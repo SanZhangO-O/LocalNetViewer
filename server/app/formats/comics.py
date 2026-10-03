@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import posixpath
 import tarfile
@@ -42,6 +43,8 @@ _ZIP_EXTS = {".cbz", ".zip"}
 _RAR_EXTS = {".cbr", ".rar"}
 _SEVEN_EXTS = {".cb7", ".7z"}
 _TAR_EXTS = {".cbt", ".tar"}
+
+logger = logging.getLogger("localnetviewer.formats.comics")
 
 
 # ------------------------------------------------------------------ 工具
@@ -193,6 +196,10 @@ class ComicContainer(ABC):
 class ZipComicContainer(ComicContainer):
     def __init__(self, env: AdapterEnv, path: Path) -> None:
         super().__init__(env)
+        # zipfile.ZipFile 的共享句柄并非线程安全（读取会移动共享文件对象）。
+        # 当前调用模式是"单适配器单线程"所以安全，但这只是约定——一旦适配器层
+        # 做预取/并发解码就会交错读写。与 RAR / 7z 的锁保持一致，成本极低。
+        self._io_lock = threading.Lock()
         try:
             self._zip = zipfile.ZipFile(path)
         except (OSError, zipfile.BadZipFile) as exc:
@@ -212,6 +219,18 @@ class ZipComicContainer(ComicContainer):
             norm = posixpath.normpath(name)
             if is_unsafe_entry_name(norm):
                 continue
+            if norm in mapping:
+                # 规范化后同名（a/b.png 与 a/./b.png）：保留自然排序较小者并告警，
+                # 静默覆盖会让页数与实际条目数对不上
+                keep, drop = sorted([mapping[norm], info.filename])
+                logger.warning(
+                    "ZIP 内条目规范化后重名: %s 与 %s（保留 %s）",
+                    drop,
+                    info.filename,
+                    keep,
+                )
+                if keep != info.filename:
+                    continue
             mapping[norm] = info.filename
             # 尺寸也按规范化后的键记录，否则 _guard_entry 会因查不到而失效
             sizes[norm] = int(info.file_size or 0)
@@ -235,8 +254,9 @@ class ZipComicContainer(ComicContainer):
             raise AssetNotFoundError(f"压缩包内不存在条目: {name}")
         self._guard_entry(key, self.size_of(key))
         try:
-            with self._zip.open(real) as fh:
-                return self._read_stream(fh, key)
+            with self._io_lock:
+                with self._zip.open(real) as fh:
+                    return self._read_stream(fh, key)
         except ParseError:
             raise
         except (KeyError, OSError, zipfile.BadZipFile) as exc:

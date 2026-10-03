@@ -19,7 +19,8 @@ from urllib.parse import unquote
 
 from ..util import imaging
 from ..util.paths import ext_of, stem_of
-from ..util.xmlutil import find_local as _find_local, text_local as _text_local
+from ..util.xmlutil import find_local as _find_local, safe_fromstring, text_local as _text_local
+from lxml import etree  # noqa: PLC0415
 from .base import (
     AdapterEnv,
     AdapterMeta,
@@ -139,10 +140,16 @@ class EpubAdapter(FlowAdapter):
         low = self._lower_map.get(name.lower())
         if low is not None:
             return self._read_guarded(low)
+        # basename 兜底只在**唯一匹配**时使用：EPUB 不同子目录下同名资源很常见
+        # （text1/img1.jpg 与 text2/img1.jpg），随便取一个会静默串读错误资源。
         base = posixpath.basename(name).lower()
-        for entry in self._zip_names:
-            if posixpath.basename(entry).lower() == base:
-                return self._read_guarded(entry)
+        matches = [e for e in self._zip_names if posixpath.basename(e).lower() == base]
+        if len(matches) == 1:
+            return self._read_guarded(matches[0])
+        if len(matches) > 1:
+            raise AssetNotFoundError(
+                f"EPUB 内存在多个同名资源，无法消歧: {name}（{len(matches)} 个匹配）"
+            )
         raise AssetNotFoundError(f"EPUB 内不存在资源: {name}")
 
     def _read_guarded(self, entry: str) -> bytes:
@@ -243,14 +250,12 @@ class EpubAdapter(FlowAdapter):
         return model
 
     def _load_with_zip(self) -> Optional[_EpubModel]:
-        from lxml import etree  # noqa: PLC0415
-
         try:
             container_xml = self._read_entry("META-INF/container.xml")
         except AssetNotFoundError:
             return None
         try:
-            container = etree.fromstring(container_xml)
+            container = safe_fromstring(container_xml)
         except etree.XMLSyntaxError:
             return None
         rootfiles = _find_local(container, "rootfile")
@@ -260,7 +265,7 @@ class EpubAdapter(FlowAdapter):
         if not opf_path:
             return None
         try:
-            opf = etree.fromstring(self._read_entry(opf_path))
+            opf = safe_fromstring(self._read_entry(opf_path))
         except (AssetNotFoundError, etree.XMLSyntaxError):
             return None
 
@@ -610,10 +615,8 @@ def _toc_from_nav(html: bytes, nav_name: str) -> Dict[str, str]:
 
 
 def _toc_from_ncx(xml: bytes, ncx_name: str) -> Dict[str, str]:
-    from lxml import etree  # noqa: PLC0415
-
     try:
-        root = etree.fromstring(xml)
+        root = safe_fromstring(xml)
     except etree.XMLSyntaxError:
         return {}
     out: Dict[str, str] = {}

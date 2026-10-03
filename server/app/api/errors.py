@@ -18,6 +18,7 @@ from ..formats.base import (
     AssetNotFoundError,
     ParseError,
     ParseTimeoutError,
+    ServerBusyError,
     UnsupportedFormatError,
 )
 from ..models.schemas import ERROR_HTTP_STATUS, ErrorCode
@@ -52,11 +53,11 @@ class AppError(Exception):
         return body
 
 
-def error_response(err: AppError) -> JSONResponse:
-    headers = {}
+def error_response(err: AppError, headers: Optional[Dict[str, str]] = None) -> JSONResponse:
+    resp_headers = dict(headers or {})
     if err.code == ErrorCode.UNAUTHORIZED.value:
-        headers["WWW-Authenticate"] = "X-Auth-Token"
-    return JSONResponse(status_code=err.http_status, content=err.payload(), headers=headers)
+        resp_headers["WWW-Authenticate"] = "X-Auth-Token"
+    return JSONResponse(status_code=err.http_status, content=err.payload(), headers=resp_headers)
 
 
 def install_exception_handlers(app: FastAPI) -> None:
@@ -75,6 +76,20 @@ def install_exception_handlers(app: FastAPI) -> None:
     async def _timeout(_: Request, exc: ParseTimeoutError) -> JSONResponse:
         return error_response(
             AppError(ErrorCode.PARSE_FAILED, str(exc) or "解析超时", {"reason": "timeout"})
+        )
+
+    # "服务器繁忙"（并发槽占满 / 任务去重）不是解析失败：映射 503 + Retry-After，
+    # 避免客户端把"过载"当成"这本书坏了"而缓存失败结果。
+    # （Starlette 按 type(exc).__mro__ 查找 handler，与注册顺序无关。）
+    @app.exception_handler(ServerBusyError)
+    async def _busy(_: Request, exc: ServerBusyError) -> JSONResponse:
+        return error_response(
+            AppError(
+                ErrorCode.SERVER_BUSY,
+                str(exc) or "服务器繁忙",
+                {"reason": "busy"},
+            ),
+            headers={"Retry-After": "5"},
         )
 
     @app.exception_handler(ParseError)

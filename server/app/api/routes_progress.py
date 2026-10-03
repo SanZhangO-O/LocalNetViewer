@@ -26,7 +26,9 @@ async def get_progress(
         None if device_id else ctx.progress.get_any(book_id)
     )
     if record is None:
-        raise AppError(ErrorCode.BAD_PATH, "该书暂无进度记录", {"book_id": book_id})
+        # "还没读过"是"未找到"，不是"路径非法"：用 404 NOT_FOUND，
+        # 客户端才能与 BAD_PATH（路径打错）区分开。
+        raise AppError(ErrorCode.NOT_FOUND, "该书暂无进度记录", {"book_id": book_id})
     return _to_record(record)
 
 

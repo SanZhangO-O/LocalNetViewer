@@ -94,6 +94,9 @@ class LibraryService:
         self._scanned_at: float = 0.0
         self._scanning: bool = False
         self._dirty: bool = False
+        # 落盘代数：快照时 +1，_mark_dirty 时 +1。写盘成功后仅当代数未变
+        # （期间没有新变更）才清 dirty，避免误清并发写入的标记（与 progress 同一套）
+        self._generation: int = 0
         self._last_save: float = 0.0
         self._warnings: List[str] = []
         # 内容变化监听者：由 AppContext 注入"清空派生缓存"的回调
@@ -153,22 +156,37 @@ class LibraryService:
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
-                self._dirty = False
                 self._last_save = time.time()
-            tmp = self.config.index_path.with_suffix(".tmp")
+                self._generation += 1
+                generation = self._generation
+            # dirty 只在写盘**成功后**清除：写盘失败（磁盘满等）时保留 dirty，
+            # 让下一次 maybe_save / 关停 flush 还能把这批变更落盘，进程崩溃前
+            # 至少多一次机会。旧实现先清 dirty 再写盘，失败即静默丢更新。
+            ok = False
+            tmp = self.config.index_path.with_suffix(f".tmp{os.getpid()}.{time.time_ns()}")
             try:
                 self.config.index_path.parent.mkdir(parents=True, exist_ok=True)
                 tmp.write_text(payload_text, encoding="utf-8")
                 os.replace(tmp, self.config.index_path)
+                ok = True
             except OSError:
                 try:
                     tmp.unlink(missing_ok=True)
                 except OSError:
                     pass
+            finally:
+                with self._lock:
+                    if ok:
+                        # 快照后没有新变更才清 dirty；否则保留给下一次落盘
+                        if self._generation == generation:
+                            self._dirty = False
+                    else:
+                        self._dirty = True
 
     def _mark_dirty(self) -> None:
         with self._lock:
             self._dirty = True
+            self._generation += 1
 
     def maybe_save(self, min_interval: float = 30.0) -> None:
         with self._lock:

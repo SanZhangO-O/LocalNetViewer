@@ -36,7 +36,9 @@ class ConfigError(RuntimeError):
 
 class ServerCfg(BaseModel):
     name: str = "LocalNetViewer"
-    host: str = "0.0.0.0"
+    # 安全默认：只监听本机。要给手机用必须在 config.yaml / --host 显式写 0.0.0.0
+    # （或具体网卡地址），此时 run.py 会在启动横幅里检查"未配令牌 + 对外监听"并告警。
+    host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
     auth_token: str = ""
 

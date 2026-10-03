@@ -11,6 +11,31 @@ from __future__ import annotations
 from typing import List, Optional
 
 
+def safe_fromstring(data: bytes):
+    """解析书籍内的不可信 XML（container.xml / OPF / NCX / FB2）。
+
+    安全约束（防 XXE / 实体膨胀）：
+    - ``resolve_entities=False``：不展开内部子集里定义的实体——恶意书籍可借
+      ``file://`` 外部实体把服务器本机文件读进正文返回给客户端；
+    - ``no_network=True``、``load_dtd=False``、``dtd_validation=False``：
+      不加载任何外部 DTD；
+    - ``huge_tree=False``（默认）：保留 libxml2 对深嵌套/超大节点的防护。
+
+    书籍格式本身不需要 DTD 实体（OPF/NCX/FB2 都不含），因此关闭它们不影响
+    正常书籍的解析。
+    """
+    from lxml import etree  # noqa: PLC0415
+
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        load_dtd=False,
+        dtd_validation=False,
+        huge_tree=False,
+    )
+    return etree.fromstring(data, parser=parser)
+
+
 def localname(el) -> str:
     try:
         from lxml import etree  # noqa: PLC0415

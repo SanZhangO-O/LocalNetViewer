@@ -289,6 +289,14 @@ class ParseTimeoutError(ParseError):
     """解析超时（PARSE_FAILED，附原因）。"""
 
 
+class ServerBusyError(ParseError):
+    """服务器繁忙（并发解析槽占满 / 同一任务已在进行中）。
+
+    语义上是"过载，请稍后重试"（SERVER_BUSY / 503），不是"这本书解析失败"；
+    单独成类以便错误处理器区分两者（客户端不应把繁忙当成书坏了而缓存失败）。
+    """
+
+
 @dataclass(frozen=True)
 class StripPage:
     """条漫切片页：源图索引 + 纵向偏移（设计 2.3 / 7.4）。

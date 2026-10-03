@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Hashable, Iterator, Optional
 
-from ..formats.base import ParseTimeoutError
+from ..formats.base import ParseTimeoutError, ServerBusyError
 
 # 同时在跑的"带超时任务"上限。超时并不会真的中断线程（Python 无法安全强杀），
 # 所以必须有一个上限来兜住"不断超时 → 不断堆积重活"的情况。
@@ -55,7 +55,7 @@ class _TimedRunner:
         if key is not None:
             with self._lock:
                 if self._inflight.get(key, 0) > 0:
-                    raise ParseTimeoutError(f"{what}超时（上一次执行仍在进行中）")
+                    raise ServerBusyError(f"{what}正在进行中（同一任务去重），请稍后重试")
                 self._inflight[key] = 1
 
         wait = min(5.0, max(0.5, float(timeout_s)))
@@ -68,8 +68,8 @@ class _TimedRunner:
         if not acquired:
             if key is not None:
                 self._leave(key)
-            raise ParseTimeoutError(
-                f"{what}繁忙（并发任务已达上限 {MAX_CONCURRENT_TIMED_TASKS}，可能有任务卡住）"
+            raise ServerBusyError(
+                f"{what}繁忙（并发任务已达上限 {MAX_CONCURRENT_TIMED_TASKS}，可能有任务卡住），请稍后重试"
             )
 
         box: Dict[str, Any] = {}

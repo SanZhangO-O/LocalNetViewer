@@ -1,8 +1,10 @@
 package com.zqr.localnetviewer.ui.reader.components
 
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -30,14 +32,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import coil3.compose.LocalPlatformContext
+import coil3.request.ImageRequest
 import com.zqr.localnetviewer.ui.reader.InnerScrollAxis
 
 private const val MAX_ZOOM = 4f
 private const val ZOOM_EPSILON = 1.01f
+/** 双击放大的目标倍率（设计 6.4）。 */
+private const val DOUBLE_TAP_ZOOM = 2f
 
 /**
  * 单页图片（设计 6.4 固定版式手势模型）。
@@ -67,18 +74,13 @@ fun PageImage(
     var offset by remember { mutableStateOf(Offset.Zero) }
     val zoomed = scale > ZOOM_EPSILON
 
-    // 重试用：URL 追加一次性查询参数（服务器忽略未知参数），强制 Coil 重新请求
+    // 重试用：attempt 作为请求级参数改变请求身份（强制 Coil 重新发起网络请求），
+    // 但显式固定 memory/disk cache key —— 不像旧方案那样在 URL 上拼 `_r=N`，
+    // 那会为每次重试生成新缓存条目、且与预取的原始 URL 无法命中。
+    // 失败结果不会被 Coil 缓存，所以同 URL 重新请求一定会再走网络。
     var attempt by remember(url) { mutableIntStateOf(0) }
     var failed by remember(url) { mutableStateOf(false) }
     var loading by remember(url) { mutableStateOf(false) }
-    val model = remember(url, attempt) {
-        when {
-            url == null -> null
-            attempt == 0 -> url
-            url.contains('?') -> "$url&_r=$attempt"
-            else -> "$url?_r=$attempt"
-        }
-    }
 
     LaunchedEffect(zoomed) { onZoomChanged(zoomed) }
 
@@ -94,20 +96,6 @@ fun PageImage(
         val widthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
         val heightPx = constraints.maxHeight.toFloat().coerceAtLeast(1f)
 
-        val transformState = rememberTransformableState { zoomChange, panChange, _ ->
-            // 小于阈值的缩放直接归一到 1f：否则 scale 落在 (1.0, 1.01] 时 zoomed 仍为
-            // false，transformable 会在手势中途被摘掉、偏移被丢弃，而且没有任何分支
-            // 应用 graphicsLayer —— 表现为"捏合了但画面没反应"
-            val raw = scale * zoomChange
-            val next = if (raw <= ZOOM_EPSILON) 1f else raw.coerceIn(1f, MAX_ZOOM)
-            scale = next
-            offset = if (next > ZOOM_EPSILON) {
-                clampOffset(offset + panChange, next, widthPx, heightPx)
-            } else {
-                Offset.Zero
-            }
-        }
-
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -120,31 +108,102 @@ fun PageImage(
                                 else -> onTapCenter()
                             }
                         },
-                        onDoubleTap = {
+                        onDoubleTap = { position ->
                             if (zoomEnabled) {
                                 if (scale > ZOOM_EPSILON) {
                                     scale = 1f
                                     offset = Offset.Zero
                                 } else {
-                                    scale = 2f
+                                    // 以点击点为中心放大：保持该点在缩放前后位置不变
+                                    // （pos = content * scale + offset，1x 时 content = pos）
+                                    scale = DOUBLE_TAP_ZOOM
+                                    offset = clampOffset(
+                                        (position - Offset(widthPx / 2f, heightPx / 2f)) *
+                                            (1f - DOUBLE_TAP_ZOOM),
+                                        DOUBLE_TAP_ZOOM,
+                                        widthPx,
+                                        heightPx,
+                                    )
                                 }
                             }
                         },
                     )
                 }
                 .then(
-                    // 只在**放大之后**才挂 transformable。
-                    //
-                    // 设计 6.4：整页模式「Pager 直接翻页」、适应宽度/高度模式「拖动主轴为
-                    // 水平时交给 Pager 翻页」。而 `Modifier.transformable` 一旦挂上就会消费
-                    // 单指拖动（它把横向拖动当成 pan），Pager 永远收不到手势 ——
-                    // 结果是"左右滑动翻不了页"。点击左右分区仍然有效，所以这个问题
-                    // 在只做静态检查时几乎不可能发现。
-                    //
-                    // 1x 时没有任何东西需要平移，缩放靠双击（设计 6.4 只规定了双击放大）；
-                    // 放大后由本修饰符负责平移，同时 Pager 被 userScrollEnabled=false 锁住。
-                    if (zoomEnabled && zoomed) {
-                        Modifier.transformable(state = transformState)
+                    // 双指捏合（1x 起即可放大）+ 放大后单指平移：自实现变换检测，
+                    // **只在 ≥2 指、或已处于放大态时**消费事件（Initial pass），
+                    // 1x 单指拖动不被消费 → Pager 翻页不受影响。
+                    // 不能直接用 Modifier.transformable：它会把单指拖动当 pan 消费掉，
+                    // Pager 永远收不到手势（"滑动翻不了页"的历史缺陷，见设计 6.4）。
+                    if (zoomEnabled) {
+                        Modifier.pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                var zooming = false
+                                var panning = false
+                                var prevCentroid = Offset.Zero
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    val pressedCount = event.changes.count { it.pressed }
+                                    val allUp = event.changes.all { !it.pressed }
+                                    val centroid = event.calculateCentroid()
+                                    if (!zooming && pressedCount >= 2) {
+                                        zooming = true
+                                        panning = false
+                                        prevCentroid = centroid
+                                    } else if (!zooming && !panning && scale > ZOOM_EPSILON && pressedCount == 1) {
+                                        panning = true
+                                        prevCentroid = centroid
+                                    }
+
+                                    if (zooming && pressedCount >= 2) {
+                                        val zoom = event.calculateZoom()
+                                        val raw = scale * zoom
+                                        val next =
+                                            if (raw <= ZOOM_EPSILON) 1f else raw.coerceIn(1f, MAX_ZOOM)
+                                        // 渲染模型：graphicsLayer 默认以图层中心 c 为 pivot，
+                                        // screen(p) = (p − c)·s + c + offset。
+                                        // 保持 prevCentroid（手势起点质心）下的内容点不动
+                                        //（缩放前后 screen(x) 不变）：
+                                        //   offset' = centroid − c − (prevCentroid − c − offset)·k
+                                        // 其中 k = next / scale。k=1（纯双指平移）时退化为
+                                        // offset' = offset + (centroid − prevCentroid)。
+                                        // 缩回 1x 时直接复位——否则残留位移会让"翻页恢复
+                                        // 但页面是歪的"（zoomed=false 已解锁 Pager）。
+                                        val center = Offset(widthPx / 2f, heightPx / 2f)
+                                        offset = if (next <= ZOOM_EPSILON) {
+                                            Offset.Zero
+                                        } else {
+                                            val k = next / scale
+                                            clampOffset(
+                                                centroid - center -
+                                                    (prevCentroid - center - offset) * k,
+                                                next,
+                                                widthPx,
+                                                heightPx,
+                                            )
+                                        }
+                                        scale = next
+                                        event.changes.forEach { it.consume() }
+                                    } else if (panning && scale > ZOOM_EPSILON && pressedCount == 1) {
+                                        offset = clampOffset(
+                                            offset + centroid - prevCentroid,
+                                            scale,
+                                            widthPx,
+                                            heightPx,
+                                        )
+                                        event.changes.forEach { it.consume() }
+                                    } else if (zooming || panning) {
+                                        // 手指抬起离开模式：回不到放大态就复位偏移
+                                        if (scale <= ZOOM_EPSILON) offset = Offset.Zero
+                                        zooming = false
+                                        panning = false
+                                    }
+                                    prevCentroid = centroid
+                                    if (allUp) break
+                                }
+                            }
+                        }
                     } else {
                         Modifier
                     }
@@ -157,7 +216,8 @@ fun PageImage(
                         .verticalScroll(rememberScrollState())
                 ) {
                     PageContent(
-                        model = model,
+                        model = url,
+                        attempt = attempt,
                         contentScale = contentScale,
                         modifier = Modifier.fillMaxWidth(),
                         onLoading = { loading = true },
@@ -176,7 +236,8 @@ fun PageImage(
                         .horizontalScroll(rememberScrollState())
                 ) {
                     PageContent(
-                        model = model,
+                        model = url,
+                        attempt = attempt,
                         contentScale = contentScale,
                         modifier = Modifier.fillMaxHeight(),
                         onLoading = { loading = true },
@@ -190,7 +251,8 @@ fun PageImage(
                 }
 
                 else -> PageContent(
-                    model = model,
+                    model = url,
+                    attempt = attempt,
                     contentScale = contentScale,
                     modifier = Modifier
                         .fillMaxSize()
@@ -250,15 +312,32 @@ fun PageImage(
 
 @Composable
 private fun PageContent(
-    model: Any?,
+    model: String?,
+    attempt: Int,
     contentScale: ContentScale,
     modifier: Modifier,
     onLoading: () -> Unit,
     onSuccess: () -> Unit,
     onError: () -> Unit,
 ) {
+    val context = LocalPlatformContext.current
+    val request = remember(model, attempt) {
+        when {
+            model == null -> null
+            // 重试：URL 加 "#attempt" 改变请求身份强制重新加载（fragment 不会发给
+            // 服务器），缓存 key 显式固定为原始 URL —— 每次重试不会产生新缓存条目
+            attempt > 0 -> ImageRequest.Builder(context)
+                .data("$model#retry-$attempt")
+                .memoryCacheKey(model)
+                .diskCacheKey(model)
+                .build()
+            else -> ImageRequest.Builder(context)
+                .data(model)
+                .build()
+        }
+    }
     AsyncImage(
-        model = model,
+        model = request,
         contentDescription = null,
         contentScale = contentScale,
         modifier = modifier,

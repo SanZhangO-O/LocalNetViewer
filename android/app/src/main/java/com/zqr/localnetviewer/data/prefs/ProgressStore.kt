@@ -11,9 +11,12 @@ import com.zqr.localnetviewer.data.runCatchingIo
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import java.util.concurrent.ConcurrentHashMap
 
 /** 每本书的阅读进度（设计 6.5）：只存锚点，页码仅供展示与快速定位。 */
 private val Context.progressDataStore: DataStore<Preferences> by preferencesDataStore(
@@ -38,6 +41,13 @@ class ProgressStore(private val context: Context) {
 
     private val store = context.progressDataStore
 
+    // 按 bookId 串行化写入：DataStore.edit 只保证单次写原子，不保证两次并发 edit
+    // 的先后次序。"旧阅读页的兜底落盘"与"重新打开同一本书的新写入"并发时，
+    // 串行化保证后调用的 put 后落盘（配合调用方的同步兜底，消灭旧页码回灌）。
+    private val locks = ConcurrentHashMap<String, Mutex>()
+
+    private fun lock(bookId: String): Mutex = locks.getOrPut(bookId) { Mutex() }
+
     fun flow(bookId: String): Flow<ReadingProgress?> = store.data.map { prefs ->
         prefs[key(bookId)]?.let { raw ->
             runCatching { prefsJson.decodeFromString<ReadingProgress>(raw) }.getOrNull()
@@ -49,17 +59,21 @@ class ProgressStore(private val context: Context) {
     /** 进度写入是尽力而为：IO 失败不抛出，避免影响阅读（调用方不再捕获）。 */
     suspend fun put(bookId: String, progress: ReadingProgress) {
         runCatchingIo {
-            store.edit { prefs ->
-                prefs[key(bookId)] = prefsJson.encodeToString(
-                    progress.copy(updatedAt = System.currentTimeMillis())
-                )
+            lock(bookId).withLock {
+                store.edit { prefs ->
+                    prefs[key(bookId)] = prefsJson.encodeToString(
+                        progress.copy(updatedAt = System.currentTimeMillis())
+                    )
+                }
             }
         }
     }
 
     suspend fun clear(bookId: String) {
         runCatchingIo {
-            store.edit { prefs -> prefs.remove(key(bookId)) }
+            lock(bookId).withLock {
+                store.edit { prefs -> prefs.remove(key(bookId)) }
+            }
         }
     }
 

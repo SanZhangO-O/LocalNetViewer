@@ -11,7 +11,8 @@ from typing import Dict, List, Optional, Tuple
 
 from ..util import imaging
 from ..util.paths import stem_of
-from ..util.xmlutil import all_text, attr_local, find_local, first_local, localname
+from ..util.xmlutil import all_text, attr_local, find_local, first_local, localname, safe_fromstring
+from lxml import etree  # noqa: PLC0415
 from .base import (
     AdapterEnv,
     AdapterMeta,
@@ -44,14 +45,13 @@ class Fb2Adapter(FlowAdapter):
     def _load(self) -> None:
         if self._loaded:
             return
-        from lxml import etree  # noqa: PLC0415
 
         max_mb = self.env.config.limits.max_book_mb
         if max_mb and (self.ref.size or 0) > max_mb * 1024 * 1024:
             raise ParseError(f"文件超过上限 {max_mb}MB")
         try:
             data = self.ref.path.read_bytes()
-            self._root = etree.fromstring(data)
+            self._root = safe_fromstring(data)
         except OSError as exc:
             raise ParseError(f"文件无法读取: {exc}") from exc
         except etree.XMLSyntaxError as exc:

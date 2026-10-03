@@ -7,19 +7,30 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -32,6 +43,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -179,6 +191,7 @@ fun ReaderScreen(
             LinearProgressIndicator(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .statusBarsPadding()
                     .align(Alignment.TopCenter)
             )
         }
@@ -194,7 +207,9 @@ fun ReaderScreen(
 
         SnackbarHost(
             hostState = snackbarHostState,
-            modifier = Modifier.align(Alignment.BottomCenter),
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding(),
         )
     }
 
@@ -261,7 +276,9 @@ private fun PagedReader(
         }
     }
     // 翻页停稳 → 取页元数据 + 预取 + 存进度（设计 6.4）
-    LaunchedEffect(pagerState, state.layoutId) {
+    // key 必须含 spreadStep：pageOfIndex 依赖它（双页跨页），而切换 pairPages
+    // 不改变 layoutId——漏掉会导致 effect 捕获旧步长，翻一"屏"被记成错误页码。
+    LaunchedEffect(pagerState, state.layoutId, state.spreadStep) {
         snapshotFlow { pagerState.settledPage }
             .flowDistinctUntilChanged()
             .collect { onSettled(state.pageOfIndex(it)) }
@@ -343,12 +360,59 @@ private fun StripReader(
                         detectTapGestures { onTapCenter() }
                     }
             ) {
-                AsyncImage(
-                    model = pageUrl(index + 1),
-                    contentDescription = null,
-                    contentScale = ContentScale.FillWidth,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+                StripPageImage(url = pageUrl(index + 1))
+            }
+        }
+    }
+}
+
+/**
+ * 条漫单页：与图文模式同等对待——加载中有指示器、失败有重试占位
+ * （不能裸用 AsyncImage：切片加载失败无提示，看起来像"这本书缺页"）。
+ * 条漫切片不需要缩放手势（整条连续滚动模型），点击留给"呼出工具栏"。
+ */
+@Composable
+private fun StripPageImage(url: String?) {
+    var attempt by remember(url) { mutableIntStateOf(0) }
+    var failed by remember(url) { mutableStateOf(false) }
+    var loading by remember(url) { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        // key(attempt)：重试时强制重建请求（失败不会被 Coil 缓存，重发即可）
+        key(attempt) {
+            AsyncImage(
+                model = url,
+                contentDescription = null,
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier.fillMaxWidth(),
+                onLoading = { loading = true },
+                onSuccess = { loading = false; failed = false },
+                onError = { loading = false; failed = true },
+            )
+        }
+        if (loading && !failed) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(strokeWidth = 2.dp)
+            }
+        }
+        if (failed) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Text("切片加载失败", style = MaterialTheme.typography.bodyMedium)
+                TextButton(onClick = {
+                    failed = false
+                    attempt += 1
+                }) {
+                    Text("重试")
+                }
             }
         }
     }

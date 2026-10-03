@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from app.formats.base import ParseTimeoutError
+from app.formats.base import ParseTimeoutError, ServerBusyError
 from app.services.progress import MAX_DEVICE_ID_LEN, normalize_device_id
 from app.util.concurrency import KeyedLocks, run_with_timeout
 
@@ -74,9 +74,9 @@ def test_same_key_is_not_run_twice_concurrently():
         run_with_timeout(slow, 0.2, "解析", key=("parse", "book-1"))
     assert entered.wait(2)
 
-    with pytest.raises(ParseTimeoutError) as excinfo:
+    with pytest.raises(ServerBusyError) as excinfo:
         run_with_timeout(slow, 5, "解析", key=("parse", "book-1"))
-    assert "仍在进行中" in str(excinfo.value)
+    assert "正在进行中" in str(excinfo.value)
     assert len(calls) == 1, "同一 key 不应并发跑第二遍"
     release.set()
 
@@ -111,7 +111,8 @@ def test_concurrency_is_bounded():
         assert started.acquire(timeout=1) and started.acquire(timeout=1)
 
         # 两个名额都被"跑不完的任务"占着 → 第三个应当快速失败而不是无限等待
-        with pytest.raises(ParseTimeoutError) as excinfo:
+        # （新契约：繁忙是 SERVER_BUSY / 503，不再是 422 PARSE_FAILED）
+        with pytest.raises(ServerBusyError) as excinfo:
             runner.run(lambda: "x", 0.5, "解析")
         assert "繁忙" in str(excinfo.value)
     finally:

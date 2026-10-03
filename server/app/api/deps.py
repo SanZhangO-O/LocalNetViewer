@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, Header, Request
@@ -29,7 +30,13 @@ def require_token(
     expected = (ctx.config.server.auth_token or "").strip()
     if not expected:
         return
-    if (x_auth_token or "").strip() != expected:
+    # 常量时间比较，避免逐字节短路造成的时序侧信道。
+    # encode 成 bytes：compare_digest 对含非 ASCII 字符的 str 会抛 TypeError（500），
+    # 而这里应当返回 401。
+    if not secrets.compare_digest(
+        (x_auth_token or "").strip().encode("utf-8"),
+        expected.encode("utf-8"),
+    ):
         raise AppError(
             ErrorCode.UNAUTHORIZED,
             "令牌缺失或错误",

@@ -62,6 +62,7 @@ def startup_banner(ctx, host: str, port: int) -> str:
         lines.append(f"  http://127.0.0.1:{port}   (仅本机，未检测到局域网地址)")
     for addr in addresses:
         lines.append(f"  http://{addr.url_host}:{port}   ({addr.label})")
+    lines.extend(_security_warnings(ctx, host))
     if platform.system() == "Windows":
         lines.append("")
         lines.append("Windows 首次运行若手机连不上，请以管理员执行：")
@@ -69,6 +70,24 @@ def startup_banner(ctx, host: str, port: int) -> str:
     lines.append("")
     lines.append("提示：仅建议在局域网使用，不要映射到公网端口。")
     return "\n".join(lines)
+
+
+def _security_warnings(ctx, host: str) -> list:
+    """对外监听且未配令牌时的醒目告警（安全默认见 config.ServerCfg.host）。"""
+    loopback = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+    if loopback:
+        return []
+    token_on = bool((ctx.config.server.auth_token or "").strip())
+    if token_on:
+        return []
+    return [
+        "",
+        "⚠️  安全警告：当前监听 " + host + "（局域网内所有设备可访问）且未启用访问令牌。",
+        "   同一网络中的任何人都能浏览您的整个书库。建议在 config.yaml 中设置：",
+        "     server:",
+        "       auth_token: <自定义口令>",
+        "   或将 host 改为 127.0.0.1（仅本机可用）。",
+    ]
 
 
 def _addresses():

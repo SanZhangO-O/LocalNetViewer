@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -75,8 +76,8 @@ fun TocSheet(
             } else {
                 LazyColumn(
                     state = listState,
-                    // 横屏 / 小屏也要能用：上限按可用高度收，而不是固定 480dp
-                    modifier = Modifier.heightIn(max = 560.dp),
+                    // 横屏 / 小屏自适应：按可用高度的比例收，而不是固定 dp
+                    modifier = Modifier.heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.7f).dp),
                 ) {
                     itemsIndexed(chapters, key = { _, chapter -> chapter.index }) { _, chapter ->
                         val selected = chapter.index == currentIndex

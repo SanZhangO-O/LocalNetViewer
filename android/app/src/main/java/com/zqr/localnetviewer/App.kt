@@ -31,6 +31,14 @@ import okio.Path.Companion.toOkioPath
  */
 class App : Application(), SingletonImageLoader.Factory {
 
+    /**
+     * 进程级协程域：供"比 ViewModel 活得更久"的小任务使用（启动恢复、兜底落盘）。
+     *
+     * 收敛为单一字段而不是每次 `CoroutineScope(...)` 现场创建：Application 存活
+     * 期间它不取消，且便于审查"有哪些任务逃出了生命周期感知范围"。
+     */
+    val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     /** 服务器地址 / 阅读设置 / 历史地址。 */
     val settingsStore: SettingsStore by lazy { SettingsStore(this) }
 
@@ -46,7 +54,7 @@ class App : Application(), SingletonImageLoader.Factory {
         // 而服务器地址只存在于 DataStore（ApiClient 的内存字段是空的）。
         // 这里在进程启动时就把地址恢复出来，并把任务交给 ApiClient ——
         // 恢复完成前的请求会挂在 api() 上等待，而不是直接抛 IllegalStateException。
-        val job = CoroutineScope(SupervisorJob() + Dispatchers.IO).async {
+        val job = applicationScope.async {
             runCatchingIo {
                 val settings = settingsStore.current()
                 // 用户在连接页抢先输入了新地址时不覆盖它

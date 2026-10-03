@@ -27,8 +27,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -262,11 +264,7 @@ class ReaderViewModel(
             val anchor = anchorOverride ?: sessionAnchor() ?: restoreAnchor
             val fallbackRatio = ratioFallback
                 ?: restoreRatio
-                ?: if (snapshot.totalPages > 0) {
-                    snapshot.currentPage.toFloat() / snapshot.totalPages.toFloat()
-                } else {
-                    null
-                }
+                ?: ratioFor(snapshot.currentPage, snapshot.totalPages)
             val total = max(1, layout.totalPages)
             val target = when {
                 anchor != null -> runCatching {
@@ -390,11 +388,7 @@ class ReaderViewModel(
         if (recovering) return
         recovering = true
         val snapshot = _state.value
-        val ratio = if (snapshot.totalPages > 0) {
-            snapshot.currentPage.toFloat() / snapshot.totalPages.toFloat()
-        } else {
-            null
-        }
+        val ratio = ratioFor(snapshot.currentPage, snapshot.totalPages)
         _state.update { it.copy(message = message) }
         viewModelScope.launch {
             try {
@@ -466,8 +460,11 @@ class ReaderViewModel(
         prefetchJob = prefetchScope.launch {
             for (url in targets) {
                 prefetchSlots.withPermit {
-                    // 预取失败无所谓（页面切过去时还会再请求一次）
-                    runCatching {
+                    // 预取失败无所谓（页面切过去时还会再请求一次）；
+                    // 但取消必须透传：runCatching 会把 CancellationException 吞成
+                    // 普通失败，靠"下一次挂起点再抛"只是巧合行为（项目里统一用
+                    // runCatchingIo 正是为此）
+                    runCatchingIo {
                         loader.execute(ImageRequest.Builder(app).data(url).build())
                     }
                 }
@@ -648,20 +645,23 @@ class ReaderViewModel(
         val page = _state.value.currentPage
         val anchor = if (anchorPage == page) _state.value.anchor else null
         val total = _state.value.totalPages
-        val ratio = if (total > 0) ((page - 0.5f) / total).coerceIn(0f, 1f) else 0f
+        val ratio = ratioFor(page, total) ?: 0f
         prefetchJob?.cancel()
         prefetchScope.cancel()
         if (total <= 0) {
             return
         }
+        // 同步兜底落盘：viewModelScope 已不可用，异步写入会与"立刻重新打开同一本书"
+        // 的新实例读取竞态（旧页码晚到覆盖新会话）。onCleared 在旧实例销毁、新实例
+        // 创建之前执行，同步写完即保证了先后次序；ProgressStore 内部再按 bookId
+        // 串行化。DataStore 单条写入很快，限时 2 秒兜底，绝不卡死退出路径。
         val store = progressStore
         val id = bookId
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            runCatchingIo {
-                store.put(
-                    id,
-                    ReadingProgress(anchor = anchor, page = page, ratio = ratio),
-                )
+        runBlocking {
+            withTimeoutOrNull(2000) {
+                runCatchingIo {
+                    store.put(id, ReadingProgress(anchor = anchor, page = page, ratio = ratio))
+                }
             }
         }
     }
@@ -670,15 +670,19 @@ class ReaderViewModel(
     private fun sessionAnchor(): AnchorDto? =
         if (anchorPage == _state.value.currentPage) _state.value.anchor else null
 
+    /**
+     * 页 → 比例的唯一换算（修复两套口径漂移）：用"页中心"
+     * ``(page - 0.5) / total``，保存进度、重排定位（/locate 兜底）共用；
+     * roundToInt 后恰好回到原页，任何路径写出的 ratio 都一致。
+     */
+    private fun ratioFor(page: Int, total: Int): Float? =
+        if (total > 0) ((page - 0.5f) / total).coerceIn(0f, 1f) else null
+
     private suspend fun persistProgress(page: Int) {
         val snapshot = _state.value
         // 只有锚点属于要保存的这一页时才记录；否则只存页码+比例，避免"错锚点"把位置带偏
         val anchor = if (anchorPage == page) snapshot.anchor else null
-        val ratio = if (snapshot.totalPages > 0) {
-            (page - 0.5f) / snapshot.totalPages.toFloat()
-        } else {
-            0f
-        }
+        val ratio = ratioFor(page, snapshot.totalPages) ?: 0f
         // 进度是"尽力而为"的本地数据：写失败（磁盘满等）不能影响阅读，也不能抛出崩溃
         runCatching {
             progressStore.put(

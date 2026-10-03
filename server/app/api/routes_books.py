@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Header, Query, Response
 
 from ..models.schemas import (
     BookMetaResponse,
@@ -19,6 +19,7 @@ from ..util.paths import safe_asset_path
 from ..util.textutil import stable_hash
 from .deps import AuthDep, get_ctx
 from .errors import AppError
+from .routes_read import _etag_matches
 
 router = APIRouter(tags=["books"])
 
@@ -61,14 +62,26 @@ async def book_meta(book_id: str, ctx=Depends(get_ctx)) -> BookMetaResponse:
 async def book_cover(
     book_id: str,
     w: int = Query(default=240, ge=40, le=1024),
+    if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     ctx=Depends(get_ctx),
 ) -> Response:
     """封面图（JPEG/PNG，强缓存）。无内嵌封面时用 Pillow 生成标题封面。"""
     key = ("cover", book_id, int(w))
+    etag = f'"{book_id}:w{int(w)}"'
+    # 封面列表一次拉几十张：支持条件请求，命中直接 304，
+    # 与 get_page 的 304 契约保持一致
+    if _etag_matches(if_none_match, etag):
+        return Response(
+            status_code=304,
+            headers={
+                "Cache-Control": f"public, max-age={COVER_MAX_AGE}",
+                "ETag": etag,
+            },
+        )
     cached = ctx.cover_cache.get(key)
     headers = {
         "Cache-Control": f"public, max-age={COVER_MAX_AGE}",
-        "ETag": f'"{book_id}:w{int(w)}"',
+        "ETag": etag,
     }
     if cached is not None:
         body, mime = cached
@@ -96,10 +109,17 @@ async def book_cover(
 async def book_asset(
     book_id: str,
     path: str = Query(..., description="容器内资源路径（EPUB 内嵌图片等）"),
+    if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     ctx=Depends(get_ctx),
 ) -> Response:
     """书内资源（只允许取书籍容器内部资源，做规范化校验，设计 9）。"""
     safe = safe_asset_path(path)
+    asset_etag = f'"{book_id}:asset:{stable_hash(safe)}"'
+    if _etag_matches(if_none_match, asset_etag):
+        return Response(
+            status_code=304,
+            headers={"Cache-Control": IMMUTABLE, "ETag": asset_etag},
+        )
     ref = await ctx.require_book_async(book_id)
     async with ctx.open_adapter_async(ref) as adapter:
         data, mime = await asyncio.to_thread(adapter.asset, safe)
@@ -110,7 +130,7 @@ async def book_asset(
             "Cache-Control": IMMUTABLE,
             # 必须是稳定哈希：内置 hash() 按 PYTHONHASHSEED 盐化，进程重启后 ETag 全变，
             # 客户端（OkHttp/Coil）的强缓存会被整体击穿
-            "ETag": f'"{book_id}:asset:{stable_hash(safe)}"',
+            "ETag": asset_etag,
         },
     )
 

@@ -1,6 +1,8 @@
 package com.zqr.localnetviewer.data.net
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerializationException
 import retrofit2.HttpException
 import java.io.IOException
@@ -94,6 +96,12 @@ suspend fun <T> apiCall(client: ApiClient? = null, block: suspend () -> T): T {
     } catch (cancel: CancellationException) {
         throw cancel
     } catch (throwable: Throwable) {
-        throw ApiException.of(throwable, client)
+        throw if (throwable is HttpException) {
+            // errorBody().string() 是网络 IO：放 IO 线程，避免大错误体 / 慢 socket
+            // 卡住调用方（通常是 Main）调度器
+            withContext(Dispatchers.IO) { ApiException.of(throwable, client) }
+        } else {
+            ApiException.of(throwable, client)
+        }
     }
 }

@@ -31,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -95,7 +96,10 @@ fun SearchSheet(
                 )
                 // key 里带上下标：服务器的 (chapter, block, char) 理论上唯一，
                 // 但 LazyColumn 遇到重复 key 会直接崩，多一个下标是零成本的保险
-                else -> LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
+                else -> LazyColumn(
+                    // 横屏 / 小屏自适应：按可用高度的比例收
+                    modifier = Modifier.heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.55f).dp)
+                ) {
                     itemsIndexed(
                         results,
                         key = { index, item ->

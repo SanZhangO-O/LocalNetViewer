@@ -108,7 +108,13 @@ fun rememberStableInsets(): InsetsPx {
         ),
     )
 
-    val holder = remember { InsetsMaxHolder() }
+    // 以"当前方向"为 key 重建持有者：max 只在同一方向内累计。否则竖屏的大 bottom
+    // inset（手势条）会永久残留到横屏、横屏的大 left/right 残留回竖屏，服务端会按
+    // 错误的 inset 排版且永不恢复。沉浸切换的稳定性不受影响——系统栏显隐发生在
+    // 同一方向内，仍由"取历史最大值"吸收。
+    val configuration = LocalConfiguration.current
+    val orientationKey = configuration.orientation
+    val holder = remember(orientationKey) { InsetsMaxHolder() }
     val merged = InsetsPx(
         left = maxOf(holder.value.left, current.left),
         top = maxOf(holder.value.top, current.top),

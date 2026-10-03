@@ -26,6 +26,8 @@ class ErrorCode(str, Enum):
     ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
     UNSUPPORTED_FORMAT = "UNSUPPORTED_FORMAT"
     PARSE_FAILED = "PARSE_FAILED"
+    SERVER_BUSY = "SERVER_BUSY"
+    NOT_FOUND = "NOT_FOUND"
     INTERNAL = "INTERNAL"
 
 
@@ -38,8 +40,10 @@ ERROR_HTTP_STATUS: Dict[str, int] = {
     ErrorCode.LAYOUT_NOT_FOUND.value: 404,
     ErrorCode.PAGE_OUT_OF_RANGE.value: 404,
     ErrorCode.ASSET_NOT_FOUND.value: 404,
+    ErrorCode.NOT_FOUND.value: 404,
     ErrorCode.UNSUPPORTED_FORMAT.value: 415,
     ErrorCode.PARSE_FAILED.value: 422,
+    ErrorCode.SERVER_BUSY.value: 503,
     ErrorCode.INTERNAL.value: 500,
 }
 

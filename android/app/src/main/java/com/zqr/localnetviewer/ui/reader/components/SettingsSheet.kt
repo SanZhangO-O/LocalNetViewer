@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import com.zqr.localnetviewer.data.prefs.AppSettings
 import com.zqr.localnetviewer.ui.reader.FitMode
@@ -54,7 +55,9 @@ fun SettingsSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(max = 560.dp)
+                // 横屏 / 小屏自适应：按可用高度的比例收，而不是固定 dp
+                // （横屏可用高度不足 560dp 时固定上限会顶满甚至超出屏幕）
+                .heightIn(max = (LocalConfiguration.current.screenHeightDp * 0.75f).dp)
                 .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp)
                 .padding(bottom = 24.dp),

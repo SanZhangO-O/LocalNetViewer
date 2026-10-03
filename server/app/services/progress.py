@@ -44,6 +44,7 @@ class ProgressStore:
         self._data: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
         self._last_save = 0.0
+        self._generation = 0
         self.load()
 
     def _key(self, book_id: str, device_id: Optional[str]) -> str:
@@ -66,6 +67,10 @@ class ProgressStore:
         ``progress.json`` 是整文件重写，而连续翻页会不停 PUT；因此两次写入之间
         至少间隔 :data:`SAVE_MIN_INTERVAL_S`，期间只标记 dirty（与书库索引的
         ``maybe_save`` 同一套做法）。关停时用 ``force=True`` 或 :meth:`flush`。
+
+        dirty 只在写盘**成功后**清除，且用代数（generation）判断快照之后有没有
+        新写入：失败保留 dirty 等下次落盘；成功但期间已有新 PUT 则不清（避免把
+        未落盘的新记录当成已落盘）。
         """
         with self._lock:
             now = time.time()
@@ -73,20 +78,30 @@ class ProgressStore:
                 self._dirty = True
                 return False
             payload = json.dumps(self._data, ensure_ascii=False, indent=1)
-            self._dirty = False
             self._last_save = now
-        tmp = self.path.with_suffix(".tmp")
+            self._generation += 1
+            generation = self._generation
+        ok = False
+        # tmp 加进程 + 代数后缀：两个线程并发 save(force) 不会互相覆盖同一个 tmp
+        tmp = self.path.with_suffix(f".tmp{os.getpid()}.{generation}")
         try:
             makedirs_quiet(self.path.parent)
             tmp.write_text(payload, encoding="utf-8")
             os.replace(tmp, self.path)
+            ok = True
         except OSError:
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
-            return False
-        return True
+        finally:
+            with self._lock:
+                if ok:
+                    if self._generation == generation:
+                        self._dirty = False
+                else:
+                    self._dirty = True
+        return ok
 
     def flush(self) -> None:
         """强制落盘（进程关停时调用）。"""
@@ -135,6 +150,8 @@ class ProgressStore:
         with self._lock:
             self._data[self._key(book_id, device_id)] = record
             self._enforce_limit_locked()
+            self._dirty = True
+            self._generation += 1
         self.save()
         return record
 

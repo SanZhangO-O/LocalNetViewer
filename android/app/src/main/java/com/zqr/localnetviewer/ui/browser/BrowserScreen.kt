@@ -3,6 +3,7 @@ package com.zqr.localnetviewer.ui.browser
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -10,11 +11,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -40,6 +43,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -48,10 +52,12 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import kotlinx.coroutines.flow.distinctUntilChanged
 import coil3.compose.AsyncImage
 import com.zqr.localnetviewer.App
 import com.zqr.localnetviewer.data.net.dto.FileEntryDto
@@ -173,7 +179,10 @@ fun BrowserScreen(
                             )
                         }
                     }
-                    items(state.entries, key = { it.path }) { entry ->
+                    // key 带 index 前缀：服务器在分页边界/重命名竞态下可能返回重复
+                    // path，LazyColumn 的重复 key 会直接抛 IllegalArgumentException
+                    // （与 SearchSheet 同样的防护）
+                    itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
                         EntryRow(
                             entry = entry,
                             coverUrl = entry.bookId?.let { app.libraryRepository.coverUrl(it, 240) },
@@ -209,9 +218,19 @@ fun BrowserScreen(
 @Composable
 private fun Breadcrumb(path: String, onNavigate: (String) -> Unit) {
     val segments = path.trim('/').split('/').filter { it.isNotEmpty() }
+    // 深层路径横向滚动（自动滚到末段），而不是把每段压到不可见。
+    // maxValue 要等布局完成后才非零：用 snapshotFlow 监听它变化后再滚动，
+    // 直接在 LaunchedEffect 里读会拿到上一帧的值（首次/加深时滚不到末尾）。
+    val scrollState = rememberScrollState()
+    LaunchedEffect(segments) {
+        snapshotFlow { scrollState.maxValue }
+            .distinctUntilChanged()
+            .collect { max -> if (max > 0) scrollState.animateScrollTo(max) }
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .horizontalScroll(scrollState)
             .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -219,9 +238,11 @@ private fun Breadcrumb(path: String, onNavigate: (String) -> Unit) {
             text = "书库",
             style = MaterialTheme.typography.labelLarge,
             modifier = Modifier
+                .heightIn(min = 36.dp)
+                .wrapContentHeight(Alignment.CenterVertically)
                 .clip(RoundedCornerShape(4.dp))
                 .clickable { onNavigate("/") }
-                .padding(horizontal = 4.dp, vertical = 2.dp),
+                .padding(horizontal = 8.dp, vertical = 6.dp),
         )
         var accumulated = ""
         segments.forEach { segment ->
@@ -237,10 +258,11 @@ private fun Breadcrumb(path: String, onNavigate: (String) -> Unit) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier
-                    .weight(1f, fill = false)
+                    .heightIn(min = 36.dp)
+                    .wrapContentHeight(Alignment.CenterVertically)
                     .clip(RoundedCornerShape(4.dp))
                     .clickable { onNavigate(target) }
-                    .padding(horizontal = 4.dp, vertical = 2.dp),
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
             )
         }
     }
