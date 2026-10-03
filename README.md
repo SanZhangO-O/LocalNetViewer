@@ -3,13 +3,11 @@
 局域网电子书阅读系统：**PC 上的 Python 服务器负责书库管理、格式解析、分页与页面渲染；
 Android 客户端通过 IP 连接服务器，浏览文件并"逐页"阅读电子书与漫画，书籍不整本下载。**
 
-完整设计见 [DESIGN.md](DESIGN.md)（v0.3）。实现状态、验证证据与设计对照见
-[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)。
+完整设计见 [DESIGN.md](DESIGN.md)（v0.3）。
 
 ```
 LocalNetViewer/
 ├─ DESIGN.md                   # 设计文档（唯一权威规格）
-├─ IMPLEMENTATION_STATUS.md    # 实现状态 / 与设计的差异 / 验证证据 / 已知限制
 ├─ server/                     # Python 服务器（FastAPI + Pillow）+ pytest 测试
 ├─ android/                    # Android 客户端（Kotlin + Compose）
 └─ .e2e/                       # 端到端验证脚手架（不属于发布内容）
@@ -110,7 +108,6 @@ cd server
 .venv\Scripts\python -X utf8 ..\.e2e\android_e2e.py          :: 模拟器 UI 全流程
 ```
 
-详细验证证据与已知限制见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) 第 0/3 节，
 缺陷修正记录见 [DESIGN.md](DESIGN.md) 第 13 节。
 
 > **中文字体**：服务器会优先挑选系统里真正含中文字形的字体（Windows 的微软雅黑 / 等线、
