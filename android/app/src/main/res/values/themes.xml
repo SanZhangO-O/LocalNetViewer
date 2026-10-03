@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      启动窗口主题。
+
+      必须同时提供 values-night 版本（见 values-night/themes.xml）：只有亮色主题时，
+      系统深色模式下启动的一瞬间会闪一下白屏，然后再切成深色 Compose 界面。
+
+      windowBackground 与 Compose 的 background 保持一致（PaperBackground / NightBackground），
+      这样冷启动看不出接缝。edge-to-edge 由 MainActivity.enableEdgeToEdge() 负责，
+      这里不做状态栏着色。
+    -->
+    <style name="Theme.LocalNetViewer" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:colorBackground">@color/window_background</item>
+    </style>
+
+</resources>

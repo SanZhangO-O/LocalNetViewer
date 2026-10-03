@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ 的备份 / 换机迁移规则。
+
+  只**包含**阅读进度，不包含设置存储（里面有明文访问令牌，见设计 9）。
+  `<include>` 的语义就是"仅备份这些"，所以不需要额外写 `<exclude>`
+  （写了 lint 会报 "not in an included path"）。
+
+  代价：换机后需要重新输入一次服务器地址与令牌，阅读位置不受影响。
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include
+            domain="file"
+            path="datastore/lnv_progress.preferences_pb" />
+    </cloud-backup>
+    <device-transfer>
+        <include
+            domain="file"
+            path="datastore/lnv_progress.preferences_pb" />
+    </device-transfer>
+</data-extraction-rules>

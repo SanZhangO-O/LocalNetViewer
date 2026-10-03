@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标背景：墨青底色 + 一道极淡的斜向高光。
+  默认模板是 Android Studio 的绿色网格，看起来"没做过设计"；这里换成与界面
+  主色一致的墨青，前景的"书页"标记才立得住。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF2F5D62"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#FF3A6E74"
+        android:pathData="M0,0L108,0L108,36L0,72Z" />
+    <path
+        android:fillColor="#FF275055"
+        android:pathData="M0,108L108,108L108,72L0,36Z" />
+</vector>

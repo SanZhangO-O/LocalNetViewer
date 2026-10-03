@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标前景：一本摊开的书（左页纸白、右页略灰、中间墨色书脊），
+  页面上几道墨色"文字行"呼应"逐页阅读"。
+
+  全部图形落在 108×108 视口的 30..78 安全区内（自适应图标会被裁成圆形/方形）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 左页 -->
+    <path
+        android:fillColor="#FFFAF8F5"
+        android:pathData="M30,38h22v40h-22z" />
+    <!-- 右页 -->
+    <path
+        android:fillColor="#FFDCE4E4"
+        android:pathData="M56,38h22v40h-22z" />
+    <!-- 书脊 -->
+    <path
+        android:fillColor="#FF15494E"
+        android:pathData="M52,36h4v44h-4z" />
+    <!-- 左页文字行 -->
+    <path
+        android:fillColor="#FF2F5D62"
+        android:pathData="M35,45h12v2.5h-12zM35,52h12v2.5h-12zM35,59h9v2.5h-9z" />
+    <!-- 右页文字行 -->
+    <path
+        android:fillColor="#FF3F4949"
+        android:pathData="M61,45h12v2.5h-12zM61,52h12v2.5h-12zM61,59h7v2.5h-7z" />
+</vector>

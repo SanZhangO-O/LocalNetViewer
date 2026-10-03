@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色模式下的启动窗口：不提供这一份就会在冷启动时闪一下白屏 -->
+    <style name="Theme.LocalNetViewer" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:colorBackground">@color/window_background</item>
+    </style>
+</resources>

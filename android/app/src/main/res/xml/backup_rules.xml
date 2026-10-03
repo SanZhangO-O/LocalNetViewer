@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 11 及以下的备份规则（API 31+ 用 data_extraction_rules.xml）。
+
+  只**包含**阅读进度，不包含设置存储：设置里有明文的访问令牌（设计 9），
+  没有任何理由把它上传到云端备份。`<include>` 的语义是"仅备份这些"，
+  因此不需要（也不能）再写一条 `<exclude>` —— lint 会报
+  "not in an included path"。
+
+  代价：换机后需要重新输入一次服务器地址与令牌，阅读位置不受影响。
+-->
+<full-backup-content>
+    <include
+        domain="file"
+        path="datastore/lnv_progress.preferences_pb" />
+</full-backup-content>

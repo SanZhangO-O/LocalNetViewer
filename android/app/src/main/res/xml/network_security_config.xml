@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP：应用只访问用户手动输入的局域网地址（IP:端口），无法按域名收敛，
+  因此这里全局允许明文（设计文档 6.6）。targetSdk >= 28 默认禁止 cleartext，
+  不加这个配置会直接 IOException: Cleartext HTTP traffic not permitted。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

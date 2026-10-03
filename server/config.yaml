@@ -1,0 +1,58 @@
+# LocalNetViewer 服务器配置（设计文档 4.2）
+# 所有相对路径均相对于本文件所在目录解析。
+
+server:
+  name: LocalNetViewer
+  host: 0.0.0.0
+  port: 8765
+  auth_token: ""            # 留空则不需要令牌；填写后客户端需携带 X-Auth-Token
+
+library:
+  roots:
+    - name: 我的书库
+      path: D:/Books
+  include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
+  show_all_files: false     # true 时列出所有文件，但非电子书不可打开
+  sort: natural             # 目录优先 + 数字感知自然排序
+  # 书级编码覆盖表（设计 7.2）：虚拟路径或文件名 → 编码名，处理检测失败的 TXT
+  encoding_overrides: {}
+  # 例：
+  # encoding_overrides:
+  #   /我的书库/老书/某本.txt: gb18030
+
+gallery:
+  folder_as_book: true      # 图片文件夹可"作为图集"打开（浏览页提供入口）
+  min_images_in_folder: 1   # 显示"打开为图集"入口所需的最少图片数
+  recursive: false          # 图集是否包含子文件夹中的图片
+  show_image_files: false   # 是否在目录列表中直接列出单张图片文件
+
+comic:
+  skip_entries: ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]
+  default_fit: viewport     # viewport(按视口缩放，默认) | original(原图直通)
+  jpeg_quality: 85          # 缩放重编码质量
+  strip_min_aspect: 1.5     # 高/宽 超过该值的长图可启用条漫 strip 模式
+  strip_overlap_px: 0       # 条漫切片时的重叠像素（0 = 不重叠）
+
+render:
+  fonts_dir: assets/fonts
+  default_font: NotoSansSC-Regular
+  max_page_pixels: 4000000  # 单页最大像素数（防止内存爆炸）
+  jpeg_for_photo_pages: true
+
+cache:
+  dir: cache
+  parsed_max_mb: 4096       # 解析缓存磁盘上限（0 = 不限制）
+  page_lru_bytes: 536870912 # 页面缓存内存上限（字节，512MB；0 = 不限制字节数）
+  page_lru_pages: 512       # 页面缓存张数上限（与字节上限双控；0 = 不限制张数）
+                            # 两项都为 0 时完全关闭页面缓存（每页都重新渲染）
+  layout_memory_max: 32     # 内存中保留的 PageMap 数量（超出后按 LRU 淘汰）
+  layouts_max_mb: 2048      # 磁盘布局缓存上限（0 = 不限制）
+  doc_memory_max: 3         # 内存中保留的解析结果数量（渲染页面需要，越小越省内存）
+
+limits:
+  max_book_mb: 2048         # 单本书文件上限，超过拒绝并提示
+  max_page_bytes: 52428800  # 单页图片字节上限（原图直通），超出强制缩放
+  max_source_pixels: 30000000  # 源图解码像素上限（Image.MAX_IMAGE_PIXELS），防图片炸弹
+  parse_timeout_s: 60       # 单本书解析/分页超时 → PARSE_FAILED
+  max_archive_entry_mb: 512 # 压缩包内单个条目的解压上限（防 zip 炸弹）
+  max_archive_total_mb: 4096 # 压缩包整体解压上限（防 zip 炸弹）

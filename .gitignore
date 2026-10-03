@@ -1,0 +1,7 @@
+# 端到端验证脚手架的生成物（脚本本身保留在版本控制里）
+.e2e/library/
+.e2e/cache/
+.e2e/fonts/
+.e2e/shots/
+.e2e/*.log
+.e2e/server-config.yaml
