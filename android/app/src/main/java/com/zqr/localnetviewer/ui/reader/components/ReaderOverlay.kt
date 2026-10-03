@@ -55,13 +55,10 @@ fun ReaderOverlay(
     onSeek: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    AnimatedVisibility(
-        visible = state.overlayVisible,
-        enter = fadeIn(),
-        exit = fadeOut(),
-        modifier = modifier.fillMaxSize(),
-    ) {
-        Column(modifier = Modifier.fillMaxSize()) {
+    // 墨水屏预设（默认）不用 AnimatedVisibility 淡入淡出：渐变动画在墨水屏上
+    // 表现为多次灰阶刷新 + 残影，直接显隐只需一次刷新；lcd/custom 开动画时保留渐变。
+    val content: @Composable () -> Unit = {
+        Column(modifier = modifier.fillMaxSize()) {
             TopAppBar(
                 title = {
                     Column {
@@ -136,5 +133,15 @@ fun ReaderOverlay(
                 }
             }
         }
+    }
+    if (state.settings.animateTransitions) {
+        // modifier 只由内层 content 的 Column 应用，这里不再重复传，避免叠加
+        AnimatedVisibility(
+            visible = state.overlayVisible,
+            enter = fadeIn(),
+            exit = fadeOut(),
+        ) { content() }
+    } else if (state.overlayVisible) {
+        content()
     }
 }

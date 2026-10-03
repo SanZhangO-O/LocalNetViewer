@@ -225,7 +225,7 @@ private fun Breadcrumb(path: String, onNavigate: (String) -> Unit) {
     LaunchedEffect(segments) {
         snapshotFlow { scrollState.maxValue }
             .distinctUntilChanged()
-            .collect { max -> if (max > 0) scrollState.animateScrollTo(max) }
+            .collect { max -> if (max > 0) scrollState.scrollTo(max) }
     }
     Row(
         modifier = Modifier

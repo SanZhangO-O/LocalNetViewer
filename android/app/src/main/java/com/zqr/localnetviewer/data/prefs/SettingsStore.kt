@@ -54,10 +54,26 @@ data class AppSettings(
     /** 双页跨页（M4） */
     val pairPages: Boolean = false,
     val keepScreenOn: Boolean = true,
+    /**
+     * 界面预设：eink（墨水屏，默认）| lcd（常规屏，动画过渡）| custom（自定义）。
+     *
+     * 墨水屏预设下所有界面过渡直接落位（翻页跳转、工具栏显隐、列表滚动）：
+     * 渐变/滑动动画在墨水屏上表现为多次灰阶全刷 + 残影。
+     */
+    val uiPreset: String = "eink",
+    /** 仅 custom 预设生效：是否启用界面过渡动画。 */
+    val animatedTransitions: Boolean = false,
     /** 上次连接的服务器地址与令牌 */
     val serverUrl: String = "",
     val authToken: String = "",
 ) {
+    /** 当前预设是否使用动画过渡（eink=否，lcd=是，custom=看开关）。 */
+    val animateTransitions: Boolean
+        get() = when (uiPreset) {
+            PRESET_EINK -> false
+            PRESET_LCD -> true
+            else -> animatedTransitions
+        }
     /** 只有几何相关的设置变化才需要重新分页（设计 3.3 / 6.4）。 */
     fun geometrySignature(): String = listOf(
         fontSizeSp,
@@ -71,6 +87,9 @@ data class AppSettings(
 
     companion object {
         val DEFAULT = AppSettings()
+        const val PRESET_EINK = "eink"
+        const val PRESET_LCD = "lcd"
+        const val PRESET_CUSTOM = "custom"
     }
 }
 

@@ -262,13 +262,15 @@ private fun PagedReader(
     )
 
     // 程序化跳页（目录 / 搜索 / 进度恢复）；用户滑动不受影响。
-    // 跳得远时用 scrollToPage 直接落位：animateScrollToPage 会横扫全书
-    // （第 1 章跳第 40 章要动画掠过几百页），固定版式下还会触发大量页面请求。
-    LaunchedEffect(state.currentPage, state.totalPages) {
+    // 墨水屏预设（默认）一律 scrollToPage 直接落位：动画跳页在墨水屏上会连续
+    // 触发多次全屏刷新并留残影；在常规屏上长距离动画也会横扫全书触发大量页面请求。
+    // 只有 lcd / custom（开动画）预设才对短距离跳页做动画。
+    val animateJump = state.settings.animateTransitions
+    LaunchedEffect(state.currentPage, state.totalPages, animateJump) {
         val target = state.indexOfPage(state.currentPage).coerceIn(0, pageCount - 1)
         if (pagerState.currentPage != target) {
             val distance = kotlin.math.abs(target - pagerState.currentPage)
-            if (distance > ANIMATED_JUMP_MAX_PAGES) {
+            if (!animateJump || distance > ANIMATED_JUMP_MAX_PAGES) {
                 pagerState.scrollToPage(target)
             } else {
                 pagerState.animateScrollToPage(target)
@@ -334,7 +336,12 @@ private fun StripReader(
         if (listState.firstVisibleItemIndex != target) {
             pendingJump = target
             try {
-                listState.animateScrollToItem(target)
+                // 墨水屏预设（默认）直接落位；开动画的预设才平滑滚动跳转
+                if (state.settings.animateTransitions) {
+                    listState.animateScrollToItem(target)
+                } else {
+                    listState.scrollToItem(target)
+                }
             } finally {
                 pendingJump = null
             }

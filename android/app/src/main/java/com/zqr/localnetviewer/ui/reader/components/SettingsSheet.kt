@@ -65,6 +65,41 @@ fun SettingsSheet(
         ) {
             Text("阅读设置", style = MaterialTheme.typography.titleMedium)
 
+            Text("界面预设", style = MaterialTheme.typography.titleSmall)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                presetOptions.forEach { preset ->
+                    FilterChip(
+                        selected = settings.uiPreset == preset.id,
+                        onClick = { onSettingsChange(settings.copy(uiPreset = preset.id)) },
+                        label = { Text(preset.label) },
+                    )
+                }
+            }
+            Text(
+                text = when (settings.uiPreset) {
+                    AppSettings.PRESET_EINK -> "过渡直接落位，避免墨水屏多次全刷与残影"
+                    AppSettings.PRESET_LCD -> "翻页跳转与工具栏显隐带动画，适合常规屏幕"
+                    else -> "自行控制界面过渡动画开关"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (settings.uiPreset == AppSettings.PRESET_CUSTOM) {
+                SwitchRow(
+                    label = "界面过渡动画",
+                    description = "翻页跳转 / 工具栏显隐 / 列表滚动是否带动画",
+                    checked = settings.animatedTransitions,
+                    onCheckedChange = {
+                        onSettingsChange(settings.copy(animatedTransitions = it))
+                    },
+                )
+            }
+
             LabeledSlider(
                 label = "字号",
                 value = settings.fontSizeSp.toFloat(),
@@ -261,6 +296,14 @@ private fun SwitchRow(
         Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
 }
+
+private data class PresetOption(val id: String, val label: String)
+
+private val presetOptions = listOf(
+    PresetOption(AppSettings.PRESET_EINK, "墨水屏"),
+    PresetOption(AppSettings.PRESET_LCD, "常规屏"),
+    PresetOption(AppSettings.PRESET_CUSTOM, "自定义"),
+)
 
 private fun themeLabel(theme: ReaderTheme): String = when (theme) {
     ReaderTheme.WHITE -> "白"
