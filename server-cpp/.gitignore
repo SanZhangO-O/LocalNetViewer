@@ -3,3 +3,5 @@
 /build-asan/
 *.obj
 *.pdb
+/build-dbg/
+/build-asan2/

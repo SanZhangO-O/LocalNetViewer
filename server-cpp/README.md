@@ -23,6 +23,10 @@ powershell -ExecutionPolicy Bypass -File server-cpp\build.ps1
   步骤重新 vendored，并**重新应用** `patches/cpp-httplib-lnv-range.patch`（build.ps1 会校验
   补丁标记，缺失时直接报错而不是静默产出行为不一致的二进制）。
 - `build.ps1 -Debug` 构建调试版；`-Run` 构建后直接以 `server/config.yaml` 启动。
+- **构建被中断过就加 `-Clean`**：MSVC 预编译头（`build/…/cmake_pch.cxx.pch`，本项目约
+  350 MB）在中断的构建里可能只更新一部分目标文件，导致同一进程内不同 TU 的结构体布局
+  不一致（ODR 违规），表现为**随机堆损坏**（0xc0000374 / 无效 free），而不是编译错误。
+  实测同一份源码：被打断过的 `build/` 在并发压测下必崩，`-Clean` 重建后 120 轮无问题。
 
 ## 运行
 

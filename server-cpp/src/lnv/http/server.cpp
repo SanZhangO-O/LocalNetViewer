@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <fstream>
 #include <regex>
+#include <windows.h>   // GetFileAttributesExW（字体文件 ETag 需要与 CPython 完全一致的 mtime）
 
 namespace lnv {
 namespace {
@@ -905,6 +906,28 @@ void handle_fonts(AppContext& ctx, const httplib::Request&, httplib::Response& r
 }
 
 // GET /api/v1/render/fonts/{font_id}/file
+// 与 CPython os.stat().st_mtime 完全一致的 mtime（秒，double）。
+//
+// Starlette 的 FileResponse 用 `md5(f"{st_mtime}-{st_size}")` 当 ETag，其中 st_mtime
+// 是 Python 的 repr（最短往返）。CPython 在 Windows 上算的是
+// `(double)sec + (double)nsec / 1e9`（nsec 来自 FILETIME 的 100ns 单位），
+// 而不是 `ft100/1e7 - 11644473600`（两者在部分文件上差 1 ulp，repr 就完全不同）。
+// 用 std::filesystem::last_write_time + clock_cast 得到的值同样对不齐：
+// 实测 arialbd.ttf 的 ETag 因此与 Python 不同（客户端无法复用字体缓存）。
+static double file_mtime_for_etag(const std::filesystem::path& path) {
+    WIN32_FILE_ATTRIBUTE_DATA info{};
+    if (!GetFileAttributesExW(path.wstring().c_str(), GetFileExInfoStandard, &info))
+        return 0.0;
+    const unsigned long long ft100 =
+        (static_cast<unsigned long long>(info.ftLastWriteTime.dwHighDateTime) << 32) |
+        info.ftLastWriteTime.dwLowDateTime;
+    constexpr long long kEpochDiffSec = 11644473600LL;  // 1601-01-01 → 1970-01-01
+    const long long ns = static_cast<long long>(ft100) * 100LL - kEpochDiffSec * 1000000000LL;
+    const long long sec = ns / 1000000000LL;
+    const long long rem = ns % 1000000000LL;
+    return static_cast<double>(sec) + static_cast<double>(rem) / 1e9;
+}
+
 void handle_font_file(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string font_id = req.matches[1];
     auto path = ctx.fonts->face_path(font_id);
@@ -925,13 +948,8 @@ void handle_font_file(AppContext& ctx, const httplib::Request& req, httplib::Res
     std::error_code ec;
     const auto st_size = std::filesystem::file_size(path, ec);
     if (!ec) {
-        const auto ftime = std::filesystem::last_write_time(path, ec);
-        if (!ec) {
-            const double mtime =
-                std::chrono::duration_cast<std::chrono::duration<double>>(
-                    std::chrono::clock_cast<std::chrono::system_clock>(ftime)
-                        .time_since_epoch())
-                    .count();
+        const double mtime = file_mtime_for_etag(path);
+        if (mtime != 0.0) {
             res.set_header("ETag", "\"" + md5_hex(json(mtime).dump() + "-" +
                                        std::to_string(static_cast<long long>(st_size))) + "\"");
             res.set_header("Accept-Ranges", "bytes");
@@ -1005,14 +1023,10 @@ void handle_unmatched(const httplib::Request& req, httplib::Response& res) {
 std::unique_ptr<httplib::Server> create_server(AppContext& ctx) {
     auto svr = std::make_unique<httplib::Server>();
     // 线程池 12（与 Python 每请求在线程池跑 CPU 活的模型对应）。
-    // ThreadPool(n, max_n, mqr)：第二个参数是**线程数上限**（默认 8 = CPPHTTPLIB_THREAD_POOL_COUNT），
-    // 第三个是排队上限（默认 0 = 无上限 → 慢客户端可以无限排队且永远不会收到 503）。
-    // max_n 必须 ≥ n：写成 (12, 8, 1024) 会造成"基准线程数 > 上限"，httplib 的动态线程
-    // 计数（threads_.size() + dynamic_threads_.size() < max_thread_count_）随之错乱，
-    // 实测会踩坏堆（0xc0000374 堆损坏）。
-    svr->new_task_queue = [] {
-        return new httplib::ThreadPool(12, 12, 1024);
-    };
+    // 只用单参数形式：ThreadPool(n, max_n, mqr) 的第二/第三参数（线程上限 / 排队上限）
+    // 在本项目的实测里会引入问题（12 基准线程 + 8 上限 → 堆损坏 0xc0000374；
+    // 12/12/1024 同样在并发压力下崩），保持上游默认行为最稳。
+    svr->new_task_queue = [] { return new httplib::ThreadPool(12); };
 
     // httplib 自身产生的错误（URI/头部超长 → 414、请求行非法 → 400）默认是**空 body**，
     // 客户端按 JSON 解析会直接失败。这里统一补上错误信封；已有 body（我们自己的
