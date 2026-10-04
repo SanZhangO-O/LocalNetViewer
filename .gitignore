@@ -5,3 +5,10 @@
 .e2e/shots/
 .e2e/*.log
 .e2e/server-config.yaml
+
+# 对拍/审查脚本的产物：缓存目录、报告、写死本机绝对路径的临时配置都不入库
+# （脚本 *.py 保留，可按需提交）
+.e2e/review/cache-*/
+.e2e/review/*.txt
+.e2e/review/*-config.yaml
+.e2e/review/*.log
