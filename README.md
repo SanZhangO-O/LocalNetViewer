@@ -9,6 +9,7 @@ Android 客户端通过 IP 连接服务器，浏览文件并"逐页"阅读电子
 LocalNetViewer/
 ├─ DESIGN.md                   # 设计文档（唯一权威规格）
 ├─ server/                     # Python 服务器（FastAPI + Pillow）+ pytest 测试
+├─ server-cpp/                 # C++ 服务器（MSVC + cpp-httplib，Python 版的移植，二选一运行）
 ├─ android/                    # Android 客户端（Kotlin + Compose）
 └─ .e2e/                       # 端到端验证脚手架（不属于发布内容）
 ```
@@ -38,6 +39,11 @@ LocalNetViewer Server v0.1
 ```
 
 交互式接口文档：`http://<服务器IP>:8765/docs`。
+
+> **另一种服务器实现**：`server-cpp/` 是同一套 HTTP 契约与缓存格式的 C++ 移植版
+> （MSVC + cpp-httplib，依赖已 vendored、无需联网）。两者**二选一运行**，共用同一份
+> `config.yaml`、书库目录与 `cache/` 目录（可互相读取对方的解析/布局缓存）。
+> 构建与运行见 [server-cpp/README.md](server-cpp/README.md)。
 
 ### 2. Android 客户端
 
@@ -86,16 +92,24 @@ gradlew.bat assembleDebug
 ## 测试与验证
 
 服务器已带 pytest 测试套件（锚点往返、编码检测、zip-slip / 路径穿越、缓存失效、容器名称映射、
-中文字体探测、并发工具、HTTP 契约与端到端 API），客户端已通过 Gradle 构建验证：
+中文字体探测、并发工具、HTTP 契约与端到端 API），C++ 移植版另有自己的回归测试
+（真实启动 `lnvserver.exe` + 临时书库/缓存，覆盖容器条目映射、编码探测边界、深层嵌套、
+压缩包守卫、图片解码、HTTP 契约、解析闸门并发语义、缓存落盘与关停）。
+客户端已通过 Gradle 构建与单元测试验证：
 
 ```bat
 cd server
 python -m venv .venv
 .venv\Scripts\python -m pip install -e .
-.venv\Scripts\python -m pytest -q
+.venv\Scripts\python -m pytest -q                      :: Python 服务器
+.venv\Scripts\python -m pytest ..\server-cpp\tests -q  :: C++ 移植版（需先构建）
+
+cd ..\server-cpp
+powershell -ExecutionPolicy Bypass -File build.ps1     :: C++ 服务器（依赖已 vendored）
 
 cd ..\android
 gradlew.bat assembleDebug
+gradlew.bat testDebugUnitTest                          :: 阅读设置/适应模式单元测试
 ```
 
 `.e2e/` 下是端到端验证脚手架（不属于发布内容）：

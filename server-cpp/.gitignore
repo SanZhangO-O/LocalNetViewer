@@ -1,0 +1,5 @@
+# 构建产物目录（只忽略本目录下的，vendored 上游源码里也有叫 build/ 的目录）
+/build/
+/build-asan/
+*.obj
+*.pdb
