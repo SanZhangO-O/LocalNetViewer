@@ -26,14 +26,20 @@ enum class ReaderTheme(val id: String, val background: Long, val foreground: Lon
     }
 }
 
-/** 固定版式适应模式（只改客户端显示策略，不触发重新分页，设计 6.4）。 */
+/**
+ * 固定版式适应模式（只改客户端显示策略，不触发重新分页，设计 6.4）。
+ *
+ * SCREEN 是默认：整页拉伸铺满整块屏幕（不留黑边，漫画优先占屏）；
+ * PAGE 完整显示整页但按比例留边；WIDTH / HEIGHT 单向撑满 + 页内滚动。
+ */
 enum class FitMode(val id: String, val label: String) {
+    SCREEN("screen", "铺满屏幕"),
     PAGE("page", "整页"),
     WIDTH("width", "适应宽度"),
     HEIGHT("height", "适应高度");
 
     companion object {
-        fun of(id: String): FitMode = entries.firstOrNull { it.id == id } ?: PAGE
+        fun of(id: String): FitMode = entries.firstOrNull { it.id == id } ?: SCREEN
     }
 }
 
@@ -132,6 +138,7 @@ fun profileSignature(
 fun contentScaleFor(settings: AppSettings, isFixed: Boolean): ContentScale {
     if (!isFixed) return ContentScale.Fit
     return when (FitMode.of(settings.fitMode)) {
+        FitMode.SCREEN -> ContentScale.FillBounds
         FitMode.PAGE -> ContentScale.Fit
         FitMode.WIDTH -> ContentScale.FillWidth
         FitMode.HEIGHT -> ContentScale.FillHeight
@@ -150,6 +157,7 @@ enum class InnerScrollAxis { NONE, VERTICAL, HORIZONTAL }
 fun innerScrollFor(settings: AppSettings, isFixed: Boolean): InnerScrollAxis {
     if (!isFixed) return InnerScrollAxis.NONE
     return when (FitMode.of(settings.fitMode)) {
+        FitMode.SCREEN -> InnerScrollAxis.NONE
         FitMode.PAGE -> InnerScrollAxis.NONE
         FitMode.WIDTH -> InnerScrollAxis.VERTICAL
         FitMode.HEIGHT -> InnerScrollAxis.HORIZONTAL
