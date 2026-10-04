@@ -227,16 +227,24 @@ class LibraryService:
                 )
         return out
 
-    def scan_blocking(self) -> None:
-        """全量/增量扫描（同步，供启动预热与后台线程调用）。"""
+    def scan_blocking(self) -> bool:
+        """全量/增量扫描（同步，供启动预热与后台线程调用）。
+
+        返回 False 表示 ``_scan_lock`` 被占用而**跳过**：watcher 等事件驱动的
+        调用方必须据此重试——watchfiles 不会重新投递已消费的事件，静默跳过
+        等于丢掉那批变化的重扫机会。
+        """
         if not self._scan_lock.acquire(blocking=False):
-            return
+            return False
         self._scanning.set()
         self._cancel_scan.clear()
         changed_old_ids: List[str] = []
         try:
             with self._lock:
                 prev_books = dict(self._books)
+                prev_counts = {
+                    k: dict(v) for k, v in self._gallery_counts.items()
+                }
             books: Dict[str, Dict[str, Any]] = {}
             counts: Dict[str, Dict[str, Any]] = {}
             warnings: List[str] = []
@@ -258,7 +266,11 @@ class LibraryService:
                 self._gallery_counts = counts
                 self._scanned_at = time.time()
                 self._warnings = warnings
-                self._dirty = True
+                # 只有索引内容真的变化才标 dirty：watcher 的事件驱动重扫可能每几秒
+                # 一次，no-op 扫描不能跟着做一次全量 json.dumps（在锁内，会卡请求
+                # 线程）+ 全文件重写。请求线程自行标的 dirty 保持不变。
+                if books != prev_books or counts != prev_counts:
+                    self._dirty = True
         finally:
             self._scanning.clear()
             self._scan_lock.release()
@@ -266,10 +278,12 @@ class LibraryService:
         # 持锁通知容易与请求线程互等；每个旧 book_id 只通知一次
         for old_id in dict.fromkeys(changed_old_ids):
             self._notify_content_changed(old_id)
-        self.save_index()
+        if self._dirty:
+            self.save_index()
+        return True
 
-    async def scan_async(self) -> None:
-        await asyncio.to_thread(self.scan_blocking)
+    async def scan_async(self) -> bool:
+        return await asyncio.to_thread(self.scan_blocking)
 
     def cancel_scan(self) -> None:
         """请求停止后台扫描（线程无法被强杀，只能协作式退出）。"""

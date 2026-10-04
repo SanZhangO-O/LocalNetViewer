@@ -58,6 +58,11 @@ class LibraryCfg(BaseModel):
     include_ext: List[str] = Field(default_factory=lambda: list(DEFAULT_INCLUDE_EXT))
     show_all_files: bool = False
     sort: Literal["natural", "name"] = "natural"
+    # 目录变化监听（设计 4.8）：OS 原生通知，事件在防抖窗口内合并为一次增量重扫。
+    # 需可选依赖 watchfiles（pip install -e ".[watch]"）；未安装或目录不可监听时
+    # 自动降级为"仅启动扫描"，不影响服务。
+    watch: bool = True
+    watch_debounce_s: float = Field(default=2.0, ge=0.1, le=60.0)
     # 书级编码覆盖：虚拟路径 / 文件名 / 纯文件名 → 编码名
     encoding_overrides: Dict[str, str] = Field(default_factory=dict)
 

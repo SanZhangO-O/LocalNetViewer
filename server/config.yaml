@@ -14,6 +14,10 @@ library:
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序
+  # 目录变化监听（设计 4.8）：变化后自动增量重扫。需可选依赖 watchfiles
+  # （pip install -e ".[watch]"），未安装时自动降级为仅启动扫描
+  watch: true
+  watch_debounce_s: 2.0     # 防抖窗口（秒）：窗口内的事件合并为一次重扫
   # 书级编码覆盖表（设计 7.2）：虚拟路径或文件名 → 编码名，处理检测失败的 TXT
   encoding_overrides: {}
   # 例：

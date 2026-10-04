@@ -25,6 +25,7 @@ from .services.layouts import LayoutService
 from .services.library import LibraryService
 from .services.progress import ProgressStore
 from .services.search import SearchService
+from .services.watcher import LibraryWatcher
 from .util import imaging
 from .api.errors import AppError
 
@@ -51,6 +52,9 @@ class AppContext:
         self.layouts = LayoutService(config, self.layout_store, self.parsed, self.fonts)
         self.search = SearchService()
         self.progress = ProgressStore(config)
+        # 书库目录变化监听（设计 4.8 / 可选依赖 watchfiles）：仅创建不启动，
+        # 线程在 main.lifespan 里启停，避免 TestClient 每次建 app 就开线程
+        self.watcher = LibraryWatcher(config, self.library)
 
         self.env = AdapterEnv(config=config, parsed_cache=self.parsed, fonts=self.fonts)
         self.started_at = time.time()
@@ -217,6 +221,7 @@ class AppContext:
             "parsed_cache": self.parsed.disk_stats(),
             "layout_cache": self.layout_store.stats(),
             "library": self.library.index_stats(),
+            "library_watch": self.watcher.status(),
             "gallery_books": self.gallery.registry_size(),
             "progress_records": self.progress.count(),
         }
@@ -234,6 +239,14 @@ class AppContext:
                 lines.append(f"书库: {root.name} ({root.path}, {count} 本)  [{state}]")
         else:
             lines.append("书库: 未配置（请编辑 config.yaml 的 library.roots）")
+        watch = self.watcher.status()
+        if not watch["enabled"]:
+            lines.append("书库监控: 关（library.watch=false）")
+        elif watch["available"]:
+            # 横幅在 lifespan 启动监听线程之前打印，这里只反映配置意图
+            lines.append(f"书库监控: 开（防抖 {watch['debounce_s']:.1f}s，服务启动后生效）")
+        else:
+            lines.append("书库监控: 未启用（缺 watchfiles，可选安装: pip install -e \".[watch]\"）")
         lines.append(f"字体: {self.fonts.default_id}（{len(self.fonts.list_faces())} 个可用）")
         if self.fonts.missing_font:
             lines.append("警告: 未找到任何字体文件，中文将显示为方框（请放入 assets/fonts）")

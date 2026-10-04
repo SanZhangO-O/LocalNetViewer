@@ -10,8 +10,8 @@ cd server
 python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
-:: 可选：网卡名称识别 / 目录监听 / 二维码
-pip install -e ".[sync]"
+:: 可选：网卡名称识别 / 书库目录监听 / 二维码
+pip install -e ".[sync,watch,qr]"
 ```
 
 Linux / macOS:
@@ -32,6 +32,8 @@ pip install -e .
 | `server.auth_token` | 留空不需要令牌；填写后客户端需带 `X-Auth-Token` |
 | `library.roots` | 书库根目录列表，`name` 即虚拟路径第一段 |
 | `library.include_ext` | 参与索引的扩展名 |
+| `library.watch` | 监听书库目录变化并自动增量重扫（默认开；需可选依赖 watchfiles，缺失时自动降级为仅启动扫描） |
+| `library.watch_debounce_s` | 变化事件防抖窗口（默认 2 秒，窗口内事件合并为一次重扫） |
 | `library.encoding_overrides` | TXT 编码检测失败时的书级覆盖 |
 | `gallery.folder_as_book` | 是否允许"文件夹作为图集打开" |
 | `comic.default_fit` | 漫画默认取页方式（`viewport` / `original`） |
@@ -109,7 +111,7 @@ server/
    ├─ config.py            # 配置加载与校验
    ├─ netinfo.py           # 本机地址枚举（多网卡/VPN 标注）
    ├─ api/                 # 路由：server / files / books / read / progress / errors
-   ├─ services/            # library / gallery / layouts / search / progress
+   ├─ services/            # library / gallery / layouts / search / progress / watcher
    ├─ formats/             # base / txt / epub / pdf / comics / fb2 / mobi / registry
    ├─ layout/              # engine（分页）/ fonts（宽度表）/ anchors（锚点换算）
    ├─ render/              # raster（Pillow 栅格化）/ jsonout（JSON 模式）

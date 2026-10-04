@@ -71,6 +71,8 @@ def create_app(
             if background_scan
             else None
         )
+        # 书库目录变化监听（设计 4.8 / 可选依赖 watchfiles）：启动失败只降级记日志
+        ctx.watcher.start()
         logger.info(
             "启动完成：%s（%d 个书库根，索引中 %d 本）",
             cfg.config_path or "(默认配置)",
@@ -80,6 +82,9 @@ def create_app(
         try:
             yield
         finally:
+            # 必须先停监听再取消扫描：监听线程触发的 scan_blocking 会清掉取消
+            # 标记，反过来的顺序可能让关停被一次"新启动的"全量扫描拖住
+            ctx.watcher.stop()
             ctx.library.cancel_scan()
             if scan_task is not None:
                 scan_task.cancel()
