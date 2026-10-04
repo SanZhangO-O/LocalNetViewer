@@ -1,6 +1,8 @@
 #pragma once
 // 图集服务 / 布局服务 / 进度 / 搜索（对应 Python services/{gallery,layouts,progress,search}.py）
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <shared_mutex>
 #include "lnv/cache/lru.h"   // 【最小新增】：ObjectLru（原文件已用而未包含）
 #include "lnv/cache/store.h"
@@ -48,6 +50,20 @@ private:
         double created_at = 0, updated_at = 0;
     };
     std::map<std::string, Entry> registry_;  // book_id → entry
+    // 图集 rev 记忆：book_ref 每次请求都要实时枚举图片算 rev（recursive 模式下
+    // 目录 mtime 不反映子目录增删）。dir_mtime 未变且在 TTL 内的重复请求复用
+    // 计数；mtime 一变立即重算。锁与 registry_ 的 shared_mutex 分离：枚举文件
+    // 系统时两把锁都不持有，避免热路径相互阻塞。
+    struct RevMemo {
+        std::optional<double> dir_mtime;
+        int image_count = 0;
+        std::string revision;
+        std::chrono::steady_clock::time_point checked_at;
+    };
+    mutable std::mutex rev_memo_mu_;
+    mutable std::map<std::string, RevMemo> rev_memo_;
+    // 注册/重载注册表后作废 rev 记忆；book_id 为空串 = 全部作废
+    void invalidate_rev_memo(const std::string& book_id = std::string());
 };
 
 // ------------------------------------------------------------------ layouts
@@ -62,9 +78,11 @@ struct LayoutBuildResult {
 
 class LayoutsService {
 public:
-    LayoutsService(const AppConfig& cfg, FontManager& fonts, LayoutsDiskCache& disk,
+    // fonts 用 shared_ptr 共享所有权：分页/解析超时后分离的 worker 按值捕获它，
+    // 即使 AppContext 先销毁也不会悬垂（审查：worker 越界使用已销毁的 FontManager）。
+    LayoutsService(const AppConfig& cfg, std::shared_ptr<FontManager> fonts, LayoutsDiskCache& disk,
                    ParsedCache& parsed)
-        : cfg_(cfg), fonts_(fonts), disk_(disk), parsed_(parsed),
+        : cfg_(cfg), fonts_(std::move(fonts)), disk_(disk), parsed_(parsed),
           memory_(static_cast<size_t>(std::max(0, cfg.cache.layout_memory_max))),
           doc_memory_(static_cast<size_t>(std::max(0, cfg.cache.doc_memory_max))) {}
 
@@ -86,7 +104,7 @@ private:
     DocumentModel document_internal(const BookRef& ref, const std::string& what);
 
     const AppConfig& cfg_;
-    FontManager& fonts_;
+    std::shared_ptr<FontManager> fonts_;
     LayoutsDiskCache& disk_;
     ParsedCache& parsed_;
     mutable std::shared_mutex mu_;

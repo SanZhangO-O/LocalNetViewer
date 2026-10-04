@@ -59,6 +59,8 @@ data class BookMetaDto(
     @SerialName("render_support") val renderSupport: RenderSupportDto = RenderSupportDto(),
     val chapters: List<ChapterInfoDto> = emptyList(),
     val source: String? = null,
+    /** 内容修订号（旧服务器缺省为空串），见 /layout 同名字段。 */
+    val revision: String = "",
 )
 
 @Serializable

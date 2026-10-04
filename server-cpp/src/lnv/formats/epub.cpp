@@ -1193,7 +1193,8 @@ void collect_spans(const HNode& n, bool bold, bool italic,
 }  // namespace
 
 // ============================================================ EpubAdapter
-EpubAdapter::EpubAdapter(const AppConfig& cfg, const BookRef& ref) : cfg_(cfg), ref_(ref) {
+EpubAdapter::EpubAdapter(const AppConfig& cfg, const BookRef& ref, const AdapterEnv& env)
+    : cfg_(cfg), ref_(ref), fonts_(env.fonts) {
     format = "epub";
     mode = "flow";
     auto* zip = new mz_zip_archive{};
@@ -1878,16 +1879,12 @@ std::optional<ImageBytes> EpubAdapter::cover(int width) {
         mp = &model();
     } catch (const ParseError&) {
         // 对齐 Python epub.py:496-522：模型解析失败的坏书也出文字封面（而不是把
-        // ParseError 抛给 /cover 变 422）。Python 适配器持有 env.fonts；C++ 适配器
-        // 没有，按同一份配置惰性建一个进程级 FontManager（首次扫描字体，之后复用；
-        // 坏书封面是少数路径）。标题/作者与 Python 分支一致：stem + None。
-        static std::unique_ptr<FontManager> fallback_fonts = [&] {
-            auto fm = std::make_unique<FontManager>();
-            fm->init(cfg_.fonts_dir(), cfg_.render.default_font);
-            return fm;
-        }();
+        // ParseError 抛给 /cover 变 422）。字体管理器来自 AdapterEnv（AppContext
+        // 的实例），与 /cover 主路径共用同一份，不再建进程级静态 FontManager。
+        // 标题/作者与 Python 分支一致：stem + None。
+        if (!fonts_) throw ParseError("文字封面缺少字体管理器");
         return text_cover(stem_of(ref_.name()), std::nullopt,
-                          width > 0 ? width : 320, fallback_fonts.get());
+                          width > 0 ? width : 320, fonts_);
     }
     std::optional<std::string> name = mp->cover_name;
     if (!name && !mp->image_names.empty()) name = mp->image_names.front();  // 任何图片第一个
@@ -1921,8 +1918,9 @@ std::optional<ImageBytes> EpubAdapter::cover(int width) {
 namespace lnv {
 
 
-std::unique_ptr<BookAdapter> create_epub_adapter(const AppConfig& cfg, const BookRef& ref) {
-    return std::make_unique<EpubAdapter>(cfg, ref);
+std::unique_ptr<BookAdapter> create_epub_adapter(const AppConfig& cfg, const BookRef& ref,
+                                                 const AdapterEnv& env) {
+    return std::make_unique<EpubAdapter>(cfg, ref, env);
 }
 
 }  // namespace lnv

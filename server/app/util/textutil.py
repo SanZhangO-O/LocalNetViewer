@@ -18,6 +18,17 @@ def stable_hash(value: object, length: int = 16) -> str:
     digest = hashlib.sha1(str(value).encode("utf-8")).hexdigest()
     return digest[: max(8, int(length))]
 
+
+def content_revision(book_id: str, size: int, mtime: float) -> str:
+    """内容修订号（跨实现契约，与 C++ 服务器一致）。
+
+    ``sha1("<book_id>:<size>:<int(mtime)>")[:12]``，mtime 取**地板秒**：
+    重启 / 跨进程稳定，供 ``revision`` 字段、页面/封面 ETag 与内存缓存键使用。
+    图集虚拟书同样用它：size 传图片数、mtime 传目录 stat 的 st_mtime。
+    """
+    payload = f"{book_id}:{int(size)}:{int(float(mtime))}"
+    return hashlib.sha1(payload.encode("ascii")).hexdigest()[:12]
+
 # ---------------------------------------------------------------- 编码检测
 # 注意 utf-16 / utf-32（不带 -le/-be 后缀）：codecs 会**消费掉 BOM**。
 # 用 "utf-16-le" 解码 b"\xff\xfe..." 会把 U+FEFF 留在文本开头，后果是

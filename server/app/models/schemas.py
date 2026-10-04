@@ -145,6 +145,7 @@ class RenderSupport(BaseModel):
 
 class BookMetaResponse(BaseModel):
     book_id: str
+    revision: str = ""
     title: str
     author: Optional[str] = None
     format: str
@@ -243,6 +244,8 @@ class LayoutProfile(BaseModel):
 
 class LayoutResponse(BaseModel):
     layout_id: str
+    # 内容修订号：内容变化后 layout_id 不变但 revision 变化（客户端据此丢弃页面缓存）
+    revision: str = ""
     mode: Mode
     total_pages: int
     chapters: List[ChapterInfo] = Field(default_factory=list)

@@ -29,6 +29,9 @@ constexpr size_t kMaxConcurrentParseTasks = 8;
 // 槽位被卡死任务占满时，新任务先等 5s 再报 503，而不是立即拒绝。
 constexpr double kMaxSlotWaitS = 5.0;
 
+// 重活闸门等待上限：超过就抛 ServerBusyError（HTTP 503），而不是无限期占住请求线程。
+constexpr double kHeavyGateWaitS = 5.0;
+
 // 有界并发 + 按 key 去重的解析门。
 // - acquire(key, wait, what)：同一 key 已在跑 → 立即抛 ServerBusyError（同一任务去重）；
 //   槽位满时最多等 wait 毫秒，仍满则抛 ServerBusyError（Python 语义）。
@@ -169,6 +172,94 @@ private:
     std::unordered_map<std::string, std::weak_ptr<std::mutex>> table_;
     size_t max_keys_;
 };
+
+// 进程级"重活闸门"：限制同时占用请求线程的重活数量（默认 4 槽），避免 12 个
+// 请求线程被 PDF 渲染、外部解压、MOBI 转换等慢操作全部占满而饿死轻量端点。
+// - 有界等待（kHeavyGateWaitS = 5s）：槽位被卡死任务占满时不再无限排队，超时抛
+//   ServerBusyError → HTTP 层映射为 503 SERVER_BUSY（与解析闸门同一错误语义）。
+// - 可重入：同一线程嵌套获取不重复占槽（适配器构造 → MOBI 转换 / 容器列表）。
+// - 锁序：持重活闸门时绝不等待解析闸门（ParseGate）；需要两者时先取重活闸门。
+class HeavyGate {
+public:
+    explicit HeavyGate(size_t slots = 4) : slots_(slots ? slots : 1) {}
+
+    class Guard {
+    public:
+        Guard() = default;
+        explicit Guard(HeavyGate& gate) : gate_(&gate) { gate_->enter(); }
+        Guard(Guard&& o) noexcept : gate_(o.gate_) { o.gate_ = nullptr; }
+        Guard& operator=(Guard&& o) noexcept {
+            if (this != &o) {
+                reset();
+                gate_ = o.gate_;
+                o.gate_ = nullptr;
+            }
+            return *this;
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+        ~Guard() { reset(); }
+        void reset() {
+            if (gate_) {
+                gate_->leave();
+                gate_ = nullptr;
+            }
+        }
+
+    private:
+        HeavyGate* gate_ = nullptr;
+    };
+
+    Guard acquire() { return Guard(*this); }
+
+private:
+    struct Tls {
+        const HeavyGate* owner = nullptr;
+        int depth = 0;
+    };
+    static Tls& tls() {
+        thread_local Tls t;
+        return t;
+    }
+
+    void enter() {
+        Tls& t = tls();
+        if (t.owner == this && t.depth > 0) {  // 同线程重入：不重复占槽
+            t.depth++;
+            return;
+        }
+        std::unique_lock<std::mutex> lk(mu_);
+        // 有界等待：重活可达分钟级，但无限期占住请求线程会让所有端点（含轻量
+        // 探测）一起排队、且永远拿不到 503。超时抛与解析闸门相同的 ServerBusyError。
+        const auto wait_ms =
+            std::chrono::milliseconds(static_cast<long long>(kHeavyGateWaitS * 1000.0));
+        if (!cv_.wait_for(lk, wait_ms, [&] { return active_ < slots_; })) {
+            throw ServerBusyError("服务器重活繁忙（并发重活已达上限 " +
+                                  std::to_string(slots_) + "，可能有任务卡住），请稍后重试");
+        }
+        active_++;
+        t.owner = this;
+        t.depth = 1;
+    }
+    void leave() {
+        Tls& t = tls();
+        if (--t.depth > 0) return;
+        t.owner = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (active_ > 0) active_--;
+        }
+        cv_.notify_one();
+    }
+
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    size_t slots_;
+    size_t active_ = 0;
+};
+
+// 进程级单例（与 parse_gate 同理故意不析构：持有/等待者可能活到进程退出）
+HeavyGate& heavy_gate();
 
 namespace detail {
 // 工作线程与等待方共享的结果槽：done 通过 mutex 发布 value/err

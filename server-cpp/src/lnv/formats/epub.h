@@ -13,7 +13,8 @@ namespace lnv {
 
 class EpubAdapter : public BookAdapter {
 public:
-    EpubAdapter(const AppConfig& cfg, const BookRef& ref);
+    // env.fonts 提供 AppContext 的字体管理器（坏书文字封面用）；不拥有
+    EpubAdapter(const AppConfig& cfg, const BookRef& ref, const AdapterEnv& env = {});
     ~EpubAdapter() override;
 
     AdapterMeta meta() override;
@@ -61,6 +62,7 @@ private:
 
     const AppConfig& cfg_;
     BookRef ref_;
+    FontManager* fonts_ = nullptr;      // AppContext 的字体管理器（不拥有）
 
     void* zip_ = nullptr;               // mz_zip_archive*（避免在头里引 miniz）
     std::vector<std::string> names_;    // 容器条目名（zip 名解码后）
@@ -74,6 +76,7 @@ private:
 };
 
 // 工厂（mobi.cpp 转换产物委托用）
-std::unique_ptr<BookAdapter> create_epub_adapter(const AppConfig& cfg, const BookRef& ref);
+std::unique_ptr<BookAdapter> create_epub_adapter(const AppConfig& cfg, const BookRef& ref,
+                                                 const AdapterEnv& env = {});
 
 }  // namespace lnv

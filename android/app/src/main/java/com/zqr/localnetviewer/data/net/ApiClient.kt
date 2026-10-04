@@ -1,6 +1,5 @@
 package com.zqr.localnetviewer.data.net
 
-import android.content.Context
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import com.zqr.localnetviewer.BuildConfig
 import kotlinx.coroutines.Deferred
@@ -19,7 +18,7 @@ import java.util.concurrent.TimeUnit
  * - 超时：连接 3s、读 15s，keep-alive 连接池；令牌统一由拦截器附加；
  * - 手动输入的是局域网 IP，无法按域名收敛，明文 HTTP 由 network_security_config 放行。
  */
-class ApiClient(private val appContext: Context? = null) {
+class ApiClient {
 
     @Volatile
     private var baseUrl: String = ""

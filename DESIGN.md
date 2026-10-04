@@ -576,6 +576,7 @@ LocalNetViewer Server v0.1
 ```json
 {
   "layout_id": "L12ab34cd56ef",
+  "revision": "a1b2c3d4e5f6",
   "mode": "flow",
   "total_pages": 812,
   "chapters": [
@@ -665,10 +666,16 @@ Cache-Control: private, max-age=31536000, immutable
 
 | 资源 | 缓存键 | 策略 |
 |---|---|---|
-| 页面图片（flow） | book + layout_id + theme + scale + page | `ETag` + `max-age=1年 immutable` |
+| 页面图片（flow） | book + layout_id + **rev** + theme + scale + page | `ETag` + `max-age=1年 immutable` |
 | 页面图片（fixed/strip） | 上述键 + `fit` / `quality` | 同上 |
 | 页元数据 | 与对应页面图片的键一致 | 同上 |
-| 封面 | book_id + w | `max-age=1天` |
+| 封面 | book_id + **rev** + w | `max-age=1天` |
+
+**内容修订号 `revision`**（跨实现契约，Python 与 C++ 服务器一致）：
+`sha1("<book_id>:<size>:<mtime 地板秒>")[:12]`（图集虚拟书：`size` 换图片数、`mtime` 换目录
+stat）。`/layout`、`/meta` 返回该字段；页面/封面 ETag 与服务器内存缓存键都含 rev；页面与
+页元数据 URL 由客户端附加 `&rev=`，封面 URL 由服务器下发时带 `?rev=`。这样"同尺寸就地
+编辑"（book_id 不变）也会产生新 URL/新 ETag，客户端 Coil 缓存不会继续命中旧内容。
 | meta / layout | book_id + 参数 | `no-cache`（可协商 ETag） |
 
 layout_id 由几何参数决定：改字号/旋转屏幕产生新 layout_id，旧缓存自然失效；服务器与客户端两侧都无需手动清理。
@@ -1176,4 +1183,86 @@ OkHttp 磁盘缓存移除后无残留引用。
 - **`progress_sync` 客户端未接线**：服务器已实现 per-device LWW，客户端仍只用本地进度。
 - **`--reload` 模式忽略 `--config`**：开发模式用默认 `config.yaml`。
 - **`search` 对含 `İ` 的块退化为大小写敏感**：偏移量仍然正确，只影响命中数。
+
+### v0.4（2026-10-04，架构审查修复）
+
+对 Python / C++ / Android 三套实现做了一轮架构审查，修复下列问题；新增跨实现
+**内容修订号 `revision`** 契约（见 5.4）。验证：`compileall` 通过、`build.ps1` 构建
+通过、`assembleDebug` 构建通过（按项目约定未跑测试套件）。
+
+**Python 服务器**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | 内容变更监听可被绕过：`list_dir`/扫描先静默刷新 size/mtime，`book_by_id` 之后再也检测不到变化，旧分页/旧图永久驻留 | `_book_id_for` / 扫描 / `book_by_id` 三路统一在检测到变化时（锁外）通知监听者；扫描按 `_claim` 只通知一次 |
+| 2 | immutable ETag 不含内容版本：等长编辑后 304、客户端永久旧图 | 新增 `revision`；页面/封面 ETag、缓存键、URL 全链路带上；封面路由先解析书籍再用当前 rev 判 304 |
+| 3 | MOBI 转换缓存（`cache/converted`）从不失效、无配额 | 内容变化时删除；启动与转换后按 mtime LRU 清到 2GiB 的 80% |
+| 4 | 默认线程池未按 CPU 配置 | lifespan 设为 `max(4, cpu_count)` |
+| 5 | fixed/strip 页集枚举无超时、无锁 | 与 flow 相同的 `KeyedLocks` + `run_with_timeout`（PARSE_FAILED） |
+| 6 | 超时后路由关闭适配器，后台线程仍在使用 | `ParseTimeoutError.orphaned`（锁内判定，无竞态）；路由标记后跳过 close，`__del__` 兜底，恰好一次 |
+| 7 | `ParsedCache` 不校验缓存内 book_id | 不匹配即隔离为未命中 |
+| 8 | 磁盘 LRU 按写入时间淘汰，热文件会被冷文件挤掉 | 读命中时 touch mtime |
+| 9 | 死代码 / 竞态 | 删除同步 `open_adapter`、`refresh_backend_status`；`scanning` 改 `threading.Event`；关停时索引写在 IO 线程；`supports_strip()` 取代 `isinstance` |
+
+**C++ 服务器**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | detach 的分页线程可活过 `AppContext`，使用已析构的 `FontManager`（UAF） | `FontManager` 改 `shared_ptr` 并被工作线程按值捕获 |
+| 2 | 两份内存缓存（其一为死状态）、配置不生效 | 删除 `AppContext` 重复缓存；`require_layout`/搜索统一走 `LayoutsService` 的配置化缓存 |
+| 3 | PDFium 进程全局库被 12 线程并发调用 | 全局递归互斥锁串行化所有 `FPDF_*` 调用 |
+| 4 | 重活与轻请求共用请求线程池，慢归档/PDF 饿死其它端点 | 进程级 `HeavyGate`（4 槽、可重入）包住适配器构造、外部容器、PDF 渲染、MOBI 转换 |
+| 5 | strip 语义与 Python 不一致（PDF + strip 变 415） | 镜像 Python：非漫画适配器回落 fixed；能力用虚函数而非类型判断 |
+| 6 | `calibre_available()` 每条目录项都全 PATH 扫描 | 进程内记忆化 |
+| 7 | MOBI 每书锁表无上限 | 改用 `KeyedLocks` |
+| 8 | EPUB 兜底字体建了进程级全局 `FontManager` | 经 `AdapterEnv.fonts` 使用 AppContext 实例 |
+| 9 | 共享缓存文件里的异常数值 `double→int` 是 UB | 范围校验后拒绝（按损坏处理） |
+| 10 | 内容变化通知缺失（与 Python 同类问题） | 扫描/列目录/`require_book` 三路通知并清理派生缓存与转换产物 |
+| 11 | 修订号契约 | 与 Python 逐字节一致（含图集）；ETag/缓存键/cover_url/304 全覆盖 |
+| 12 | "缓存与 Python 互读"无测试 | 新增 `tests/test_cross_impl.py`（互读 + layout_id 相等；缺解释器自动 skip） |
+
+**Android 客户端**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | `onCleared` 用 `runBlocking` 主线程落盘（最坏 2s） | 改 `applicationScope` 异步写；`ProgressStore` 登记 per-book pending Job，后续读取先 join，顺序仍有保证 |
+| 2 | 缩放三处状态、翻页后 `renderScale` 不复位（继续按 2x 拉图） | 翻页统一复位本地 `zoomed` 与 VM `renderScale`；`PageImage` 按 pageKey 复位内部缩放 |
+| 3 | 重排失败被 `!canRender` 掩盖 | `canRender` 时改走 Snackbar 提示，不再静默用旧分页 |
+| 4 | 三处 `runCatching` 吞掉取消异常 | 统一 `runCatchingIo` |
+| 5 | 连接未验证就先改全局 `ApiClient` | 先用临时客户端探测，成功后才 configure；取消不改动旧配置 |
+| 6 | 无响应体的 404 被映射成 BOOK_NOT_FOUND，`LAYOUT_NOT_FOUND` 恢复失效 | 映射为 `NOT_FOUND`；阅读页元数据触发重排恢复（含条漫图片失败路径） |
+| 7 | 预取不设解码尺寸，与屏上缓存键不一致且可能解码超大位图 | 预取按视口尺寸请求 |
+| 8 | 设置加载与首次排版竞态 | 设置就位后核对签名并按需重排 |
+| 9 | 分层泄漏（UI 直读 `App.serverSummary` / repository 构造 URL） | 收进 `BrowserViewModel`；封面优先用服务端带 `rev` 的 `cover_url` |
+| 10 | `SettingsStore.update` 返回事务外旧值 | 事务内取值返回 |
+| 11 | `ApiClient` 未使用的 Context 参数 | 移除 |
+| 12 | 修订号未接线 | `LayoutDto`/`MetaDto.revision` → UiState → 页面与页元数据 URL `&rev=` |
+
+**仓库**
+
+| # | 问题 | 修正 |
+|---|---|---|
+| 1 | `server/.gitignore` 的 `cache/` 误伤源码包 `server/app/cache/*.py`（缓存层从未纳入版本控制） | 改为根锚定 `/cache/`；`app/cache/*.py` 需 `git add` 纳入 |
+
+**仍然存在的已知限制（本轮未扩大范围）**：双服务器实现仍是手工镜像契约（现已有互读
+测试兜底，但无代码生成）；C++ 重活仍占用请求线程（`HeavyGate` 只限制占用上限，未做
+独立线程池）；缓存配额清理仍是每次写入 O(n) 目录遍历；Python/C++ 的 JSON 键序与
+`y0` 数值类型差异照旧（可互读，非逐字节相等）。
+
+### v0.4.1（2026-10-04，v0.4 改动的对抗性 review 修复）
+
+对 v0.4 的全部改动做了一轮六轨 review（安全 / 性能 / 逻辑 / 发布安全 / 重复 / 死代码），
+修复以下问题；三套实现重新构建通过。
+
+| # | 问题 | 修正 |
+|---|---|---|
+| 1 | **安全**：`LayoutStore.path_for` 把客户端传入的 `layout_id` 直接拼进缓存路径，`_quarantine` 会 unlink → 可经 `../..` 删除任意 `*.json.gz` | `util/paths.is_safe_id`（`[A-Za-z0-9_-]{1,64}`）严格校验 `book_id`/`layout_id`；非法值按未命中处理，绝不构造/删除路径（LayoutStore + ParsedCache 全部入口） |
+| 2 | 图集 rev 每次请求全量枚举目录（Python `count_images` / C++ `list_images`） | 两者都加进程内记忆：目录 mtime 未变且 2s 内复用 `(count, rev)`，mtime 变化立即重算，register/forget 时清除 |
+| 3 | 扫描可能对同一次变化通知两次（等长编辑指纹不变，只看 book_id 的去重失效） | Python `_claim_scan_change` 追加"live 仍处于变化前 size/mtime"条件；C++ 扫描提交前快照 live 索引，已由请求路径处理过的变化跳过 |
+| 4 | MOBI 失效与在途转换竞态：旧的 `{book_id}.epub` 会在失效后被重新发布并采用 | 转换产物按内容修订号命名 `{book_id}.{revision}.epub`（两实现一致），新 rev 天然不命中旧产物；失效时清理该书全部旧 rev 与 `.tmp` |
+| 5 | C++ `HeavyGate` 无限等待，慢重活可占满 12 个请求线程且没有 503 | 有界等待（5s），超时抛 `ServerBusyError`（复用 SERVER_BUSY → 503 语义） |
+| 6 | PDFium 全局锁覆盖了像素转换与 JPEG 编码，所有 PDF 编码被串行化 | 锁只覆盖 FPDF 调用 + 原始位图拷贝；BGRA→RGBA 与编码在锁外执行（`page_bytes`/`pair_bytes`） |
+| 7 | Android 退出兜底落盘改为纯异步，进程被立刻杀死可能丢最后位置 | `applicationScope` 异步写 + 退出路径有界 join 300ms（正常毫秒级完成，异常不卡退出） |
+| 8 | 封面 URL 两个构造器漂移：服务端 URL 只有 `rev`，本地 URL 只有 `w`，`width` 被静默丢弃 | 使用服务端 `cover_url` 时补 `&w=`；语义与回退路径一致 |
+| 9 | 死代码 | C++ 移除不可达的 `compute_file_rev` 回退与未使用的 `HeavyGate::active/slots`；Android `meta.revision` 改为布局响应缺省时的回退值 |
 

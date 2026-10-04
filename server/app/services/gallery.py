@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from ..config import IMAGE_EXT
 from ..util.natural import natural_key
 from ..util.paths import PathError, ext_of, makedirs_quiet, normalize_vpath, stem_of
+from ..util.textutil import content_revision
 from ..formats.base import BookRef, UnsupportedFormatError
 from ..formats.comics import should_skip_entry
 
@@ -31,6 +32,11 @@ if TYPE_CHECKING:  # pragma: no cover
 GALLERY_PREFIX = "gallery:"
 GALLERY_FORMAT = "gallery"
 DEFAULT_SKIP = ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]
+
+# 目录图片数枚举很贵（recursive 模式要遍历整棵子树），而 /books/{id}、封面与
+# 翻页请求都会调 resolve()。按 book_id 记忆 (目录 mtime, 图片数, revision)，
+# 目录 mtime 未变且距上次校验 < 2s 时复用；register/forget 主动失效。
+GALLERY_MEMO_TTL_S = 2.0
 
 
 def gallery_book_id(vpath: str) -> str:
@@ -98,6 +104,8 @@ class GalleryService:
         self.path = config.gallery_registry_path
         self._lock = threading.RLock()
         self._registry: Dict[str, Dict[str, Any]] = {}
+        # resolve() 的短时记忆：{book_id: (dir_mtime, image_count, revision, checked_at)}
+        self._memo: Dict[str, tuple] = {}
         self.load_registry()
 
     # ------------------------------------------------------------ 注册表
@@ -164,6 +172,13 @@ class GalleryService:
             )
 
         book_id = gallery_book_id(v)
+        # 封面 URL 带修订号（与服务端 rev 公式一致）：目录图片变化后 URL 变化
+        try:
+            revision = content_revision(
+                book_id, len(images), float(real.stat().st_mtime)
+            )
+        except OSError:
+            revision = book_id
         with self._lock:
             prev = self._registry.get(book_id)
             self._registry[book_id] = {
@@ -174,6 +189,8 @@ class GalleryService:
                 "created_at": (prev or {}).get("created_at") or time.time(),
                 "updated_at": time.time(),
             }
+            # 注册刚重新枚举过，旧记忆必须作废（recursive 标志可能也变了）
+            self._memo.pop(book_id, None)
             # 在同一临界区内取副本：否则并发 forget() 会让这里 KeyError
             entry = dict(self._registry[book_id])
         self.save_registry()
@@ -183,7 +200,7 @@ class GalleryService:
             "format": GALLERY_FORMAT,
             "page_count": len(images),
             "mode": "fixed",
-            "cover_url": f"/api/v1/books/{book_id}/cover",
+            "cover_url": f"/api/v1/books/{book_id}/cover?rev={revision}",
             "recursive": rec,
         }
 
@@ -202,6 +219,45 @@ class GalleryService:
         real = self.library.resolve_real(vpath)
         if real is None or not real.exists():
             return None
+        # 图集修订号契约：sha1("<id>:<图片数>:<目录 mtime 秒>")[:12]；
+        # stat 失败时退化为 book_id（跨实现约定）。图片数必须实时枚举：
+        # 目录 mtime 在 recursive 模式下不会随子目录增删改变，只有计数能兜住。
+        # 但枚举很贵且 resolve() 每请求都调：目录 mtime 未变且 2s 内校验过则
+        # 复用记忆的 (count, revision)；mtime 一变立即重算，register/forget 失效。
+        try:
+            dir_mtime = float(real.stat().st_mtime)
+        except OSError:
+            revision = book_id
+        else:
+            if real.is_file():
+                count = 1
+                revision = content_revision(book_id, count, dir_mtime)
+            else:
+                memo = None
+                with self._lock:
+                    cached = self._memo.get(book_id)
+                if (
+                    cached is not None
+                    and abs(float(cached[0]) - dir_mtime) < 1e-6
+                    and (time.monotonic() - float(cached[3])) < GALLERY_MEMO_TTL_S
+                ):
+                    memo = cached
+                if memo is not None:
+                    count, revision = int(memo[1]), str(memo[2])
+                else:
+                    count = count_images(
+                        real,
+                        bool(item.get("recursive", False)),
+                        list(self.config.comic.skip_entries),
+                    )
+                    revision = content_revision(book_id, count, dir_mtime)
+                    with self._lock:
+                        self._memo[book_id] = (
+                            dir_mtime,
+                            count,
+                            revision,
+                            time.monotonic(),
+                        )
         return BookRef(
             book_id=book_id,
             vpath=vpath,
@@ -210,6 +266,7 @@ class GalleryService:
             size=0,
             mtime=0.0,
             virtual=True,
+            revision=revision,
             extra={"recursive": bool(item.get("recursive", False)), "title": item.get("title")},
         )
 
@@ -227,4 +284,5 @@ class GalleryService:
     def forget(self, book_id: str) -> None:
         with self._lock:
             self._registry.pop(book_id, None)
+            self._memo.pop(book_id, None)
         self.save_registry()

@@ -46,7 +46,7 @@ class App : Application(), SingletonImageLoader.Factory {
     val progressStore: ProgressStore by lazy { ProgressStore(this) }
 
     /** HTTP 客户端：地址可切换，令牌与超时统一管理。 */
-    val apiClient: ApiClient by lazy { ApiClient(this) }
+    val apiClient: ApiClient by lazy { ApiClient() }
 
     override fun onCreate() {
         super.onCreate()

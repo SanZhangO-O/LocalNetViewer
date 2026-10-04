@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
 from urllib.parse import unquote
@@ -29,6 +30,20 @@ _WINDOWS_RESERVED = {
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
+
+# 缓存键（book_id / layout_id）允许的字符集。这些 id 会被直接拼进缓存文件路径：
+# 含分隔符、点号或盘符的值（如 "../../parsed/x.1"）可以越出缓存目录，而
+# _quarantine/失效逻辑会对拼出来的路径做 unlink，等于任意删除。
+# 不能收窄成纯十六进制：测试与图集 id 形如 "Ltest" / "gallery000000001"。
+_SAFE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def is_safe_id(value: object) -> bool:
+    """缓存键安全校验：只接受字母、数字、``_``、``-``（1..64 字符）。
+
+    调用方对非法值必须按"未命中/无效"处理，绝不能构造或删除路径。
+    """
+    return bool(_SAFE_ID_RE.fullmatch(str(value or "")))
 
 
 def normalize_vpath(raw: str, *, allow_empty: bool = False) -> str:

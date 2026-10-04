@@ -68,11 +68,19 @@ fun PageImage(
     onTapCenter: () -> Unit,
     onError: (String) -> Unit,
     modifier: Modifier = Modifier,
+    /** 当前槽位对应的页身份：变化（翻页 / 跨页步长变化）时复位页内缩放 */
+    pageKey: Any? = null,
     isCurrent: Boolean = true,
 ) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
     val zoomed = scale > ZOOM_EPSILON
+
+    // 换页（槽位映射到另一页）时复位缩放，避免把上一页的放大状态带过来
+    LaunchedEffect(pageKey) {
+        scale = 1f
+        offset = Offset.Zero
+    }
 
     // 重试用：attempt 作为请求级参数改变请求身份（强制 Coil 重新发起网络请求），
     // 但显式固定 memory/disk cache key —— 不像旧方案那样在 URL 上拼 `_r=N`，

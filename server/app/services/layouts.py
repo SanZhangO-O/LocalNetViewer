@@ -15,7 +15,6 @@ from typing import Any, Dict, List, Optional
 from ..cache.parsed import PARSER_VERSION, ParsedCache
 from ..cache.store import LayoutEntry, LayoutStore
 from ..formats.base import BookAdapter, BookRef
-from ..formats.comics import ComicAdapter
 from ..layout.engine import (
     FlowLayoutEngine,
     build_fixed_pagemap,
@@ -68,7 +67,7 @@ def effective_profile(config, adapter: BookAdapter, profile: LayoutProfile) -> L
         if profile.mode != "flow":
             update["mode"] = "flow"
     else:
-        if profile.mode == "strip" and not isinstance(adapter, ComicAdapter):
+        if profile.mode == "strip" and not adapter.supports_strip:
             update["mode"] = "fixed"
         elif profile.mode == "flow":
             update["mode"] = "fixed"
@@ -149,16 +148,36 @@ class LayoutService:
                 self.store.save(entry)
                 return self._result(entry, cache_hit=False)
 
-        # 固定版式 / 条漫：页集合每次实时枚举
-        if profile.mode == "strip":
-            slices = adapter.strip_pages(profile.avail_height, int(profile.strip_overlap_px))
-            pagemap = build_strip_pagemap(ref.book_id, layout_id, slices)
-        else:
-            pagemap = build_fixed_pagemap(ref.book_id, layout_id, adapter.page_count(), mode="fixed")
-        entry = LayoutEntry(
-            book_id=ref.book_id, layout_id=layout_id, profile=profile, pagemap=pagemap
-        )
-        self.store.save(entry)
+        # 固定版式 / 条漫：页集合每次实时枚举（不缓存页内容，设计 4.6）。
+        # 但枚举本身可能是重活（strip 要探测每张图的原始尺寸，PDF 要开文档），
+        # 与 flow 分页同等对待：同一 (book_id, layout_id) 加锁避免并发重复枚举 +
+        # run_with_timeout 超时保护（超时同样映射 PARSE_FAILED；若上一次枚举
+        # 超时后仍在跑，key 去重会让本次快速失败而不是再跑一遍）。
+        with self._locks.acquire((ref.book_id, layout_id)):
+            if profile.mode == "strip":
+                slices = run_with_timeout(
+                    lambda: adapter.strip_pages(
+                        profile.avail_height, int(profile.strip_overlap_px)
+                    ),
+                    timeout,
+                    "分页",
+                    key=("layout", ref.book_id, layout_id),
+                )
+                pagemap = build_strip_pagemap(ref.book_id, layout_id, slices)
+            else:
+                page_count = run_with_timeout(
+                    adapter.page_count,
+                    timeout,
+                    "分页",
+                    key=("layout", ref.book_id, layout_id),
+                )
+                pagemap = build_fixed_pagemap(
+                    ref.book_id, layout_id, page_count, mode="fixed"
+                )
+            entry = LayoutEntry(
+                book_id=ref.book_id, layout_id=layout_id, profile=profile, pagemap=pagemap
+            )
+            self.store.save(entry)
         return self._result(entry, cache_hit=False)
 
     @staticmethod

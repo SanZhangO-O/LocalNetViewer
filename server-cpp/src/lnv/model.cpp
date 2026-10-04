@@ -19,6 +19,34 @@ int saturating_int(long long v) {
     if (v < 0) return 0;
     return static_cast<int>(v);
 }
+
+// 共享缓存（parsed/layouts）可能被外部写坏：JSON 里的 double → int 在
+// NaN/Inf/超出 int 范围时是 UB（不只是实现定义），必须在 from_dict 层拦截。
+// 抛异常 → 上层 cache.get 按"损坏"删除文件，而不是拿垃圾值继续渲染。
+int cache_int(const nlohmann::json& v, int fallback) {
+    double d = static_cast<double>(fallback);
+    if (v.is_number()) {
+        d = v.get<double>();
+    } else if (v.is_boolean()) {
+        d = v.get<bool>() ? 1.0 : 0.0;
+    } else if (!v.is_null()) {
+        throw nlohmann::json::type_error::create(302,
+            "cache integer field is not a number", &v);
+    }
+    if (!std::isfinite(d) || d < static_cast<double>(std::numeric_limits<int>::min()) ||
+        d > static_cast<double>(std::numeric_limits<int>::max())) {
+        throw nlohmann::json::out_of_range::create(406, "cache integer field out of range", &v);
+    }
+    // C++20 起 static_cast<double>→int 截断语义确定；先显式 std::trunc 保持旧标准一致
+    return static_cast<int>(std::trunc(d));
+}
+
+// 对象字段版的 cache_int：缺失/null → fallback
+int cache_int_of(const nlohmann::json& obj, const char* key, int fallback) {
+    auto it = obj.find(key);
+    if (it == obj.end() || it->is_null()) return fallback;
+    return cache_int(*it, fallback);
+}
 }  // namespace
 
 // ---------------------------------------------------------------- JSON 工具
@@ -182,26 +210,29 @@ nlohmann::json LayoutProfile::to_json() const {
 }
 
 LayoutProfile LayoutProfile::from_dict(const nlohmann::json& j) {
-    // 落盘格式即 to_json 的输出；不重新校验
+    // 落盘格式即 to_json 的输出；不重新校验。整数统一走 cache_int（防坏缓存的
+    // double → int 窄化 UB；超出 int 范围抛异常 → 上层按损坏删除）。
     LayoutProfile p;
-    p.viewport.w = j["viewport"].value("w", 0);
-    p.viewport.h = j["viewport"].value("h", 0);
+    const auto& vp = j["viewport"];
+    p.viewport.w = cache_int_of(vp, "w", 0);
+    p.viewport.h = cache_int_of(vp, "h", 0);
     const auto& mg = j["margin"];
-    p.margin = {mg.value("left", 0), mg.value("right", 0), mg.value("top", 0), mg.value("bottom", 0)};
+    p.margin = {cache_int_of(mg, "left", 0), cache_int_of(mg, "right", 0),
+                cache_int_of(mg, "top", 0), cache_int_of(mg, "bottom", 0)};
     const auto& fs = j["font"];
     p.font.family = fs.value("family", "auto");
-    p.font.size_px = (int)fs.value("size_px", 52.0);
+    p.font.size_px = cache_int_of(fs, "size_px", 52);
     p.font.line_height = fs.value("line_height", 1.6);
     p.font.letter_spacing_px = fs.value("letter_spacing_px", 0.0);
     const auto& ps = j["paragraph"];
     p.paragraph.spacing_px = ps.value("spacing_px", 20.0);
-    p.paragraph.first_line_indent_chars = (int)ps.value("first_line_indent_chars", 2.0);
+    p.paragraph.first_line_indent_chars = cache_int_of(ps, "first_line_indent_chars", 2);
     const auto& is = j["image"];
     p.image.max_width_ratio = is.value("max_width_ratio", 1.0);
     p.image.max_height_ratio = is.value("max_height_ratio", 1.0);
     p.chapter_new_page = j.value("chapter_new_page", true);
     p.mode = j.value("mode", "flow");
-    p.strip_overlap_px = (int)j.value("strip_overlap_px", 0.0);
+    p.strip_overlap_px = cache_int_of(j, "strip_overlap_px", 0);
     return p;
 }
 
@@ -295,10 +326,10 @@ static Block block_from_dict(const nlohmann::json& d) {
         if (it != d.end() && it->is_string() && !it->get<std::string>().empty())
             b.spans.push_back({utf8_to_u32(it->get<std::string>()), SpanStyle::None});
     }
-    b.level = (int)d.value("level", 1.0);
+    b.level = cache_int_of(d, "level", 1);
     b.asset = d.value("asset", "");
-    b.w = (int)(d.contains("w") ? d["w"].get<double>() : 0);
-    b.h = (int)(d.contains("h") ? d["h"].get<double>() : 0);
+    b.w = cache_int_of(d, "w", 0);
+    b.h = cache_int_of(d, "h", 0);
     return b;
 }
 
@@ -330,7 +361,7 @@ DocumentModel DocumentModel::from_dict(const nlohmann::json& d) {
     if (d.contains("chapters") && d["chapters"].is_array())
         for (const auto& c : d["chapters"]) {
             Chapter ch;
-            ch.index = (int)c.value("index", 0.0);
+            ch.index = cache_int_of(c, "index", 0);
             ch.title = utf8_to_u32(c.value("title", ""));
             if (c.contains("blocks") && c["blocks"].is_array())
                 for (const auto& b : c["blocks"]) ch.blocks.push_back(block_from_dict(b));
@@ -355,16 +386,16 @@ nlohmann::json PageRecord::to_dict() const {
 
 PageRecord PageRecord::from_dict(const nlohmann::json& d) {
     PageRecord r;
-    r.page = (int)d.value("page", 0.0);
+    r.page = cache_int_of(d, "page", 0);
     if (d.contains("anchor") && d["anchor"].is_array() && d["anchor"].size() >= 3) {
-        r.anchor[0] = (int)d["anchor"][0].get<double>();
-        r.anchor[1] = (int)d["anchor"][1].get<double>();
-        r.anchor[2] = (int)d["anchor"][2].get<double>();
+        r.anchor[0] = cache_int(d["anchor"][0], 0);
+        r.anchor[1] = cache_int(d["anchor"][1], 0);
+        r.anchor[2] = cache_int(d["anchor"][2], 0);
     }
-    r.chapter_index = (int)d.value("chapter_index", 0.0);
+    r.chapter_index = cache_int_of(d, "chapter_index", 0);
     r.chapter_title = utf8_to_u32(d.value("chapter_title", ""));
     r.first_line = utf8_to_u32(d.value("first_line", ""));
-    r.image_index = (int)d.value("image_index", -1.0);
+    r.image_index = cache_int_of(d, "image_index", -1);
     r.y0 = d.value("y0", 0.0);
     r.height = d.value("height", 0.0);
     return r;
@@ -410,27 +441,27 @@ PageMap PageMap::from_dict(const nlohmann::json& d) {
     if (d.contains("chapters") && d["chapters"].is_array())
         for (const auto& c : d["chapters"]) {
             PageMapChapter ch;
-            ch.index = (int)c.value("index", 0.0);
+            ch.index = cache_int_of(c, "index", 0);
             ch.title = utf8_to_u32(c.value("title", ""));
             auto tc = c.find("total_chars");
-            if (tc != c.end() && tc->is_number()) ch.total_chars = (int)tc->get<double>();
+            if (tc != c.end() && !tc->is_null()) ch.total_chars = cache_int(*tc, 0);
             auto sp = c.find("start_page");
-            if (sp != c.end() && sp->is_number()) ch.start_page = (int)sp->get<double>();
+            if (sp != c.end() && !sp->is_null()) ch.start_page = cache_int(*sp, 0);
             m.chapters.push_back(std::move(ch));
         }
     if (d.contains("pages") && d["pages"].is_array())
         for (const auto& p : d["pages"]) m.pages.push_back(PageRecord::from_dict(p));
     m.total_pages = d.contains("total_pages") && !d["total_pages"].is_null()
-                        ? (int)d["total_pages"].get<double>()
-                        : (int)m.pages.size();
+                        ? cache_int(d["total_pages"], static_cast<int>(m.pages.size()))
+                        : static_cast<int>(m.pages.size());
     // 一致性兜底：total_pages 与 pages 长度不符（损坏/半截缓存）时以 pages 为准。
     // 否则 check_page 会放行 pages[page-1] 越界的页码（审查 M5）。
     if (m.total_pages != static_cast<int>(m.pages.size()))
         m.total_pages = static_cast<int>(m.pages.size());
     if (d.contains("end_anchor") && d["end_anchor"].is_array() && d["end_anchor"].size() >= 3) {
-        m.end_anchor[0] = (int)d["end_anchor"][0].get<double>();
-        m.end_anchor[1] = (int)d["end_anchor"][1].get<double>();
-        m.end_anchor[2] = (int)d["end_anchor"][2].get<double>();
+        m.end_anchor[0] = cache_int(d["end_anchor"][0], 0);
+        m.end_anchor[1] = cache_int(d["end_anchor"][1], 0);
+        m.end_anchor[2] = cache_int(d["end_anchor"][2], 0);
     } else if (!m.pages.empty()) {
         const auto& a = m.pages.back().anchor;
         m.end_anchor[0] = a[0];

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -55,6 +57,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # 渲染/解析都走 asyncio.to_thread 的默认线程池：显式按 CPU 核数限制
+        # （设计 4.9），避免 asyncio 默认的上限在高并发下把重活无限塞进线程池；
+        # 但同一线程池也承载阻塞式的适配器打开/关闭（CBR 起 unrar、MOBI 起
+        # ebook-convert），必须留出 IO 余量——只按 CPU 核数取 4 时，几个慢打开
+        # 就能占满全部 worker，饿死所有人的翻页。下限 8 兼顾两者。
+        # 超时执行器（util.concurrency）是独立实现，不受影响。
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=max(8, os.cpu_count() or 4))
+        )
         scan_task = (
             asyncio.create_task(ctx.library.scan_async(), name="library-scan")
             if background_scan
@@ -78,7 +89,8 @@ def create_app(
                     pass
             # 线程无法被强杀，等它协作式退出后再保存索引，避免两个线程写同一个文件
             await asyncio.to_thread(ctx.library.wait_idle, 10.0)
-            ctx.library.save_index()
+            # index.json 可能几 MB：落盘不能阻塞事件循环
+            await asyncio.to_thread(ctx.library.save_index)
             # 进度落盘是合并写入的，关停时必须强制刷一次，否则最后几次翻页会丢
             await asyncio.to_thread(ctx.progress.flush)
             logger.info("服务器已停止")

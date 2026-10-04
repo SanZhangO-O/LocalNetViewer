@@ -77,16 +77,20 @@ def _populate_caches(ctx, book_id: str, layout_id: str) -> None:
     ctx.parsed.save_disk(model)
     ctx.parsed.memory.put(book_id, model)
 
-    ctx.page_cache.put((book_id, layout_id, 1, "white", 1.0), (b"page", "image/png"), 4)
-    ctx.cover_cache.put(("cover", book_id, 240), (b"cover", "image/jpeg"), 5)
+    ctx.page_cache.put(
+        (book_id, layout_id, "rev-test", 1, "white", 1.0), (b"page", "image/png"), 4
+    )
+    ctx.cover_cache.put(("cover", book_id, "rev-test", 240), (b"cover", "image/jpeg"), 5)
 
 
 def _assert_caches_cleared(ctx, book_id: str, layout_id: str) -> None:
     assert ctx.layout_store.get(book_id, layout_id) is None, "布局缓存未失效"
     assert ctx.parsed.load_disk(book_id) is None, "解析缓存未失效"
     assert ctx.parsed.get_memory(book_id) is None, "解析内存缓存未失效"
-    assert ctx.page_cache.get((book_id, layout_id, 1, "white", 1.0)) is None, "页面缓存未失效"
-    assert ctx.cover_cache.get(("cover", book_id, 240)) is None, "封面缓存未失效"
+    assert (
+        ctx.page_cache.get((book_id, layout_id, "rev-test", 1, "white", 1.0)) is None
+    ), "页面缓存未失效"
+    assert ctx.cover_cache.get(("cover", book_id, "rev-test", 240)) is None, "封面缓存未失效"
 
 
 def test_same_size_edit_invalidates_all_derived_caches(context, tmp_books: Path):

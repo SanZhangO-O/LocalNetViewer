@@ -19,8 +19,15 @@ class ReaderRepository(private val client: ApiClient) {
     suspend fun registerLayout(bookId: String, profile: LayoutProfileDto): LayoutResponseDto =
         apiCall(client) { client.api().registerLayout(bookId, profile) }
 
-    suspend fun pageMeta(bookId: String, page: Int, layoutId: String): PageMetaDto =
-        apiCall(client) { client.api().pageMeta(bookId, page, layoutId) }
+    suspend fun pageMeta(
+        bookId: String,
+        page: Int,
+        layoutId: String,
+        revision: String = "",
+    ): PageMetaDto =
+        apiCall(client) {
+            client.api().pageMeta(bookId, page, layoutId, revision.takeIf { it.isNotEmpty() })
+        }
 
     suspend fun locate(bookId: String, layoutId: String, anchor: AnchorDto): LocateResponseDto =
         apiCall(client) {
@@ -57,6 +64,7 @@ class ReaderRepository(private val client: ApiClient) {
         pair: Boolean,
         rtl: Boolean,
         fixed: Boolean,
+        revision: String,
     ): String = client.absoluteUrl(
         ApiPaths.page(
             bookId = bookId,
@@ -69,6 +77,7 @@ class ReaderRepository(private val client: ApiClient) {
             pair = pair,
             rtl = rtl,
             fixed = fixed,
+            revision = revision,
         )
     )
 }

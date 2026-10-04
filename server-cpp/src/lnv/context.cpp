@@ -2,6 +2,7 @@
 #include "lnv/auth.h"
 #include "lnv/formats/registry.h"
 #include "lnv/netinfo.h"
+#include "lnv/util/paths.h"
 
 namespace lnv {
 
@@ -10,7 +11,7 @@ std::unique_ptr<AppContext> AppContext::create(AppConfig config, bool background
     ctx->cfg = std::move(config);
     ensure_dirs(ctx->cfg);
 
-    ctx->fonts = std::make_unique<FontManager>();
+    ctx->fonts = std::make_shared<FontManager>();
     ctx->fonts->init(ctx->cfg.fonts_dir(), ctx->cfg.render.default_font);
 
     ctx->library = std::make_unique<LibraryService>(ctx->cfg);
@@ -26,13 +27,16 @@ std::unique_ptr<AppContext> AppContext::create(AppConfig config, bool background
                                                       ctx->cfg.cache.parsed_max_mb);
     ctx->layouts_cache = std::make_unique<LayoutsDiskCache>(ctx->cfg.layouts_cache_dir(),
                                                             ctx->cfg.cache.layouts_max_mb);
-    ctx->layouts = std::make_unique<LayoutsService>(ctx->cfg, *ctx->fonts,
+    ctx->layouts = std::make_unique<LayoutsService>(ctx->cfg, ctx->fonts,
                                                     *ctx->layouts_cache, *ctx->parsed_cache);
 
     ctx->page_cache = std::make_unique<LruCache>(ctx->cfg.cache.page_lru_bytes,
                                                  ctx->cfg.cache.page_lru_pages);
     ctx->cover_cache = std::make_unique<LruCache>(64LL * 1024 * 1024, 256);
     ctx->gate = nullptr;  // 解析闸门由 services.cpp 的进程级 ParseGate 承担
+
+    // MOBI 转换产物（cache/converted）启动时按 2GiB 配额做一次 mtime-LRU 清理
+    enforce_dir_quota(ctx->cfg.cache_dir() / "converted", 2LL * 1024 * 1024 * 1024);
 
     // 书籍内容变化 → 丢弃全部由旧内容派生的缓存（对应 Python context.py:59）。
     // 少了这一步，"同尺寸就地编辑"会让服务器永远返回旧分页与旧页面图。
@@ -53,8 +57,9 @@ void AppContext::shutdown() {
         library->wait_idle(10.0);
         library->save_index();
     }
-    // 再等解析/分页 worker 收尾（最多 10s）：它们捕获了 FontManager/AppContext 资源，
-    // 销毁上下文时仍在跑会访问悬垂对象。超时的卡死任务放弃等待（无法强杀）。
+    // 再等解析/分页 worker 收尾（最多 10s）：它们按值捕获了 FontManager 的
+    // shared_ptr、DocumentModel 的 shared_ptr 与各自的配置副本，即使超时后活过
+    // AppContext 也不会悬垂；这里等一等只是让关停更干净。卡死任务放弃等待（无法强杀）。
     wait_parse_tasks_idle(10.0);
     if (progress) progress->flush();
 }
@@ -76,40 +81,58 @@ std::optional<BookRef> AppContext::require_book(const std::string& book_id) cons
 
 void AppContext::invalidate_book_caches(const std::string& book_id) {
     // 与 Python context.invalidate_book_caches 对齐：布局（磁盘 + LayoutsService 内存层）、
-    // 解析（磁盘 + 热文档）、页面图与封面。只清磁盘不清 LayoutsService 的内存 LRU 时，
-    // 内容变更后 /layout 仍会命中旧 PageMap 直到进程重启。
+    // 解析（磁盘 + 热文档）、页面图与封面，以及 MOBI 转换产物。只清磁盘不清
+    // LayoutsService 的内存 LRU 时，内容变更后 /layout 仍会命中旧 PageMap 到进程重启。
+    // rev 由 size/mtime 现算，内容变化后自然变新（缓存键/ETag 不再命中）。
     layouts->invalidate_book(book_id);
     layouts_cache->invalidate_book(book_id);
     std::error_code ec;
     std::filesystem::remove(
         cfg.parsed_cache_dir() / (book_id + "." + kParsedCacheVersion + ".json.gz"), ec);
+    // MOBI/AZW3：内容变化后旧转换产物必须丢弃（否则 /layout 仍读旧 EPUB）。
+    // 产物按 revision 命名（{book_id}.{rev}.epub），新 rev 天然不命中旧文件；
+    // 这里再清掉该书全部旧 rev 产物与 .tmp（含在途转换先写的临时文件），
+    // 避免竞态窗口里旧产物被再次采用或堆积。
+    {
+        std::error_code dir_ec;
+        std::filesystem::directory_iterator it(cfg.cache_dir() / "converted", dir_ec);
+        const std::string prefix = book_id + ".";
+        for (auto end = std::filesystem::directory_iterator(); !dir_ec && it != end;
+             it.increment(dir_ec)) {
+            const std::string name = path_to_utf8(it->path().filename());
+            if (name.compare(0, prefix.size(), prefix) == 0) {
+                std::error_code rec;
+                std::filesystem::remove(it->path(), rec);
+            }
+        }
+    }
     auto contains = [&](const std::string& key) {
         return key.find(book_id) != std::string::npos;
     };
     cover_cache->remove_if(contains);
     page_cache->remove_if(contains);
-    layout_memory.remove_if(contains);
-    doc_memory.remove_if(contains);
 }
 
 std::optional<LayoutEntry> AppContext::require_layout(const std::string& book_id,
                                                       const std::string& layout_id) {
-    std::string key = book_id + ":" + layout_id;
-    if (auto e = layout_memory.get(key)) {
-        return e;
-    }
-    auto entry = layouts_cache->get(book_id, layout_id);
+    // 读穿 LayoutsService 的统一内存/磁盘缓存（与 /layout、/search 共用一套，
+    // 失效路径只需清它自己的 memory_/doc_memory_）
+    auto entry = layouts->entry(book_id, layout_id);
     if (!entry) {
         throw AppError(ErrorCode::LayoutNotFound,
                        "layout_id 不存在或已失效，请重新 POST /layout",
                        nlohmann::json{{"book_id", book_id}, {"layout_id", layout_id}});
     }
-    layout_memory.put(key, *entry);
     return entry;
 }
 
 std::unique_ptr<BookAdapter> AppContext::open_adapter(const BookRef& ref) {
-    return create_adapter(cfg, ref);
+    // 重活闸门：适配器构造可能触发外部解压列表 / MOBI 转换（分钟级）。
+    // 可重入，MOBI 内部再取不会重复占槽；持闸门期间不等待解析闸门。
+    auto heavy = heavy_gate().acquire();
+    AdapterEnv env;
+    env.fonts = fonts.get();
+    return create_adapter(cfg, ref, env);
 }
 
 // ---------------------------------------------------------------- HTTP 缓存
@@ -130,10 +153,11 @@ static std::string scale_tag_of(double scale) {
     return buf;
 }
 
-std::string AppContext::page_etag(const std::string& layout_id, int page,
+std::string AppContext::page_etag(const std::string& layout_id, const std::string& rev, int page,
                                   const std::string& theme, double scale, const std::string& fit,
                                   std::optional<int> quality, bool pair, bool rtl, bool fixed) {
-    std::vector<std::string> parts = {layout_id, fixed ? "-" : theme, scale_tag_of(scale),
+    // 契约：rev 是第二段 → "<layout_id>:<rev>:<theme|->:<scale_tag>:<page>[:extras]"
+    std::vector<std::string> parts = {layout_id, rev, fixed ? "-" : theme, scale_tag_of(scale),
                                       std::to_string(page)};
     if (fixed) {
         parts.push_back(fit);
@@ -151,10 +175,11 @@ std::string AppContext::page_etag(const std::string& layout_id, int page,
 }
 
 std::string AppContext::page_cache_key(const std::string& book_id, const std::string& layout_id,
-                                       int page, const std::string& theme, double scale,
-                                       const std::string& fit, std::optional<int> quality,
-                                       bool pair, bool rtl, bool fixed) {
-    std::vector<std::string> parts = {book_id, layout_id, std::to_string(page),
+                                       const std::string& rev, int page, const std::string& theme,
+                                       double scale, const std::string& fit,
+                                       std::optional<int> quality, bool pair, bool rtl, bool fixed) {
+    // 契约顺序：[book_id, layout_id, rev, page, theme|"", scale]（+ fixed 附加项不变）
+    std::vector<std::string> parts = {book_id, layout_id, rev, std::to_string(page),
                                       fixed ? "" : theme, scale_tag_of(scale)};
     if (fixed) {
         parts.push_back(fit);

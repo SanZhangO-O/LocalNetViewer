@@ -13,7 +13,8 @@ class MobiAdapter : public BookAdapter {
 public:
     // ebook-convert 缺失 → UnsupportedFormatError("MOBI/AZW3 需要 Calibre","需安装 Calibre")
     // 转换失败 → ParseError（stderr 尾 500 字节入 message）
-    MobiAdapter(const AppConfig& cfg, const BookRef& ref);
+    // env 透传给内层 EPUB 适配器（字体管理器，坏书封面用）
+    MobiAdapter(const AppConfig& cfg, const BookRef& ref, const AdapterEnv& env = {});
 
     // 委托内层 EPUB 适配器，format 字段改回 mobi/azw3
     AdapterMeta meta() override;
@@ -28,6 +29,7 @@ private:
 
     AppConfig cfg_;
     BookRef ref_;
+    AdapterEnv env_;                      // 透传给内层 EpubAdapter（仅存指针）
     std::unique_ptr<BookAdapter> inner_;  // EpubAdapter（由 create_epub_adapter 创建）
 };
 

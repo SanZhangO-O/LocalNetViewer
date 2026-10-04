@@ -224,6 +224,8 @@ class BookRef:
     size: int = 0
     mtime: float = 0.0
     virtual: bool = False
+    # 内容修订号（sha1(id:size:mtime)[:12]，跨实现契约）：用于 ETag 与缓存键
+    revision: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -286,7 +288,16 @@ class AssetNotFoundError(Exception):
 
 
 class ParseTimeoutError(ParseError):
-    """解析超时（PARSE_FAILED，附原因）。"""
+    """解析超时（PARSE_FAILED，附原因）。
+
+    ``orphaned=True`` 表示超时发生时工作线程**仍在运行**、可能还在读取调用方
+    持有的适配器：调用方必须跳过 ``close()``，把关闭交给 GC（工作线程释放
+    最后一个引用后由 ``BookAdapter.__del__`` 兜底，且 close 必须可重复调用）。
+    """
+
+    def __init__(self, message: str, *, orphaned: bool = False) -> None:
+        super().__init__(message)
+        self.orphaned = bool(orphaned)
 
 
 class ServerBusyError(ParseError):
@@ -321,21 +332,54 @@ class BookAdapter(ABC):
     def __init__(self, env: AdapterEnv, ref: BookRef) -> None:
         self.env = env
         self.ref = ref
+        # 超时遗弃标记：工作线程仍在使用本适配器时，调用方不得 close()（见 mark_orphaned）
+        self._orphaned = False
+        self._closed = False
 
     # ------------------------------------------------------------- 生命周期
     def close(self) -> None:  # pragma: no cover - 默认无资源
         return None
 
+    def __del__(self) -> None:
+        # 兜底关闭：正常路径已 close（mark_closed）的跳过；被 mark_orphaned() 遗弃的
+        # 适配器在工作线程释放后被 GC 收到这里。半构造对象（__init__ 中途抛错）也要容错。
+        if getattr(self, "_closed", False):
+            return
+        try:
+            self.close()
+        except BaseException:  # noqa: BLE001 - 解释器退出/半构造对象都不能报错
+            pass
+
+    def mark_orphaned(self) -> None:
+        """标记：超时工作线程仍可能使用本适配器，调用方应跳过 close()（交给 GC）。"""
+        self._orphaned = True
+
+    def mark_closed(self) -> None:
+        """正常 close 成功后调用：GC 兜底不再重复 close（恰好关闭一次）。"""
+        self._closed = True
+
+    @property
+    def orphaned(self) -> bool:
+        return bool(getattr(self, "_orphaned", False))
+
     def __enter__(self) -> "BookAdapter":
         return self
 
     def __exit__(self, *exc: Any) -> None:
-        self.close()
+        try:
+            self.close()
+        finally:
+            self._closed = True
 
     # ------------------------------------------------------------- 通用能力
     @abstractmethod
     def meta(self) -> AdapterMeta:
         """容器级元数据（meta 阶段必须快）。"""
+
+    @property
+    def supports_strip(self) -> bool:
+        """是否支持条漫切片（仅漫画 / 图集容器，设计 7.4）。"""
+        return False
 
     def cover(self, width: int = 0) -> Optional[Tuple[bytes, str]]:
         """封面图字节（JPEG/PNG）。无封面返回 None，由调用方生成占位。"""

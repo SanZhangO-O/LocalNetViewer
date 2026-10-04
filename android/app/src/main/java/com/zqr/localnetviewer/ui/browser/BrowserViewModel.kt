@@ -22,6 +22,7 @@ import kotlinx.coroutines.launch
 class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
     private val repository = app.libraryRepository
+    private val appRef = app
 
     data class UiState(
         val path: String = "/",
@@ -35,6 +36,8 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
         val scanning: Boolean = false,
         val error: String? = null,
         val message: String? = null,
+        /** 已连接服务器概要（原名 App.serverSummary，移到这里避免 Composable 直接读 App）。 */
+        val serverSummary: String = "",
     ) {
         val canOpenCurrentAsGallery: Boolean
             get() = gallery?.canOpenAsBook == true
@@ -56,6 +59,7 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     private var loadMoreJob: Job? = null
 
     init {
+        _state.update { it.copy(serverSummary = appRef.serverSummary) }
         load("/")
     }
 
@@ -77,6 +81,7 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
                         scanning = response.scanning,
                         loading = false,
                         loadingMore = false,
+                        serverSummary = appRef.serverSummary,
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -171,6 +176,10 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     fun consumeOpenBook() {
         _openBook.value = null
     }
+
+    /** 书封 URL（Composable 不直接触碰 repository，设计分层；带服务端 rev）。 */
+    fun coverUrl(entry: FileEntryDto, width: Int = 240): String =
+        repository.coverUrl(entry, width)
 
     fun consumeMessage() {
         _state.update { it.copy(message = null) }

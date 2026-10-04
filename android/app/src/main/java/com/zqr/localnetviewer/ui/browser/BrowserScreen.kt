@@ -113,10 +113,10 @@ fun BrowserScreen(
                         // 服务器名/版本/书库数（设计 6.3）：连接页在连接成功后立刻被
                         // 移出返回栈，信息放在这里才真的看得见
                         val subtitle = when {
-                            state.scanning && app.serverSummary.isNotEmpty() ->
-                                "书库扫描中… · ${app.serverSummary}"
+                            state.scanning && state.serverSummary.isNotEmpty() ->
+                                "书库扫描中… · ${state.serverSummary}"
                             state.scanning -> "书库扫描中…"
-                            else -> app.serverSummary
+                            else -> state.serverSummary
                         }
                         if (subtitle.isNotEmpty()) {
                             Text(
@@ -185,7 +185,7 @@ fun BrowserScreen(
                     itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
                         EntryRow(
                             entry = entry,
-                            coverUrl = entry.bookId?.let { app.libraryRepository.coverUrl(it, 240) },
+                            coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
                             onClick = { vm.onEntryClick(entry) },
                             onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
                             opening = state.opening,

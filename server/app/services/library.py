@@ -35,6 +35,7 @@ from ..util.paths import (
     parent_vpath,
     resolve_in_root,
 )
+from ..util.textutil import content_revision
 from . import gallery as gallery_mod
 
 INDEX_VERSION = 1
@@ -92,7 +93,9 @@ class LibraryService:
         self._by_id: Dict[str, str] = {}
         self._gallery_counts: Dict[str, Dict[str, Any]] = {}
         self._scanned_at: float = 0.0
-        self._scanning: bool = False
+        # scanning 是跨线程读写的状态位（请求线程 / 扫描线程 / 关停线程）：用 Event
+        # 而不是裸 bool，避免读到过期值（/files 的 scanning 字段必须准确）
+        self._scanning = threading.Event()
         self._dirty: bool = False
         # 落盘代数：快照时 +1，_mark_dirty 时 +1。写盘成功后仅当代数未变
         # （期间没有新变更）才清 dirty，避免误清并发写入的标记（与 progress 同一套）
@@ -197,7 +200,7 @@ class LibraryService:
     # ------------------------------------------------------------ 扫描
     @property
     def scanning(self) -> bool:
-        return self._scanning
+        return self._scanning.is_set()
 
     @property
     def warnings(self) -> List[str]:
@@ -209,20 +212,28 @@ class LibraryService:
 
     def libraries_info(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
+        # 直接在锁内按 root 计数：旧实现每次 /server/info 都 dict(self._books)
+        # 复制整份索引（每本书一个 dict），书库大时纯属浪费
         with self._lock:
-            books = dict(self._books)
-        for root in self.config.library.roots:
-            prefix = f"/{root.name}"
-            count = sum(1 for vp in books if vp == prefix or vp.startswith(prefix + "/"))
-            out.append({"name": root.name, "book_count": count, "path": root.path})
+            for root in self.config.library.roots:
+                prefix = f"/{root.name}"
+                count = sum(
+                    1
+                    for vp in self._books
+                    if vp == prefix or vp.startswith(prefix + "/")
+                )
+                out.append(
+                    {"name": root.name, "book_count": count, "path": root.path}
+                )
         return out
 
     def scan_blocking(self) -> None:
         """全量/增量扫描（同步，供启动预热与后台线程调用）。"""
         if not self._scan_lock.acquire(blocking=False):
             return
-        self._scanning = True
+        self._scanning.set()
         self._cancel_scan.clear()
+        changed_old_ids: List[str] = []
         try:
             with self._lock:
                 prev_books = dict(self._books)
@@ -236,7 +247,9 @@ class LibraryService:
                         f"书库根目录不存在，已跳过: {root.name} ({root.path})"
                     )
                     continue
-                self._scan_root(root, root_path, prev_books, books, counts)
+                self._scan_root(
+                    root, root_path, prev_books, books, counts, changed_old_ids
+                )
             if self.config.gallery.recursive:
                 _rollup_gallery_counts(counts)
             with self._lock:
@@ -247,8 +260,12 @@ class LibraryService:
                 self._warnings = warnings
                 self._dirty = True
         finally:
-            self._scanning = False
+            self._scanning.clear()
             self._scan_lock.release()
+        # 内容变化通知必须在锁外：监听者会清磁盘/内存缓存（可能做 IO），
+        # 持锁通知容易与请求线程互等；每个旧 book_id 只通知一次
+        for old_id in dict.fromkeys(changed_old_ids):
+            self._notify_content_changed(old_id)
         self.save_index()
 
     async def scan_async(self) -> None:
@@ -265,10 +282,10 @@ class LibraryService:
             if self._scan_lock.acquire(blocking=False):
                 self._scan_lock.release()
                 return True
-            if not self._scanning:
+            if not self._scanning.is_set():
                 return True
             time.sleep(0.1)
-        return not self._scanning
+        return not self._scanning.is_set()
 
     def _scan_root(
         self,
@@ -277,6 +294,7 @@ class LibraryService:
         prev_books: Dict[str, Dict[str, Any]],
         books: Dict[str, Dict[str, Any]],
         counts: Dict[str, Dict[str, Any]],
+        changed_old_ids: List[str],
     ) -> None:
         patterns = list(self.config.comic.skip_entries)
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
@@ -337,6 +355,20 @@ class LibraryService:
                     book_id = str(prev["book_id"])
                 else:
                     book_id = compute_book_id(real, int(st.st_size))
+                    # 实际内容变化：登记旧 id，扫描提交后在锁外通知监听者
+                    # （旧实现静默吞掉变化，派生缓存永远不会失效）
+                    old_id = str(prev.get("book_id") or "") if prev else ""
+                    if old_id and self._claim_scan_change(
+                        vpath,
+                        old_id,
+                        book_id,
+                        fmt,
+                        int(st.st_size),
+                        float(st.st_mtime),
+                        prev_size=int(prev.get("size", -1)),
+                        prev_mtime=float(prev.get("mtime", 0.0)),
+                    ):
+                        changed_old_ids.append(old_id)
                 books[vpath] = {
                     "book_id": book_id,
                     "format": fmt,
@@ -345,6 +377,49 @@ class LibraryService:
                 }
 
             counts[vdir] = {"count": image_count, "mtime": dir_mtime}
+
+    def _claim_scan_change(
+        self,
+        vpath: str,
+        old_id: str,
+        book_id: str,
+        fmt: str,
+        size: int,
+        mtime: float,
+        *,
+        prev_size: int,
+        prev_mtime: float,
+    ) -> bool:
+        """扫描检测到内容变化时，把 ``_books[vpath]`` 从旧 id 切换到新记录。
+
+        返回 True 表示这次变化由扫描负责通知旧 id；若请求线程的 ``_book_id_for``
+        已抢先切换并通知过，则返回 False，避免同一次变化通知两次。别名清理与
+        ``_book_id_for`` 一致：立即摘掉旧别名、登记新 id，扫描结束时会整体重建
+        ``_by_id``。
+
+        只比较 book_id 是不够的：1MB 之后的等长编辑指纹不变，请求线程处理完
+        live 记录的 book_id 仍是旧 id，但 size/mtime 已刷新为新值。必须同时
+        要求 live 仍停留在**变化前**的 size/mtime，否则这次变化已经有人通知过。
+        """
+        with self._lock:
+            live = self._books.get(vpath)
+            if live is None or str(live.get("book_id") or "") != old_id:
+                return False
+            if (
+                int(live.get("size", -1)) != int(prev_size)
+                or abs(float(live.get("mtime", 0.0)) - float(prev_mtime)) >= 1e-6
+            ):
+                return False
+            self._books[vpath] = {
+                "book_id": book_id,
+                "format": fmt,
+                "size": int(size),
+                "mtime": float(mtime),
+            }
+            if old_id != book_id and self._by_id.get(old_id) == vpath:
+                self._by_id.pop(old_id, None)
+            self._by_id[book_id] = vpath
+            return True
 
     # ------------------------------------------------------------ 目录图片数
     def dir_gallery_info(self, vpath: str, real: Optional[Path] = None) -> DirGalleryInfo:
@@ -533,6 +608,8 @@ class LibraryService:
             book_id = self._book_id_for(
                 child_vpath, Path(entry.path), st.st_size, st.st_mtime, fmt
             )
+            # 封面 URL 带内容修订号：内容变化后 URL 变化，客户端强缓存自然失效
+            rev = content_revision(book_id, int(st.st_size), float(st.st_mtime))
             reason = registry.openable_reason(fmt)
             files.append(
                 {
@@ -543,7 +620,7 @@ class LibraryService:
                     "book_id": book_id,
                     "size": int(st.st_size),
                     "mtime": iso_time(st.st_mtime),
-                    "cover_url": f"/api/v1/books/{book_id}/cover",
+                    "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
                     "openable": reason is None,
                     "reason": reason,
                 }
@@ -568,7 +645,7 @@ class LibraryService:
             "total": total,
             "limit": int(limit),
             "offset": int(offset),
-            "scanning": self._scanning,
+            "scanning": self._scanning.is_set(),
         }
 
     def _list_roots(self, limit: int, offset: int) -> Dict[str, Any]:
@@ -596,7 +673,7 @@ class LibraryService:
             "total": total,
             "limit": int(limit),
             "offset": int(offset),
-            "scanning": self._scanning,
+            "scanning": self._scanning.is_set(),
         }
 
     def _book_id_for(
@@ -613,10 +690,20 @@ class LibraryService:
                 return str(info["book_id"])
         book_id = compute_book_id(real, size)
         with self._lock:
+            # 并发重复检测：另一个线程（或扫描）已经完成本次切换并通知过旧 id，
+            # 直接沿用其结果，避免同一次变化通知两次
+            info = self._books.get(vpath)
+            if (
+                info
+                and int(info.get("size", -1)) == int(size)
+                and abs(float(info.get("mtime", 0.0)) - float(mtime)) < 1e-6
+                and info.get("format") == fmt
+            ):
+                return str(info["book_id"])
             # 同一个 vpath 换了内容 → 旧 book_id 必须彻底作废，否则 _by_id 里会留下
             # 一个"指向同一路径、却声称自己是旧 id"的别名：客户端拿着旧 id 请求时，
             # 会拿到新文件的内容（size/mtime 都已刷新，检测不到任何变化）
-            previous = str(self._books.get(vpath, {}).get("book_id") or "")
+            previous = str(info.get("book_id") or "") if info else ""
             self._books[vpath] = {
                 "book_id": book_id,
                 "format": fmt,
@@ -627,6 +714,11 @@ class LibraryService:
                 self._by_id.pop(previous, None)
             self._by_id[book_id] = vpath
             self._dirty = True
+        if previous:
+            # 内容变化通知必须在锁外：监听者会清磁盘/内存缓存（可能做 IO）。
+            # previous 未必等于 book_id（1MB 之后的等长编辑指纹不变），
+            # 只要检测到变化就丢弃该 id 的全部派生缓存。
+            self._notify_content_changed(previous)
         return book_id
 
     # ------------------------------------------------------------ 书籍引用
@@ -657,27 +749,38 @@ class LibraryService:
                         int(info.get("size", -1)) != int(st.st_size)
                         or abs(float(info.get("mtime", 0.0)) - float(st.st_mtime)) > 1e-6
                     ):
-                        old_id = bid
                         refreshed = self._book_id_for(
                             vpath, real, int(st.st_size), float(st.st_mtime), fmt
                         )
+                        # 内容变化通知已由 _book_id_for 在锁外统一发出（旧 id 一次），
+                        # 这里只决定旧 id 是否还能继续交付
                         # book_id 只覆盖"大小 + 文件头 1MB"，1MB 之后的等长编辑
                         # （TXT 勘误的常见形态）算出来的指纹和旧的一样。此时若只更新
                         # size/mtime 就继续用旧缓存，会永远读到旧分页与旧页面图。
                         # 所以：只要检测到文件变化就丢弃该 book_id 的全部派生缓存。
-                        self._notify_content_changed(old_id)
-                        if refreshed != old_id:
+                        if refreshed != bid:
                             # 内容指纹真的变了：旧 id 已失效，客户端需重新扫描
                             return None
                         info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
+                else:
+                    # 防御：_by_id 有记录但 _books 无详情（索引不一致）时补一次 stat
+                    try:
+                        st = real.stat()
+                    except OSError:
+                        st = None
+                    if st is not None:
+                        info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
+                size = int(info.get("size", 0))
+                mtime = float(info.get("mtime", 0.0))
                 return BookRef(
                     book_id=bid,
                     vpath=vpath,
                     path=real,
                     format=fmt,
-                    size=int(info.get("size", 0)),
-                    mtime=float(info.get("mtime", 0.0)),
+                    size=size,
+                    mtime=mtime,
                     virtual=False,
+                    revision=content_revision(bid, size, mtime),
                 )
         if self.gallery is not None:
             ref = self.gallery.resolve(bid)
@@ -694,18 +797,26 @@ class LibraryService:
             return None
         fmt = str(info.get("format") or registry.format_of(v) or "")
         book_id = str(info.get("book_id") or "") or compute_book_id(real)
-        try:
-            size = int(info.get("size", 0)) or int(real.stat().st_size)
-        except OSError:
+        if info:
             size = int(info.get("size", 0))
+            mtime = float(info.get("mtime", 0.0))
+        else:
+            try:
+                st = real.stat()
+                size = int(st.st_size)
+                mtime = float(st.st_mtime)
+            except OSError:
+                size = 0
+                mtime = 0.0
         return BookRef(
             book_id=book_id,
             vpath=v,
             path=real,
             format=fmt,
             size=size,
-            mtime=float(info.get("mtime", 0.0)),
+            mtime=mtime,
             virtual=False,
+            revision=content_revision(book_id, size, mtime),
         )
 
     def dir_ref(self, vpath: str, recursive: Optional[bool] = None) -> Optional[BookRef]:
@@ -723,7 +834,7 @@ class LibraryService:
                 "books": len(self._books),
                 "gallery_dirs": len(self._gallery_counts),
                 "scanned_at": self._scanned_at,
-                "scanning": self._scanning,
+                "scanning": self._scanning.is_set(),
                 "warnings": list(self._warnings),
             }
 

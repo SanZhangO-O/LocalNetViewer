@@ -130,7 +130,9 @@ class SettingsStore(private val context: Context) {
      * 调用方无需处理异常（UI 已经按新值渲染）。
      */
     suspend fun update(transform: (AppSettings) -> AppSettings): AppSettings {
-        var next = current()
+        // 返回值必须与事务内基于磁盘当前值算出的结果一致：事务外先 current()
+        // 可能拿到并发写入前的过期快照，返回它就会与"实际落盘值"不一致
+        var next: AppSettings? = null
         runCatchingIo {
             store.edit { prefs ->
                 val updated = transform(decodeSettings(prefs[KEY_SETTINGS]))
@@ -138,7 +140,8 @@ class SettingsStore(private val context: Context) {
                 prefs[KEY_SETTINGS] = prefsJson.encodeToString(updated)
             }
         }
-        return next
+        // 落盘失败（磁盘满等）时退回当前磁盘快照，保持尽力而为的既有语义
+        return next ?: current()
     }
 
     suspend fun setServer(url: String, token: String): AppSettings =

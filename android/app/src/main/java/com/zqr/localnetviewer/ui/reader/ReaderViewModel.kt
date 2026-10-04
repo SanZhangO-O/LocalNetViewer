@@ -59,6 +59,8 @@ class ReaderViewModel(
         /** flow | fixed | strip */
         val mode: String = "flow",
         val layoutId: String? = null,
+        /** 服务器内容修订号（旧服务器可能缺省为空串）：页面 URL 携带它避免命中旧缓存 */
+        val revision: String = "",
         val totalPages: Int = 0,
         val currentPage: Int = 1,
         val chapterTitle: String = "",
@@ -147,6 +149,14 @@ class ReaderViewModel(
         viewModelScope.launch {
             val settings = settingsStore.current()
             _state.update { it.copy(settings = settings) }
+            // 竞态：首次 /layout 可能先于设置加载完成（用默认设置排了版）。
+            // 设置就位后核对签名，不一致就重排，避免整本书一直用默认字号。
+            if (initialLayoutStarted) {
+                val wanted = currentSignature()
+                if (wanted != null && wanted != currentSignature) {
+                    scheduleRelayout(300)
+                }
+            }
         }
         viewModelScope.launch { loadFonts() }
         viewModelScope.launch { openBook() }
@@ -166,6 +176,7 @@ class ReaderViewModel(
                     author = meta.author,
                     format = meta.format,
                     mode = meta.mode,
+                    revision = meta.revision,
                     chapters = meta.chapters,
                     loading = true,
                     error = null,
@@ -190,7 +201,7 @@ class ReaderViewModel(
     }
 
     private suspend fun loadFonts() {
-        runCatching { readerRepository.fonts() }.onSuccess { response ->
+        runCatchingIo { readerRepository.fonts() }.onSuccess { response ->
             _state.update { it.copy(fonts = response.fonts) }
         }
     }
@@ -243,8 +254,12 @@ class ReaderViewModel(
         val snapshot = _state.value
         _state.update { it.copy(preparing = true, error = null, errorCode = null) }
         val profile = buildLayoutProfile(viewport, snapshot.settings, density, insets, snapshot.mode)
+        // 记录"本次排版实际使用的输入签名"：设置可能在请求期间变化，不能等响应
+        // 回来再按最新 settings 计算，否则会掩盖差异、永远不重排（见 init 的竞态处理）
+        val signature = profileSignature(viewport, snapshot.settings, density, insets, snapshot.mode)
         try {
             val layout = readerRepository.registerLayout(bookId, profile)
+            currentSignature = signature
             if (layout.totalPages <= 0) {
                 // 空文件 / 目录内没有图片：明确提示，避免一直停在加载态
                 _state.update {
@@ -267,7 +282,7 @@ class ReaderViewModel(
                 ?: ratioFor(snapshot.currentPage, snapshot.totalPages)
             val total = max(1, layout.totalPages)
             val target = when {
-                anchor != null -> runCatching {
+                anchor != null -> runCatchingIo {
                     readerRepository.locate(bookId, layout.layoutId, anchor).page
                 }.getOrDefault(1)
                 fallbackRatio != null && fallbackRatio > 0f -> {
@@ -283,6 +298,8 @@ class ReaderViewModel(
             _state.update {
                 it.copy(
                     layoutId = layout.layoutId,
+                    // 旧服务器可能不带 revision：保留 meta 阶段拿到的值
+                    revision = layout.revision.ifEmpty { it.revision },
                     totalPages = layout.totalPages,
                     mode = layout.mode,
                     chapters = chapters,
@@ -293,7 +310,6 @@ class ReaderViewModel(
                     errorCode = null,
                 )
             }
-            currentSignature = currentSignature()
             onPageSettled(_state.value.currentPage, immediate = true)
         } catch (cancelled: CancellationException) {
             // 防抖取消是正常流程（连续改字号/旋转屏幕），不能当成错误展示
@@ -306,12 +322,16 @@ class ReaderViewModel(
     }
 
     private fun handleFatal(error: ApiException) {
+        val text = if (error.isNetwork) "无法连接服务器：${error.message}" else error.message
         _state.update {
             it.copy(
                 preparing = false,
                 loading = false,
-                error = if (error.isNetwork) "无法连接服务器：${error.message}" else error.message,
+                error = text,
                 errorCode = error.code,
+                // 已有可读页面时 ErrorView 不会显示（仅 !canRender 时展示），
+                // 改用消息通道/Snackbar 提示重排失败，保留当前页继续阅读
+                message = if (it.canRender) text else it.message,
             )
         }
     }
@@ -360,7 +380,7 @@ class ReaderViewModel(
     private suspend fun fetchPageMeta(page: Int) {
         val layoutId = _state.value.layoutId ?: return
         try {
-            val meta = readerRepository.pageMeta(bookId, page, layoutId)
+            val meta = readerRepository.pageMeta(bookId, page, layoutId, _state.value.revision)
             // 锚点必须和它所属的页一起记录，否则翻页后立刻退出会把"新页码 + 旧锚点"存下来
             anchorPage = meta.page
             _state.update {
@@ -376,6 +396,10 @@ class ReaderViewModel(
             when {
                 error.isLayoutLost -> recoverLayout("布局缓存已失效，正在自动重建")
                 error.isPageOutOfRange -> recoverLayout("内容已变化，正在刷新")
+                // 错误体缺失/不可解析时 404 会退化成 NOT_FOUND（不再误报 BOOK_NOT_FOUND）：
+                // 对页元数据而言最可能的原因仍是 layout 已失效，走同一恢复路径
+                error.code == ApiException.CODE_NOT_FOUND ->
+                    recoverLayout("布局缓存已失效，正在自动重建")
                 // 阅读页没有下拉刷新（只有左右翻页），文案不能承诺做不到的操作
                 error.isNetwork -> _state.update { it.copy(message = "网络中断：${error.message}") }
                 else -> _state.update { it.copy(message = error.message) }
@@ -446,6 +470,9 @@ class ReaderViewModel(
         if (snapshot.layoutId == null || snapshot.totalPages <= 0) return
         val app = getApplication<App>()
         val loader = app.imageLoader
+        // 与屏上 AsyncImage 相同的目标尺寸（视口像素）：Coil 内存缓存键包含 size，
+        // 不指定会另存一份解码结果，且可能按原图超采样（scale=2.0 时尤其浪费）
+        val viewport = viewportSize
         // 跨页模式下 Pager 的每一屏都是奇数页（步长 2），所以 ±1 页根本不会被显示
         // （page+1 是当前屏的第二页、page-1 是上一屏的首页），预取要按步长走
         val step = snapshot.spreadStep
@@ -465,7 +492,11 @@ class ReaderViewModel(
                     // 普通失败，靠"下一次挂起点再抛"只是巧合行为（项目里统一用
                     // runCatchingIo 正是为此）
                     runCatchingIo {
-                        loader.execute(ImageRequest.Builder(app).data(url).build())
+                        val request = ImageRequest.Builder(app).data(url)
+                        if (viewport != null && viewport.width > 0 && viewport.height > 0) {
+                            request.size(viewport.width, viewport.height)
+                        }
+                        loader.execute(request.build())
                     }
                 }
             }
@@ -491,6 +522,7 @@ class ReaderViewModel(
             pair = snapshot.settings.pairPages && fixed && !snapshot.strip,
             rtl = snapshot.reverseLayout,
             fixed = fixed,
+            revision = snapshot.revision,
         )
     }
 
@@ -506,7 +538,7 @@ class ReaderViewModel(
         _state.update { it.copy(settings = new) }
         // 整体覆盖写入：new 是包含全部字段的完整设置（这里不使用变换参数）
         // 落盘失败不影响本次阅读（内存中的设置已生效）
-        viewModelScope.launch { runCatching { settingsStore.update { new } } }
+        viewModelScope.launch { runCatchingIo { settingsStore.update { new } } }
         val geometryChanged = old.geometrySignature() != new.geometrySignature()
         if (geometryChanged) {
             scheduleRelayout(300)
@@ -560,6 +592,20 @@ class ReaderViewModel(
     /** 供界面提示（页面加载失败等）。 */
     fun notify(message: String) {
         _state.update { it.copy(message = message) }
+    }
+
+    /**
+     * 当前页图片加载失败（UI 上报）。
+     *
+     * 同 URL 内容变化时服务器会失效 layout：图片先失败，页元数据请求若晚于
+     * 失效时间会返回 LAYOUT_NOT_FOUND 并触发自动重建（不新增服务器端点）。
+     * 没有这一步，用户会停在失败占位上反复重试同一张已失效的图片。
+     */
+    fun onPageImageFailed(message: String) {
+        _state.update { it.copy(message = message) }
+        if (_state.value.layoutId == null) return
+        val page = _state.value.currentPage
+        viewModelScope.launch { fetchPageMeta(page) }
     }
 
     // ------------------------------------------------------------ 搜索
@@ -651,19 +697,16 @@ class ReaderViewModel(
         if (total <= 0) {
             return
         }
-        // 同步兜底落盘：viewModelScope 已不可用，异步写入会与"立刻重新打开同一本书"
-        // 的新实例读取竞态（旧页码晚到覆盖新会话）。onCleared 在旧实例销毁、新实例
-        // 创建之前执行，同步写完即保证了先后次序；ProgressStore 内部再按 bookId
-        // 串行化。DataStore 单条写入很快，限时 2 秒兜底，绝不卡死退出路径。
-        val store = progressStore
-        val id = bookId
-        runBlocking {
-            withTimeoutOrNull(2000) {
-                runCatchingIo {
-                    store.put(id, ReadingProgress(anchor = anchor, page = page, ratio = ratio))
-                }
-            }
-        }
+        // 兜底落盘：viewModelScope 已不可用，交给进程级 scope；写入顺序由
+        // ProgressStore 保证（pending Job + get/flow 先等待），因此"退出后立刻
+        // 重开"仍能读到最新位置。这里再有界等待 300ms：正常 DataStore 写入毫秒级
+        // 完成，保证进程被立刻杀掉前已落盘；磁盘异常时也不会卡死退出路径。
+        val job = progressStore.putAsync(
+            getApplication<App>().applicationScope,
+            bookId,
+            ReadingProgress(anchor = anchor, page = page, ratio = ratio),
+        )
+        runBlocking { withTimeoutOrNull(300L) { job.join() } }
     }
 
     /** 会话内锚点：只有它确实属于当前页时才可信（否则用比例恢复）。 */
@@ -684,7 +727,7 @@ class ReaderViewModel(
         val anchor = if (anchorPage == page) snapshot.anchor else null
         val ratio = ratioFor(page, snapshot.totalPages) ?: 0f
         // 进度是"尽力而为"的本地数据：写失败（磁盘满等）不能影响阅读，也不能抛出崩溃
-        runCatching {
+        runCatchingIo {
             progressStore.put(
                 bookId,
                 ReadingProgress(

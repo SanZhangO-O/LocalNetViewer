@@ -1,6 +1,7 @@
 // PDF 适配器实现：动态加载 pdfium.dll，FPDF_* 原型手写 typedef
 // 语义对齐 Python formats/pdf.py（pypdfium2 直渲、fixed、恒 JPEG）
 #include "lnv/formats/pdf.h"
+#include "lnv/util/concurrency.h"
 #include "lnv/util/imaging.h"
 #include "lnv/util/paths.h"
 
@@ -13,6 +14,15 @@
 namespace lnv {
 
 namespace {
+
+// PDFium C API 使用进程级全局状态（文档/位图句柄共享库内部缓存），并非线程安全。
+// 本项目从 12 线程池并发调用，必须用一把全局递归互斥锁把所有 FPDF_* 调用串行化
+// （递归：公开入口内部嵌套私有 helper，同线程重入不自我死锁）。代价是 PDF 请求
+// 彼此串行——重活闸门已把并发 PDF 请求限为 4，这里再保证库层面的正确性优先。
+std::recursive_mutex& pdfium_mutex() {
+    static std::recursive_mutex* mu = new std::recursive_mutex();  // 故意不析构
+    return *mu;
+}
 
 // ---------------------------------------------------------- pdfium 动态加载
 
@@ -179,6 +189,7 @@ PdfAdapter::PdfAdapter(const AppConfig& cfg, const BookRef& ref)
     format = "pdf";
     mode = "fixed";
     max_pixels_ = cfg.render.max_page_pixels;
+    std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
     require_pdfium();
     const auto& api = pdfium_api();
     // FPDF_LoadDocument 与 pypdfium2 一样要求 UTF-8 路径（path::string() 非 ACP 时给错编码）
@@ -198,6 +209,7 @@ PdfAdapter::PdfAdapter(const AppConfig& cfg, const BookRef& ref)
 
 PdfAdapter::~PdfAdapter() {
     if (!doc_) return;
+    std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
     const auto& api = pdfium_api();
     if (api.CloseDocument) api.CloseDocument(doc_);
     doc_ = nullptr;
@@ -206,6 +218,7 @@ PdfAdapter::~PdfAdapter() {
 PdfAdapter::PtSize PdfAdapter::page_pt(int page) {
     if (page < 1 || page > page_count_)
         throw UnsupportedFormatError("页码越界: " + std::to_string(page));
+    std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
     const auto& api = pdfium_api();
     FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
     if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页无法读取");
@@ -248,60 +261,80 @@ double PdfAdapter::clamp_scale(double w_pt, double h_pt, double scale) {
     return scale * std::sqrt((double)max_pixels_ / pixels);
 }
 
-ImageBytes PdfAdapter::render_loaded_page(FPDF_PAGE pg, double w_pt, double h_pt,
-                                          double scale, int quality) {
+// 前置条件：调用方已持有 pdfium_mutex()（page_bytes/pair_bytes 的入口锁）。
+// 只做 FPDF 调用 + 位图原始数据拷贝；像素转换/编码由调用方在锁外做，
+// 避免全部 PDF 的 CPU 密集编码也被这把全局锁串行化。
+PdfAdapter::RawBitmap PdfAdapter::render_page_raw(void* pg, double w_pt, double h_pt,
+                                                  double scale) {
     const auto& api = pdfium_api();
     int w = std::max(1, (int)std::lround(w_pt * scale));
     int h = std::max(1, (int)std::lround(h_pt * scale));
     FPDF_BITMAP bmp = api.Bitmap_Create(w, h, 0);
     if (!bmp) throw ParseError("PDF 渲染位图创建失败");
-    BitmapGuard guard{api, bmp};  // encode_jpeg 抛出时也释放位图
+    BitmapGuard guard{api, bmp};  // 拷贝完成后（含抛异常路径）自动释放位图
     api.Bitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);  // 白底（PDFium 渲染自带底色，防御）
     api.RenderPageBitmap(bmp, pg, 0, 0, w, h, 0, 0);
-    ImageBuf img;
-    img.w = w;
-    img.h = h;
-    img.rgba.resize((size_t)w * h * 4);
     const uint8_t* src = (const uint8_t*)api.Bitmap_GetBuffer(bmp);
     int stride = api.Bitmap_GetStride(bmp);
-    if (src) {
-        // BGRA → RGBA
-        for (int y = 0; y < h; ++y) {
-            const uint8_t* row = src + (size_t)y * stride;
-            auto* dst = img.rgba.data() + (size_t)y * w * 4;
-            for (int x = 0; x < w; ++x) {
-                dst[x * 4 + 0] = row[x * 4 + 2];
-                dst[x * 4 + 1] = row[x * 4 + 1];
-                dst[x * 4 + 2] = row[x * 4 + 0];
-                dst[x * 4 + 3] = 255;
-            }
+    if (!src || stride <= 0) throw ParseError("PDF 渲染缓冲区不可读");
+    RawBitmap raw;
+    raw.w = w;
+    raw.h = h;
+    raw.stride = stride;
+    raw.bgra.resize((size_t)stride * (size_t)h);
+    std::memcpy(raw.bgra.data(), src, raw.bgra.size());
+    return raw;
+}
+
+ImageBuf PdfAdapter::raw_to_image(const RawBitmap& raw) {
+    ImageBuf img;
+    img.w = raw.w;
+    img.h = raw.h;
+    img.rgba.resize((size_t)raw.w * raw.h * 4);
+    for (int y = 0; y < raw.h; ++y) {
+        const uint8_t* row = raw.bgra.data() + (size_t)y * raw.stride;
+        auto* dst = img.rgba.data() + (size_t)y * raw.w * 4;
+        for (int x = 0; x < raw.w; ++x) {
+            dst[x * 4 + 0] = row[x * 4 + 2];
+            dst[x * 4 + 1] = row[x * 4 + 1];
+            dst[x * 4 + 2] = row[x * 4 + 0];
+            dst[x * 4 + 3] = 255;
         }
     }
     img.has_alpha = false;
-    return {encode_jpeg(img, quality > 0 ? quality : 85), "image/jpeg"};
+    return img;
 }
 
 ImageBytes PdfAdapter::page_bytes(int page, const std::string& fit, int quality,
                                   int viewport_w, double render_scale) {
-    require_pdfium();
-    if (page < 1 || page > page_count_)
-        throw UnsupportedFormatError("页码越界: " + std::to_string(page));
-    const auto& api = pdfium_api();
-    FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
-    if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页无法读取");
-    PageGuard guard{api, pg};
-    // 单次 LoadPage：原实现 page_pt + render 内各再 LoadPage 一次（共 3 次）
-    double w_pt = api.GetPageWidthF(pg);
-    double h_pt = api.GetPageHeightF(pg);
-    if (w_pt <= 0) w_pt = 1.0;
-    if (h_pt <= 0) h_pt = 1.0;
-    double sc;
-    if (fit == "original")
-        sc = kRenderPtToPx * std::max(0.5, std::min(2.0, render_scale));
-    else
-        sc = (std::max(1, viewport_w) * std::max(0.5, std::min(2.0, render_scale))) / w_pt;
-    sc = clamp_scale(w_pt, h_pt, std::max(0.05, sc));
-    return render_loaded_page(pg, w_pt, h_pt, sc, quality);
+    // 锁序：先重活闸门，再 pdfium 互斥锁（后者是叶子锁，绝不在其下等待别的锁）。
+    // 锁只覆盖 FPDF 调用与原始位图拷贝；PageGuard 在块内先于锁析构（关闭页面
+    // 仍在锁内），BGRA→RGBA 与 JPEG 编码在锁外执行。
+    auto heavy = heavy_gate().acquire();
+    RawBitmap raw;
+    {
+        std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
+        require_pdfium();
+        if (page < 1 || page > page_count_)
+            throw UnsupportedFormatError("页码越界: " + std::to_string(page));
+        const auto& api = pdfium_api();
+        FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
+        if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页无法读取");
+        PageGuard guard{api, pg};
+        // 单次 LoadPage：原实现 page_pt + render 内各再 LoadPage 一次（共 3 次）
+        double w_pt = api.GetPageWidthF(pg);
+        double h_pt = api.GetPageHeightF(pg);
+        if (w_pt <= 0) w_pt = 1.0;
+        if (h_pt <= 0) h_pt = 1.0;
+        double sc;
+        if (fit == "original")
+            sc = kRenderPtToPx * std::max(0.5, std::min(2.0, render_scale));
+        else
+            sc = (std::max(1, viewport_w) * std::max(0.5, std::min(2.0, render_scale))) / w_pt;
+        sc = clamp_scale(w_pt, h_pt, std::max(0.05, sc));
+        raw = render_page_raw(pg, w_pt, h_pt, sc);
+    }
+    return {encode_jpeg(raw_to_image(raw), quality > 0 ? quality : 85), "image/jpeg"};
 }
 
 std::optional<ImageBytes> PdfAdapter::cover(int width) {
@@ -315,26 +348,32 @@ std::optional<ImageBytes> PdfAdapter::cover(int width) {
 
 ImageBytes PdfAdapter::pair_bytes(int page, int quality, int viewport_w,
                                   double render_scale, bool rtl) {
-    require_pdfium();
-    if (page + 1 > page_count_)
+    auto heavy = heavy_gate().acquire();
+    if (page + 1 > page_count_)  // page_count_ 构造后只读，可在锁外判断
         return page_bytes(page, "viewport", quality, viewport_w, render_scale);  // 末页落单
-    std::vector<ImageBuf> imgs;
-    const auto& api = pdfium_api();
-    for (int p : {page, page + 1}) {
-        FPDF_PAGE pg = api.LoadPage(doc_, p - 1);
-        if (!pg) throw ParseError("PDF 第 " + std::to_string(p) + " 页无法读取");
-        PageGuard guard{api, pg};
-        double w_pt = api.GetPageWidthF(pg);
-        double h_pt = api.GetPageHeightF(pg);
-        if (w_pt <= 0) w_pt = 1.0;
-        if (h_pt <= 0) h_pt = 1.0;
-        // Python pair 不做 0.5..2 clamp，只做像素上限钳制
-        double sc = clamp_scale(w_pt, h_pt, (viewport_w * render_scale) / w_pt);
-        sc = std::max(0.05, sc);
-        auto bytes = render_loaded_page(pg, w_pt, h_pt, sc, quality > 0 ? quality : 85);
-        ImageBuf im = decode_image(bytes.bytes, 0);
-        imgs.push_back(std::move(im));
+    // 锁只覆盖 FPDF 调用与原始位图拷贝；拼接与编码在锁外做（与 page_bytes 同理）
+    std::vector<RawBitmap> raws;
+    {
+        std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
+        require_pdfium();
+        const auto& api = pdfium_api();
+        for (int p : {page, page + 1}) {
+            FPDF_PAGE pg = api.LoadPage(doc_, p - 1);
+            if (!pg) throw ParseError("PDF 第 " + std::to_string(p) + " 页无法读取");
+            PageGuard guard{api, pg};
+            double w_pt = api.GetPageWidthF(pg);
+            double h_pt = api.GetPageHeightF(pg);
+            if (w_pt <= 0) w_pt = 1.0;
+            if (h_pt <= 0) h_pt = 1.0;
+            // Python pair 不做 0.5..2 clamp，只做像素上限钳制
+            double sc = clamp_scale(w_pt, h_pt, (viewport_w * render_scale) / w_pt);
+            sc = std::max(0.05, sc);
+            raws.push_back(render_page_raw(pg, w_pt, h_pt, sc));
+        }
     }
+    std::vector<ImageBuf> imgs;
+    imgs.reserve(raws.size());
+    for (const auto& raw : raws) imgs.push_back(raw_to_image(raw));
     if (rtl) std::reverse(imgs.begin(), imgs.end());
     // 横向拼接（白底垂直居中）
     long long w = 0;
@@ -358,6 +397,7 @@ ImageBytes PdfAdapter::pair_bytes(int page, int quality, int viewport_w,
 // ---------------------------------------------------------- meta
 
 std::string PdfAdapter::meta_text(const char* tag) {
+    std::lock_guard<std::recursive_mutex> pdf_lk(pdfium_mutex());
     const auto& api = pdfium_api();
     if (!api.GetMetaText) return {};
     FPDF_STRLEN need = api.GetMetaText(doc_, tag, nullptr, 0);

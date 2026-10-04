@@ -23,6 +23,10 @@ namespace { std::string u8_name(const std::filesystem::path& p) {
 
 namespace {
 
+// 图集 rev 记忆 TTL：dir_mtime 未变时最多复用 2s，兼顾"recursive 子目录增删的
+// 可见延迟"与"每请求全量枚举"的开销（对齐 Python GALLERY_MEMO_TTL_S）。
+constexpr long long kGalleryMemoTtlMs = 2000;
+
 // ------------------------------------------------------------------ 通用小工具
 
 // 虚拟路径 → 真实路径（含穿越校验）；根名未知返回空路径
@@ -82,6 +86,23 @@ size_t u32_find(const U32Text& hay, const U32Text& needle, size_t from) {
     return U32Text::npos;
 }
 
+// file_time → epoch 秒（图集目录 mtime 用；library.cpp 同款实现）
+double file_time_to_epoch_local(const std::filesystem::file_time_type& t) {
+    auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
+    return std::chrono::duration_cast<std::chrono::duration<double>>(sys.time_since_epoch())
+        .count();
+}
+
+// 图集路径自身的 mtime（对齐 Python gallery.resolve/register 的 real.stat()：
+// 单图图集 stat 的就是图片文件本身，不是父目录）；stat 失败返回 nullopt →
+// rev 退回 book_id（跨实现契约）
+std::optional<double> path_mtime_opt(const std::filesystem::path& real) {
+    std::error_code ec;
+    auto t = std::filesystem::last_write_time(real, ec);
+    if (ec) return std::nullopt;
+    return file_time_to_epoch_local(t);
+}
+
 // 读整个文件（文本/二进制均可）
 bool read_all(const std::filesystem::path& p, std::string& out) {
     std::error_code ec;
@@ -123,6 +144,8 @@ void GalleryService::load_registry() {
         e.updated_at = val.value("updated_at", 0.0);
         registry_[book_id] = std::move(e);
     }
+    // 重新加载注册表后旧计数可能已失真：整体作废 rev 记忆
+    invalidate_rev_memo();
 }
 
 void GalleryService::save_registry() {
@@ -209,14 +232,32 @@ GalleryService::GalleryInfoResult GalleryService::register_folder(
         registry_[book_id] = std::move(e);
     }
     save_registry();
+    // 本次注册用了自己的实时计数：作废该书可能残留的旧 rev 记忆
+    invalidate_rev_memo(book_id);
 
     GalleryInfoResult out;
     out.book_id = book_id;
     out.title = title;
     out.format = "gallery";
     out.page_count = static_cast<int>(images.size());
-    out.cover_url = "/api/v1/books/" + book_id + "/cover";
+    // cover_url 带当前 rev（跨实现契约）：客户端在内容变化后能拿到新 URL。
+    // 对齐 Python register：图片数用本次实时枚举结果、mtime 用 real.stat()，
+    // stat 失败退化为 book_id。
+    auto dir_mtime = path_mtime_opt(real);
+    const std::string rev = dir_mtime
+                                ? compute_gallery_rev(book_id, out.page_count, dir_mtime)
+                                : book_id;
+    out.cover_url = "/api/v1/books/" + book_id + "/cover?rev=" + rev;
     return out;
+}
+
+void GalleryService::invalidate_rev_memo(const std::string& book_id) {
+    std::lock_guard<std::mutex> lk(rev_memo_mu_);
+    if (book_id.empty()) {
+        rev_memo_.clear();
+    } else {
+        rev_memo_.erase(book_id);
+    }
 }
 
 std::optional<BookRef> GalleryService::book_ref(const std::string& book_id) const {
@@ -249,6 +290,47 @@ std::optional<BookRef> GalleryService::book_ref(const std::string& book_id) cons
     ref.size = 0;
     ref.mtime = 0.0;
     ref.virtual_book = true;
+    // 图集修订号（对齐 Python gallery.resolve）：路径 stat 失败退回 book_id；
+    // 否则需要图片数——recursive 模式下目录 mtime 不随子目录增删变化，只有
+    // 实时计数能反映内容变化。但枚举很贵且 book_ref() 每请求都调：目录 mtime
+    // 未变且在 TTL 内的重复请求复用记忆计数；mtime 一变立即重算（注册/重载时
+    // 还会显式作废）。单图图集计 1（与 ComicAdapter 的单页一致）。
+    auto dir_mtime = path_mtime_opt(real);
+    if (!dir_mtime) {
+        ref.rev = book_id;
+    } else {
+        const double dm = *dir_mtime;
+        int image_count = 0;
+        std::string revision;
+        bool memo_hit = false;
+        {
+            std::lock_guard<std::mutex> lk(rev_memo_mu_);
+            auto mit = rev_memo_.find(book_id);
+            if (mit != rev_memo_.end() && mit->second.dir_mtime &&
+                std::fabs(*mit->second.dir_mtime - dm) < 1e-6 &&
+                (std::chrono::steady_clock::now() - mit->second.checked_at) <
+                    std::chrono::milliseconds(kGalleryMemoTtlMs)) {
+                image_count = mit->second.image_count;
+                revision = mit->second.revision;
+                memo_hit = true;
+            }
+        }
+        if (!memo_hit) {
+            std::error_code sec;
+            image_count = std::filesystem::is_regular_file(real, sec)
+                              ? 1
+                              : static_cast<int>(list_images(real, e.recursive).size());
+            revision = compute_gallery_rev(book_id, image_count, dir_mtime);
+            std::lock_guard<std::mutex> lk(rev_memo_mu_);
+            RevMemo m;
+            m.dir_mtime = dm;
+            m.image_count = image_count;
+            m.revision = revision;
+            m.checked_at = std::chrono::steady_clock::now();
+            rev_memo_[book_id] = std::move(m);
+        }
+        ref.rev = revision;
+    }
     // extra["dir"]：真实路径（UTF-8 字符串），适配器据此枚举图片
     ref.extra["dir"] = real.u8string();
     ref.extra["recursive"] = e.recursive;
@@ -319,8 +401,11 @@ std::vector<std::filesystem::path> GalleryService::list_images(
 
 // ================================================================== LayoutsService
 
-// 按适配器能力修正 mode（对应 Python effective_profile；C++ 无 ComicAdapter
-// 类型可判，任务约定：fixed 适配器请求 strip 一律按 strip 处理）
+// 按适配器能力修正 mode（逐行对齐 Python effective_profile）：
+// - flow 适配器强制 flow；
+// - fixed 适配器请求 flow → fixed；请求 strip 仅漫画/图集能力支持，否则 → fixed
+//   （不是 415：固定版式对 strip 的语义是退回 fixed）。
+// strip_overlap_px 仅在修正后仍是 strip 时补配置默认值。
 static LayoutProfile effective_profile(const AppConfig& cfg, const BookAdapter& adapter,
                                        const LayoutProfile& profile) {
     LayoutProfile p = profile;
@@ -328,8 +413,8 @@ static LayoutProfile effective_profile(const AppConfig& cfg, const BookAdapter& 
         if (p.mode != "flow") p.mode = "flow";  // flow 适配器强制 flow
         return p;
     }
-    // fixed 适配器：请求 flow → fixed；请求 strip → strip
     if (p.mode == "flow") p.mode = "fixed";
+    if (p.mode == "strip" && !adapter.supports_strip()) p.mode = "fixed";
     if (p.mode == "strip" && p.strip_overlap_px == 0 && cfg.comic.strip_overlap_px > 0) {
         p.strip_overlap_px = cfg.comic.strip_overlap_px;
     }
@@ -396,7 +481,7 @@ static LayoutBuildResult make_result(const PageMap& pm, const std::string& layou
 LayoutBuildResult LayoutsService::build(const BookRef& ref, BookAdapter& adapter,
                                         const LayoutProfile& profile) {
     LayoutProfile prof = effective_profile(cfg_, adapter, profile);
-    std::string font_id = fonts_.resolve_id(prof.font.family);
+    std::string font_id = fonts_->resolve_id(prof.font.family);
     std::string layout_id = compute_layout_key(prof, font_id);
 
     if (prof.mode == "flow") {
@@ -423,10 +508,12 @@ LayoutBuildResult LayoutsService::build(const BookRef& ref, BookAdapter& adapter
         std::string fid = font_id;
         PageMap pm = run_with_timeout(
             parse_gate(),
-            [doc, prof_copy, fid, fonts = &fonts_]() {
+            // fonts 按值捕获 shared_ptr：超时分离的 worker 即使活过 AppContext
+            // 也能保证 FontManager 存活（审查 H：悬垂 FontManager）。
+            [doc, prof_copy, fid, fonts = fonts_]() {
                 FlowLayoutEngine::Deps d;
                 d.doc = doc.get();
-                d.fonts = fonts;
+                d.fonts = fonts.get();
                 d.profile = &prof_copy;
                 d.font_id = fid;
                 FlowLayoutEngine engine(d);
@@ -550,8 +637,15 @@ DocumentModel LayoutsService::document_internal(const BookRef& ref, const std::s
         BookRef ref_copy = ref;
         doc = run_with_timeout(
             parse_gate(),
-            [cfg = std::move(cfg_copy), bref = std::move(ref_copy)]() {
-                auto own = create_adapter(cfg, bref);
+            // fonts 按值捕获 shared_ptr（同上）；env 让内层适配器（EPUB 文字封面）
+            // 使用 AppContext 的同一个 FontManager。
+            [cfg = std::move(cfg_copy), bref = std::move(ref_copy), fonts = fonts_]() {
+                auto own = [&] {
+                    auto heavy = heavy_gate().acquire();  // 适配器构造可能是重活（MOBI 转换）
+                    AdapterEnv env;
+                    env.fonts = fonts.get();
+                    return create_adapter(cfg, bref, env);
+                }();
                 return own->document();
             },
             cfg_.limits.parse_timeout_s, what, "parse:" + ref.book_id);

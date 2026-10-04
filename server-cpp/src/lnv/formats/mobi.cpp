@@ -2,6 +2,8 @@
 // 对应 Python formats/mobi.py；子进程用 CreateProcess + WaitForSingleObject 超时 kill。
 #include "lnv/formats/mobi.h"
 #include "lnv/formats/epub.h"  // 另一代理实现：需提供 create_epub_adapter(cfg, ref)
+#include "lnv/cache/store.h"   // enforce_dir_quota（converted 目录 2GiB 配额）
+#include "lnv/util/concurrency.h"  // KeyedLocks / heavy_gate
 #include "lnv/util/paths.h"
 #include "lnv/util/textutil.h"
 
@@ -17,11 +19,19 @@ namespace {
 
 static constexpr double kConvertTimeoutFactor = 4.0;
 
+// converted 目录配额：转换产物只用于复用，超限按 mtime LRU 淘汰到 80%
+constexpr long long kConvertedQuotaBytes = 2LL * 1024 * 1024 * 1024;
+
 }  // namespace
 
 // 供 /files 的 openable 探测用（Python registry.openable_reason）。
 // 与外部工具一致只查 PATH：SearchPathW 的搜索序含 exe 目录/CWD，可被种植劫持。
-bool calibre_available() { return !find_tool_in_path(L"ebook-convert").empty(); }
+// 结果进程内缓存（与 rar/7z/pdfium 探测一致）：/files 的每个条目都会问一次，
+// 不缓存等于每次列目录都做一遍 PATH 扫描。
+bool calibre_available() {
+    static const bool ok = [] { return !find_tool_in_path(L"ebook-convert").empty(); }();
+    return ok;
+}
 
 namespace {
 
@@ -35,14 +45,12 @@ void unlink_quiet(const std::filesystem::path& p) {
     std::filesystem::remove(p, ec);
 }
 
-// 每本书一把进程内锁：并发首次打开同一本书时串行转换
-std::mutex& lock_for(const std::string& key) {
-    static std::mutex guard;
-    static std::map<std::string, std::unique_ptr<std::mutex>> locks;
-    std::lock_guard<std::mutex> g(guard);
-    auto it = locks.find(key);
-    if (it == locks.end()) it = locks.emplace(key, std::make_unique<std::mutex>()).first;
-    return *it->second;
+// 每本书一把进程内锁：并发首次打开同一本书时串行转换。
+// 用有界/引用计数回收的 KeyedLocks（concurrency.h）：旧的 static map<unique_ptr<mutex>>
+// 会随书数无限增长（审查）。故意不析构：超时任务可能在 main 返回后仍持有锁。
+KeyedLocks& convert_locks() {
+    static KeyedLocks* locks = new KeyedLocks();
+    return *locks;
 }
 
 // 运行子进程并限时；stderr 写入 stderr_file；返回进程 exit code
@@ -135,8 +143,8 @@ std::string tail_500(const std::filesystem::path& p) {
 
 }  // namespace
 
-MobiAdapter::MobiAdapter(const AppConfig& cfg, const BookRef& ref)
-    : cfg_(cfg), ref_(ref) {
+MobiAdapter::MobiAdapter(const AppConfig& cfg, const BookRef& ref, const AdapterEnv& env)
+    : cfg_(cfg), ref_(ref), env_(env) {
     format = !ref.format.empty() ? ref.format : "mobi";
     mode = "flow";
     auto target = converted_path();
@@ -154,18 +162,25 @@ MobiAdapter::MobiAdapter(const AppConfig& cfg, const BookRef& ref)
     eref.virtual_book = ref.virtual_book;
     eref.extra = ref.extra;
     // 依赖：formats/epub.h 需提供该工厂（另一代理实现）
-    inner_ = create_epub_adapter(cfg_, eref);
+    inner_ = create_epub_adapter(cfg_, eref, env_);
 }
 
 std::filesystem::path MobiAdapter::converted_path() const {
     auto out_dir = cfg_.cache_dir() / "converted";
     std::error_code ec;
     std::filesystem::create_directories(out_dir, ec);
+    // 文件名带内容修订号（跨实现契约，与 Python 一致）：{book_id}.{rev}.epub。
+    // 内容变化后新 rev 指向新文件，失效时仍在途的旧转换（先写 .tmp 再 rename）
+    // 永远不会被新 rev 采用，关闭"失效与转换竞态"导致的旧 EPUB 回灌。
+    if (!ref_.rev.empty()) return out_dir / (ref_.book_id + "." + ref_.rev + ".epub");
     return out_dir / (ref_.book_id + ".epub");
 }
 
 void MobiAdapter::convert(const BookRef& ref, const std::filesystem::path& target) {
-    std::lock_guard<std::mutex> lk(lock_for(ref.book_id));
+    // 重活闸门：Calibre 转换可达分钟级，限流避免占满请求线程池（可重入，
+    // 外层 open_adapter 已持有闸门时不会重复占槽）
+    auto heavy = heavy_gate().acquire();
+    auto lk = convert_locks().acquire(ref.book_id);
     if (is_usable(target)) return;  // 等锁期间别人已经转好了
     std::wstring exe = find_tool_in_path(L"ebook-convert");
     if (exe.empty())
@@ -200,6 +215,8 @@ void MobiAdapter::convert(const BookRef& ref, const std::filesystem::path& targe
         throw ParseError("转换结果无法落盘: " + ec.message());
     }
     unlink_quiet(err_file);
+    // 转换产物目录配额（2GiB，按 mtime LRU 到 80%）：keep 当前文件防止刚转好被淘汰
+    enforce_dir_quota(target.parent_path(), kConvertedQuotaBytes, &target);
 }
 
 AdapterMeta MobiAdapter::meta() {

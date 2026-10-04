@@ -619,6 +619,11 @@ class ComicAdapter(FixedAdapter):
         self._container.close()
 
     @property
+    def supports_strip(self) -> bool:
+        """漫画 / 图集容器才支持条漫切片（设计 7.4）。"""
+        return True
+
+    @property
     def container(self) -> ComicContainer:
         return self._container
 

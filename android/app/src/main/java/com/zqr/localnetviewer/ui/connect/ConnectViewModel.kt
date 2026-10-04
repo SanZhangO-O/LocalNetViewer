@@ -6,6 +6,7 @@ import com.zqr.localnetviewer.App
 import com.zqr.localnetviewer.data.net.ApiClient
 import com.zqr.localnetviewer.data.net.ApiException
 import com.zqr.localnetviewer.data.prefs.ServerAddress
+import com.zqr.localnetviewer.data.repo.LibraryRepository
 import com.zqr.localnetviewer.data.runCatchingIo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -25,7 +26,6 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
 
     private val appRef = app
     private val settingsStore = app.settingsStore
-    private val repository = app.libraryRepository
     private val client = app.apiClient
 
     data class UiState(
@@ -104,14 +104,19 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
         connectJob = viewModelScope.launch {
             _state.update { it.copy(connecting = true, error = null) }
             try {
-                client.configure(url, tokenValue, ApiClient.PROBE_TIMEOUT_SECONDS)
-                val info = repository.serverInfo()
+                // 用一次性客户端探测候选服务器（同样的地址规范化 / 3s 超时 / 令牌头）。
+                // 探测失败或被取消时进程级 ApiClient 保持原配置不变；否则一个打错的
+                // 地址会把全局客户端带偏，浏览页/阅读页全部跟着失败。
+                val probeClient = ApiClient()
+                probeClient.configure(url, tokenValue, ApiClient.PROBE_TIMEOUT_SECONDS)
+                val probeRepository = LibraryRepository(probeClient)
+                val info = probeRepository.serverInfo()
                 if (info.authRequired) {
                     if (tokenValue.isEmpty()) {
                         throw ApiException(ApiException.CODE_UNAUTHORIZED, "该服务器需要访问令牌，请填写后重试")
                     }
                     try {
-                        repository.listFiles("/", 1, 0)
+                        probeRepository.listFiles("/", 1, 0)
                     } catch (unauthorized: ApiException) {
                         if (unauthorized.isUnauthorized) {
                             throw ApiException(unauthorized.code, "令牌错误，请检查后重试")
@@ -120,7 +125,7 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
                     }
                 }
                 if (seq != connectSeq) return@launch
-                // 校验通过：恢复常规超时（页面图片下载需要更长时间）
+                // 校验通过：才配置全局客户端并恢复常规超时（页面图片下载需要更长时间）
                 client.configure(url, tokenValue, ApiClient.DEFAULT_CALL_TIMEOUT_SECONDS)
                 // 地址/令牌落盘失败不影响本次连接
                 runCatchingIo {

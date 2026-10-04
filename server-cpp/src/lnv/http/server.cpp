@@ -388,6 +388,9 @@ void handle_book_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
                             {"start_page", c.contains("start_page") ? c["start_page"]
                                                                     : json(nullptr)}});
     }
+    // 内容修订号（跨实现契约）：文件书 = sha1(book_id:size:mtime_int)[:12]；
+    // 图集虚拟书在 require_book 时已算好。cover_url 必须带 rev。
+    const std::string rev = ref->rev;
     json j = {
         {"book_id", book_id},
         {"title", meta.title.empty() ? ref->title_guess() : meta.title},
@@ -397,7 +400,8 @@ void handle_book_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
         {"size", ref->size},
         {"mode", meta.mode},
         {"page_count", meta.page_count ? json(*meta.page_count) : json(nullptr)},
-        {"cover_url", "/api/v1/books/" + book_id + "/cover"},
+        {"revision", rev},
+        {"cover_url", "/api/v1/books/" + book_id + "/cover?rev=" + rev},
         {"render_support", {{"png", true}, {"json", adapter->supports_json()}}},
         {"chapters", chapters},
         {"source", ref->vpath},
@@ -412,13 +416,17 @@ void handle_cover(AppContext& ctx, const httplib::Request& req, httplib::Respons
     const long long w =
         pv_int(v, qparam(req, "w"), {"query", "w"}, 240, int_range(40, 1024));
     v.done();
-    const std::string etag = "\"" + book_id + ":w" + std::to_string(w) + "\"";
+    // 契约：先解析书（被删除 → 404），用**当前** rev 计算 ETag；绝不在未解析书的
+    // 情况下命中 304（书被删/内容变化后旧 ETag 必须失效）。
+    auto ref = ctx.require_book(book_id);
+    if (!ref) throw book_not_found(book_id);
+    const std::string rev = ref->rev;
+    const std::string etag = "\"" + book_id + ":" + rev + ":w" + std::to_string(w) + "\"";
     res.set_header("ETag", etag);
     res.set_header("Cache-Control", "public, max-age=86400");
     if (ctx.etag_matches(inm_ptr(req), etag)) { res.status = 304; return; }
-    // 内存缓存键 ("cover", book_id, w)；缓存值 = mime + '\n' + 字节
-    // 顺序与 Python 一致：先查缓存再 require_book（书被删掉后已缓存的封面仍可命中）
-    const std::string key = "cover:" + book_id + ":" + std::to_string(w);
+    // 内存缓存键 ("cover", book_id, rev, w)；缓存值 = mime + '\n' + 字节
+    const std::string key = "cover:" + book_id + ":" + rev + ":" + std::to_string(w);
     std::string bytes;
     std::string mime = "image/jpeg";
     if (auto hit = ctx.cover_cache->get(key)) {
@@ -426,8 +434,6 @@ void handle_cover(AppContext& ctx, const httplib::Request& req, httplib::Respons
         mime = hit->substr(0, nl);
         bytes = hit->substr(nl + 1);
     } else {
-        auto ref = ctx.require_book(book_id);
-        if (!ref) throw book_not_found(book_id);
         auto adapter = ctx.open_adapter(*ref);
         ImageBytes img;
         if (auto cov = adapter->cover(static_cast<int>(w))) {
@@ -509,9 +515,12 @@ void handle_layout(AppContext& ctx, const httplib::Request& req, httplib::Respon
     auto r = ctx.layouts->build(*ref, *adapter, profile);
     json chapters = json::array();
     for (const auto& c : r.chapters) chapters.push_back(c);
+    // revision：当前内容的修订号（页面/封面 URL 与 ETag 都以它做失效维度）
+    const std::string rev = ref->rev;
     json j = {
         {"layout_id", r.layout_id}, {"mode", r.mode}, {"total_pages", r.total_pages},
         {"chapters", chapters}, {"cache_hit", r.cache_hit}, {"strip", r.strip},
+        {"revision", rev},
     };
     res.set_content(j.dump(), "application/json");
 }
@@ -575,11 +584,13 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
 
     const bool fixed = pm.mode != "flow";  // fixed / strip
 
-    // §4.6：ETag / 缓存键 / 公共响应头（png 与 json 均带）
+    // §4.6：ETag / 缓存键 / 公共响应头（png 与 json 均带）。
+    // rev 为第二段：内容变化后 ETag 与内存缓存键都随 rev 变化。
+    const std::string rev = ref->rev;
     const std::string etag =
-        ctx.page_etag(layout_id, page, theme, scale, fit, quality, pair, rtl, fixed);
+        ctx.page_etag(layout_id, rev, page, theme, scale, fit, quality, pair, rtl, fixed);
     const std::string cache_key =
-        ctx.page_cache_key(book_id, layout_id, page, theme, scale, fit, quality, pair,
+        ctx.page_cache_key(book_id, layout_id, rev, page, theme, scale, fit, quality, pair,
                            rtl, fixed);
     res.set_header("ETag", etag);
     res.set_header("Cache-Control", "private, max-age=31536000, immutable");
@@ -805,11 +816,8 @@ void handle_search(AppContext& ctx, const httplib::Request& req, httplib::Respon
         // Python 的 search 走 require_layout_async，但它的 detail **只有 layout_id**
         // （不含 book_id，与 /pages、/locate 不同）。require_layout 会抛带 book_id 的
         // 错误，所以这里先查缓存、查不到再按 search 的 detail 抛（审查 M7）。
-        entry = ctx.layout_memory.get(book_id + ":" + *lid);
-        if (!entry) {
-            entry = ctx.layouts_cache->get(book_id, *lid);
-            if (entry) ctx.layout_memory.put(book_id + ":" + *lid, *entry);
-        }
+        // 读穿 LayoutsService 的统一缓存（内存 + 磁盘），与 /layout 共用一套。
+        entry = ctx.layouts->entry(book_id, *lid);
         if (!entry)
             throw AppError(ErrorCode::LayoutNotFound,
                            "layout_id 不存在或已失效，请重新 POST /layout",

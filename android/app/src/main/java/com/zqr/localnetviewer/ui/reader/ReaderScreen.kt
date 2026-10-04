@@ -133,7 +133,13 @@ fun ReaderScreen(
     }
 
     var zoomed by remember { mutableStateOf(false) }
-    LaunchedEffect(state.currentPage) { zoomed = false }
+    // 翻页时统一复位两处缩放状态：屏上 zoomed 与 ViewModel 的 renderScale。
+    // 只复位 zoomed 会让后续页面继续以 scale=2.0 请求（renderScale 从不回落），
+    // 既浪费流量又让预取/屏上缓存的解码尺寸翻倍。
+    LaunchedEffect(state.currentPage) {
+        zoomed = false
+        vm.setZoomed(false)
+    }
 
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -168,6 +174,7 @@ fun ReaderScreen(
                 pageUrl = vm::pageUrl,
                 onSettled = { vm.onPageSettled(it) },
                 onTapCenter = vm::toggleOverlay,
+                onError = vm::onPageImageFailed,
             )
 
             else -> PagedReader(
@@ -183,7 +190,7 @@ fun ReaderScreen(
                 onPrev = vm::previousPage,
                 onNext = vm::nextPage,
                 onToggleOverlay = vm::toggleOverlay,
-                onError = vm::notify,
+                onError = vm::onPageImageFailed,
             )
         }
 
@@ -297,6 +304,8 @@ private fun PagedReader(
         PageImage(
             // 跨页模式下每一屏都以"首页"页码请求，服务器会一并渲染 page+1
             url = pageUrl(state.pageOfIndex(index)),
+            // 页身份：映射到新页（翻页 / 跨页步长变化）时复位页内缩放
+            pageKey = state.pageOfIndex(index),
             contentScale = contentScaleFor(state.settings, state.isFixed),
             innerScroll = innerScrollFor(state.settings, state.isFixed),
             zoomEnabled = true,
@@ -322,6 +331,7 @@ private fun StripReader(
     pageUrl: (Int) -> String?,
     onSettled: (Int) -> Unit,
     onTapCenter: () -> Unit,
+    onError: (String) -> Unit,
 ) {
     val pageCount = state.totalPages.coerceAtLeast(1)
     val listState = rememberLazyListState(
@@ -367,7 +377,7 @@ private fun StripReader(
                         detectTapGestures { onTapCenter() }
                     }
             ) {
-                StripPageImage(url = pageUrl(index + 1))
+                StripPageImage(url = pageUrl(index + 1), onError = onError)
             }
         }
     }
@@ -379,7 +389,7 @@ private fun StripReader(
  * 条漫切片不需要缩放手势（整条连续滚动模型），点击留给"呼出工具栏"。
  */
 @Composable
-private fun StripPageImage(url: String?) {
+private fun StripPageImage(url: String?, onError: (String) -> Unit) {
     var attempt by remember(url) { mutableIntStateOf(0) }
     var failed by remember(url) { mutableStateOf(false) }
     var loading by remember(url) { mutableStateOf(false) }
@@ -393,7 +403,12 @@ private fun StripPageImage(url: String?) {
                 modifier = Modifier.fillMaxWidth(),
                 onLoading = { loading = true },
                 onSuccess = { loading = false; failed = false },
-                onError = { loading = false; failed = true },
+                onError = {
+                    loading = false
+                    failed = true
+                    // 切片 404 也可能是 layout 已失效：上报给 ViewModel，走页元数据触发的自动重建
+                    onError("切片加载失败")
+                },
             )
         }
         if (loading && !failed) {

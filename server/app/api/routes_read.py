@@ -8,7 +8,7 @@ from typing import Dict, Optional, Tuple
 from fastapi import APIRouter, Depends, Header, Query, Response
 from fastapi.responses import JSONResponse
 
-from ..formats.base import BookAdapter, BookRef
+from ..formats.base import BookAdapter, BookRef, ParseTimeoutError
 from ..layout import anchors as anchors_mod
 from ..models.schemas import (
     Anchor,
@@ -32,6 +32,12 @@ VALID_FITS = ("viewport", "original")
 
 
 # ------------------------------------------------------------------ layout
+def _mark_orphan(exc: BaseException, adapter: BookAdapter) -> None:
+    """超时工作线程仍在使用适配器时，标记它让 open_adapter_async 跳过 close()。"""
+    if isinstance(exc, ParseTimeoutError) and exc.orphaned:
+        adapter.mark_orphaned()
+
+
 @router.post(
     "/books/{book_id}/layout", response_model=LayoutResponse, dependencies=[AuthDep]
 )
@@ -41,9 +47,14 @@ async def register_layout(
     """注册排版参数 → layout_id、总页数、章节起始页（设计 4.6）。"""
     ref = await ctx.require_book_async(book_id)
     async with ctx.open_adapter_async(ref) as adapter:
-        result = await asyncio.to_thread(ctx.layouts.build, ref, adapter, profile)
+        try:
+            result = await asyncio.to_thread(ctx.layouts.build, ref, adapter, profile)
+        except ParseTimeoutError as exc:
+            _mark_orphan(exc, adapter)
+            raise
     return LayoutResponse(
         layout_id=result.layout_id,
+        revision=ref.revision,
         mode=result.mode,  # type: ignore[arg-type]
         total_pages=result.total_pages,
         chapters=result.chapters,
@@ -222,6 +233,7 @@ async def get_page(
 
     etag = ctx.page_etag(
         layout_id,
+        ref.revision,
         page,
         theme=theme,
         scale=scale,
@@ -244,6 +256,7 @@ async def get_page(
     cache_key = ctx.page_cache_key(
         book_id,
         layout_id,
+        ref.revision,
         page,
         theme=theme,
         scale=scale,
@@ -263,16 +276,20 @@ async def get_page(
             )
         # JSON 模式不占用图片缓存（体积小且需带上布局信息）
         async with ctx.open_adapter_async(ref) as adapter:
-            doc = await asyncio.to_thread(ctx.layouts.document, ref, adapter)
-            payload = await asyncio.to_thread(
-                build_page_json,
-                doc,
-                entry.pagemap,
-                page,
-                entry.profile,
-                ctx.fonts,
-                ref.book_id,
-            )
+            try:
+                doc = await asyncio.to_thread(ctx.layouts.document, ref, adapter)
+                payload = await asyncio.to_thread(
+                    build_page_json,
+                    doc,
+                    entry.pagemap,
+                    page,
+                    entry.profile,
+                    ctx.fonts,
+                    ref.book_id,
+                )
+            except ParseTimeoutError as exc:
+                _mark_orphan(exc, adapter)
+                raise
         return JSONResponse(content=payload, headers=headers)
 
     cached = ctx.page_cache.get(cache_key)
@@ -280,21 +297,25 @@ async def get_page(
         body, mime = cached
     else:
         async with ctx.open_adapter_async(ref) as adapter:
-            body, mime = await asyncio.to_thread(
-                _render_page,
-                ctx,
-                ref,
-                adapter,
-                entry,
-                page,
-                fmt=fmt,
-                theme=theme,
-                scale=scale,
-                fit=fit_mode,
-                quality=quality,
-                pair=bool(pair),
-                rtl=bool(rtl),
-            )
+            try:
+                body, mime = await asyncio.to_thread(
+                    _render_page,
+                    ctx,
+                    ref,
+                    adapter,
+                    entry,
+                    page,
+                    fmt=fmt,
+                    theme=theme,
+                    scale=scale,
+                    fit=fit_mode,
+                    quality=quality,
+                    pair=bool(pair),
+                    rtl=bool(rtl),
+                )
+            except ParseTimeoutError as exc:
+                _mark_orphan(exc, adapter)
+                raise
         ctx.page_cache.put(cache_key, (body, mime), len(body))
 
     if fit_mode == "original" and _is_fixed_mode(entry):
@@ -400,7 +421,11 @@ async def search(
                 f"{adapter.format} 暂不支持全文搜索",
                 {"format": adapter.format},
             )
-        doc = await asyncio.to_thread(ctx.layouts.document, ref, adapter)
+        try:
+            doc = await asyncio.to_thread(ctx.layouts.document, ref, adapter)
+        except ParseTimeoutError as exc:
+            _mark_orphan(exc, adapter)
+            raise
     # 全文扫描是 CPU 密集操作（10MB TXT 可能几百毫秒），必须离开事件循环（设计 4.9）
     data = await asyncio.to_thread(ctx.search.search, doc, q, limit=limit, pagemap=pagemap)
     return SearchResponse(**data)

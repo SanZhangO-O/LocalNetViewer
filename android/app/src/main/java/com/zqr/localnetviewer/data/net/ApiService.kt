@@ -48,6 +48,7 @@ interface ApiService {
         @Path("bookId") bookId: String,
         @Path("page") page: Int,
         @Query("layout_id") layoutId: String,
+        @Query("rev") rev: String? = null,
     ): PageMetaDto
 
     @GET("api/v1/books/{bookId}/locate")
@@ -110,6 +111,7 @@ object ApiPaths {
         rtl: Boolean = false,
         format: String = "png",
         fixed: Boolean = false,
+        revision: String = "",
     ): String {
         val builder = StringBuilder("/api/v1/books/$bookId/pages/$page")
         builder.append("?layout_id=").append(encode(layoutId))
@@ -123,6 +125,10 @@ object ApiPaths {
             builder.append("&theme=").append(encode(theme))
         }
         builder.append("&scale=").append(formatScale(scale))
+        // 内容修订号变化 = 同 URL 内容变化：带上它让 Coil 的磁盘缓存无法命中旧页面
+        if (revision.isNotEmpty()) {
+            builder.append("&rev=").append(encode(revision))
+        }
         return builder.toString()
     }
 

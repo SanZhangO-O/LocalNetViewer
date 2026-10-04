@@ -8,8 +8,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from contextlib import asynccontextmanager, contextmanager
-from typing import Any, AsyncIterator, Dict, Iterator, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, Optional
 
 from .cache.lru import PageLRU
 from .cache.parsed import ParsedCache
@@ -17,6 +17,7 @@ from .cache.store import LayoutStore
 from .config import AppConfig, ensure_dirs
 from .formats import registry
 from .formats.base import AdapterEnv, BookAdapter, BookRef
+from .formats.mobi import sweep_converted_cache
 from .layout.fonts import FontManager
 from .models.schemas import ErrorCode
 from .services.gallery import GalleryService
@@ -54,6 +55,10 @@ class AppContext:
         self.env = AdapterEnv(config=config, parsed_cache=self.parsed, fonts=self.fonts)
         self.started_at = time.time()
 
+        # MOBI/AZW3 的转换缓存（cache/converted）不属于三级缓存，启动时做一次
+        # 按 mtime 的 LRU 配额清理（设计：转换产物要有上限）
+        sweep_converted_cache(config.cache_dir / "converted")
+
         # 书籍内容变化 → 丢弃全部由旧内容派生的缓存（设计 4.6）。
         # 少了这一步，"同尺寸就地编辑"会让服务器永远返回旧分页与旧页面图。
         self.library.add_content_listener(self.invalidate_book_caches)
@@ -65,10 +70,25 @@ class AppContext:
         removed += self.layout_store.invalidate_book(book_id)
         self.parsed.invalidate(book_id)
         removed += self.page_cache.invalidate(lambda key: bool(key) and key[0] == book_id)
-        # 封面缓存键是 ("cover", book_id, width)
+        # 封面缓存键是 ("cover", book_id, rev, width)
         self.cover_cache.invalidate(
             lambda key: len(key) > 1 and key[0] == "cover" and key[1] == book_id
         )
+        # MOBI/AZW3 的转换缓存也必须作废：否则内容换掉后仍解析旧 EPUB。
+        # 产物按 revision 命名（{book_id}.{rev}.epub），新 rev 天然指向新文件；
+        # 这里再清掉该书全部旧 rev 产物与 .tmp（含在途转换先写的临时文件），
+        # 避免竞态窗口里旧产物被再次采用或堆积。
+        converted_dir = self.config.cache_dir / "converted"
+        try:
+            stale = list(converted_dir.glob(f"{book_id}.*.epub*"))
+            stale.append(converted_dir / f"{book_id}.epub")
+            for path in stale:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
         if removed:
             logger.info("书籍内容已变化，清理 %d 项缓存：%s", removed, book_id)
 
@@ -77,15 +97,6 @@ class AppContext:
         return registry.create_adapter(
             self.env, ref, recursive=bool(ref.extra.get("recursive", False))
         )
-
-    @contextmanager
-    def open_adapter(self, ref: BookRef) -> Iterator[BookAdapter]:
-        """同步版（仅限已经在线程池里的调用方使用；async 路由必须用 :meth:`open_adapter_async`）。"""
-        adapter = self.create_adapter(ref)
-        try:
-            yield adapter
-        finally:
-            _quiet_close(adapter)
 
     @asynccontextmanager
     async def open_adapter_async(self, ref: BookRef) -> AsyncIterator[BookAdapter]:
@@ -134,6 +145,7 @@ class AppContext:
     def page_cache_key(
         book_id: str,
         layout_id: str,
+        rev: str,
         page: int,
         *,
         theme: str = "white",
@@ -144,7 +156,14 @@ class AppContext:
         rtl: bool = False,
         fixed: bool = False,
     ) -> tuple:
-        key = [book_id, layout_id, int(page), theme if not fixed else "", round(float(scale), 2)]
+        key = [
+            book_id,
+            layout_id,
+            str(rev or ""),
+            int(page),
+            theme if not fixed else "",
+            round(float(scale), 2),
+        ]
         if fixed:
             key.extend([fit, int(quality or 0), 1 if pair else 0, 1 if rtl else 0])
         return tuple(key)
@@ -152,6 +171,7 @@ class AppContext:
     @staticmethod
     def page_etag(
         layout_id: str,
+        rev: str,
         page: int,
         *,
         theme: str = "white",
@@ -165,7 +185,13 @@ class AppContext:
         # scale 与页面缓存键保持一致的精度：常见值输出 1 位（如 "1.0"），
         # 非整十分位才用 2 位，避免 ETag 与缓存键在小数位上分歧导致错误 304。
         scale_tag = _scale_tag(scale)
-        parts = [layout_id, theme if not fixed else "-", scale_tag, str(int(page))]
+        parts = [
+            layout_id,
+            str(rev or ""),
+            theme if not fixed else "-",
+            scale_tag,
+            str(int(page)),
+        ]
         if fixed:
             parts.extend(
                 [
@@ -226,9 +252,17 @@ class AppContext:
 
 
 def _quiet_close(adapter: BookAdapter) -> None:
-    """关闭适配器；关闭失败不能影响响应（缓存文件已落盘，句柄由 GC 兜底）。"""
+    """关闭适配器；关闭失败不能影响响应（缓存文件已落盘，句柄由 GC 兜底）。
+
+    ``orphaned``（解析/分页超时、工作线程仍在读适配器）时必须跳过 close()：
+    提前关闭会让工作线程读到坏数据；等工作线程释放引用后由 __del__ 兜底关闭。
+    """
+    if getattr(adapter, "orphaned", False):
+        return
     try:
         adapter.close()
+        # 正常关闭成功：GC 兜底（__del__）不再重复关闭，保证恰好关闭一次
+        adapter.mark_closed()
     except Exception:
         pass
 

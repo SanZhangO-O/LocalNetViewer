@@ -12,6 +12,8 @@ public:
     ComicAdapter(const AppConfig& cfg, const BookRef& ref);
 
     AdapterMeta meta() override;
+    // 对应 Python isinstance(adapter, ComicAdapter)：只有漫画/图集能做条漫切片
+    bool supports_strip() const override { return true; }
     int page_count() override;
     std::optional<ImageBytes> cover(int width = 0) override;
     std::pair<int, int> page_native_size(int page) override;

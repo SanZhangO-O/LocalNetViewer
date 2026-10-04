@@ -438,8 +438,12 @@ void LibraryService::scan_blocking() {
         rollup_gallery_counts(counts);
     }
 
+    std::map<std::string, LibraryBook> live_before;
     {
         std::unique_lock lk(mu_);
+        // 扫描期间请求线程可能已检测到变化、刷新 live 索引并通知过；
+        // 提交前快照，供下面的通知循环去重（否则同一次变化会清两遍缓存）。
+        live_before = by_vpath_;
         by_vpath_.clear();
         id_to_vpath_.clear();
         for (auto& [vpath, b] : books) {
@@ -450,6 +454,39 @@ void LibraryService::scan_blocking() {
         }
         gallery_counts_ = counts;
         scanned_at_ = now_epoch();
+    }
+    // 扫描路径的失效语义（对应 Python 在 scan 路径的修复）：本地文件 size/mtime/
+    // format 变化或被删除 → 通知清旧 book_id 的派生缓存。否则扫描只刷新索引，
+    // 旧分页/旧页面图会一直服务到进程重启（"一个路径静默刷新 size/mtime，
+    // 后一个路径再也检测不到变化"）。通知在 mu_ 外做，避免与缓存锁嵌套。
+    for (const auto& [vpath, pb] : prev) {
+        if (pb.book_id.empty()) continue;
+        auto it = books.find(vpath);
+        bool changed = it == books.end();
+        if (!changed) {
+            const LibraryBook& nb = it->second;
+            changed = nb.book_id != pb.book_id || nb.size != pb.size ||
+                      std::fabs(nb.mtime - pb.mtime) > 1e-6 || nb.format != pb.format;
+        }
+        if (!changed) continue;
+        // 请求线程可能在扫描期间已抢先处理同一变化：live 已是本次扫描的新值、
+        // 且不同于扫描起点的 prev → 跳过，避免二次失效清掉刚重建的缓存
+        // （Python `_claim_scan_change` 的等价去重）。
+        if (it != books.end()) {
+            auto lit = live_before.find(vpath);
+            if (lit != live_before.end()) {
+                const LibraryBook& nb = it->second;
+                const LibraryBook& lb = lit->second;
+                const bool live_is_new =
+                    lb.book_id == nb.book_id && lb.size == nb.size &&
+                    std::fabs(lb.mtime - nb.mtime) < 1e-6 && lb.format == nb.format;
+                const bool live_is_same_as_prev =
+                    lb.book_id == pb.book_id && lb.size == pb.size &&
+                    std::fabs(lb.mtime - pb.mtime) < 1e-6 && lb.format == pb.format;
+                if (live_is_new && !live_is_same_as_prev) continue;
+            }
+        }
+        notify_content_changed(pb.book_id);
     }
     save_index();  // Python 在扫描锁释放后落盘（scanning_ 由 ScanGuard 复位）
 }
@@ -730,39 +767,55 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
         // book_id：索引增量命中则复用，否则重算指纹并更新索引映射
         std::string fmt_s = fmt;
         std::string book_id;
+        std::string changed_old_id;  // 非空 → 内容变化，锁外通知清派生缓存
         {
             bool reuse = false;
             std::shared_lock lk(mu_);
             auto it = by_vpath_.find(child_vpath);
+            // 与 Python _book_id_for 对齐：还要求旧记录有 book_id（损坏索引不复用空 id）
             if (it != by_vpath_.end() && it->second.size == size &&
-                std::fabs(it->second.mtime - mtime) < 1e-6 && it->second.format == fmt_s) {
+                std::fabs(it->second.mtime - mtime) < 1e-6 && it->second.format == fmt_s &&
+                !it->second.book_id.empty()) {
                 book_id = it->second.book_id;
                 reuse = true;
             }
             if (!reuse) {
                 lk.unlock();
-                book_id = compute_book_id(e.path(), size);
+                std::string computed = compute_book_id(e.path(), size);
                 std::unique_lock lk2(mu_);
-                // 同一 vpath 换了内容 → 旧 book_id 必须彻底作废，否则 id_to_vpath_
-                // 里会留下"指向同一路径、却声称自己是旧 id"的别名
-                std::string previous;
+                // 并发重复检测（对齐 Python _book_id_for）：另一个线程已完成切换并
+                // 通知过旧 id，直接沿用其结果，避免同一次变化通知两次。
                 auto bit = self->by_vpath_.find(child_vpath);
-                if (bit != self->by_vpath_.end()) previous = bit->second.book_id;
-                LibraryBook nb;
-                nb.book_id = book_id;
-                nb.vpath = child_vpath;
-                nb.format = fmt_s;
-                nb.size = size;
-                nb.mtime = mtime;
-                self->by_vpath_[child_vpath] = std::move(nb);
-                if (!previous.empty() && previous != book_id) {
-                    auto pit = self->id_to_vpath_.find(previous);
-                    if (pit != self->id_to_vpath_.end() && pit->second == child_vpath)
-                        self->id_to_vpath_.erase(pit);
+                if (bit != self->by_vpath_.end() && bit->second.size == size &&
+                    std::fabs(bit->second.mtime - mtime) < 1e-6 &&
+                    bit->second.format == fmt_s && !bit->second.book_id.empty()) {
+                    book_id = bit->second.book_id;
+                } else {
+                    book_id = computed;
+                    // 同一 vpath 换了内容 → 旧 book_id 必须彻底作废，否则
+                    // id_to_vpath_ 里会留下"指向同一路径、却声称自己是旧 id"的别名。
+                    // 同时记录旧 id 供锁外通知：列表路径不能让 size/mtime 被静默
+                    // 刷新后旧分页/旧页面图继续服务（审查：三路失效不一致）。
+                    if (bit != self->by_vpath_.end()) changed_old_id = bit->second.book_id;
+                    LibraryBook nb;
+                    nb.book_id = book_id;
+                    nb.vpath = child_vpath;
+                    nb.format = fmt_s;
+                    nb.size = size;
+                    nb.mtime = mtime;
+                    self->by_vpath_[child_vpath] = std::move(nb);
+                    if (!changed_old_id.empty() && changed_old_id != book_id) {
+                        auto pit = self->id_to_vpath_.find(changed_old_id);
+                        if (pit != self->id_to_vpath_.end() && pit->second == child_vpath)
+                            self->id_to_vpath_.erase(pit);
+                    }
+                    self->id_to_vpath_[book_id] = child_vpath;
                 }
-                self->id_to_vpath_[book_id] = child_vpath;
             }
         }
+        // 等长就地编辑时旧 id 可能等于新 id，但派生缓存（分页/解析/页面图）仍必须清
+        if (!changed_old_id.empty()) notify_content_changed(changed_old_id);
+        const std::string rev = compute_file_rev(book_id, size, mtime);
         // openable/reason：后端缺失（unrar/7z/Calibre/pdfium）时置灰并给出原因。
         // 对应 Python library.py:536-549 的 registry.openable_reason(fmt)：
         // 恒 true 会让客户端把打不开的书显示成可点，点进去才报 415。
@@ -775,7 +828,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
             {"book_id", book_id},
             {"size", size},
             {"mtime", iso_time_utc_micro(mtime)},
-            {"cover_url", "/api/v1/books/" + book_id + "/cover"},
+            {"cover_url", "/api/v1/books/" + book_id + "/cover?rev=" + rev},
             {"gallery", nullptr},
             {"openable", !unopenable.has_value()},
             {"reason", unopenable ? nlohmann::json(*unopenable) : nlohmann::json(nullptr)},
@@ -853,26 +906,51 @@ std::optional<BookRef> LibraryService::require_book(const std::string& book_id) 
         if (ec) return std::nullopt;
         double mtime = path_mtime(real);
         if (info.size != size || std::fabs(info.mtime - mtime) > 1e-6) {
-            // 内容变了：清掉该 book_id 的全部派生缓存（对应 library.py:668
+            std::string refreshed = compute_book_id(real, size);
+            // 索引刷新（对应 Python book_by_id → _book_id_for）：写入新指纹并作废
+            // 旧 id 别名。只刷新 size/mtime 而不更新映射的话，下一次请求会把旧 id
+            // 继续当作有效指纹（"一个路径悄悄刷新、后一个路径再也检测不到变化"）。
+            {
+                auto& mutable_books =
+                    const_cast<std::map<std::string, LibraryBook>&>(by_vpath_);
+                auto& mutable_ids = const_cast<std::unordered_map<std::string, std::string>&>(
+                    id_to_vpath_);
+                std::unique_lock lk(mu_);
+                auto bit = mutable_books.find(vpath);
+                if (bit != mutable_books.end()) {
+                    std::string previous = bit->second.book_id;
+                    bit->second.book_id = refreshed;
+                    bit->second.size = size;
+                    bit->second.mtime = mtime;
+                    if (!previous.empty() && previous != refreshed) {
+                        auto pit = mutable_ids.find(previous);
+                        if (pit != mutable_ids.end() && pit->second == vpath)
+                            mutable_ids.erase(pit);
+                    }
+                    mutable_ids[refreshed] = vpath;
+                }
+            }
+            // 内容变了：清掉旧 book_id 的全部派生缓存（对应 library.py:668
             // _notify_content_changed）。等长就地编辑时 book_id 不变，
             // 不通知就会一直用旧的 parsed/layout 缓存与旧页面图。
             notify_content_changed(bid);
-            std::string refreshed = compute_book_id(real, size);
             if (refreshed != bid) return std::nullopt;  // 内容指纹真的变了：旧 id 失效
-            // 指纹相同（1MB 之后的等长编辑）：id 不变，仅刷新索引里的 size/mtime
-            auto& mutable_books = const_cast<std::map<std::string, LibraryBook>&>(by_vpath_);
-            std::unique_lock lk(mu_);
-            auto bit = mutable_books.find(vpath);
-            if (bit != mutable_books.end()) {
-                bit->second.size = size;
-                bit->second.mtime = mtime;
-            }
             info.size = size;
             info.mtime = mtime;
+        }
+    } else {
+        // 防御（对齐 Python book_by_id）：_by_id 有记录但索引无详情时补一次 stat，
+        // 否则 rev 会按 size=0/mtime=0 计算，与 Python 分叉
+        std::error_code sec;
+        long long size = static_cast<long long>(std::filesystem::file_size(real, sec));
+        if (!sec) {
+            info.size = size;
+            info.mtime = path_mtime(real);
         }
     }
     BookRef ref;
     ref.book_id = bid;
+    ref.rev = compute_file_rev(bid, info.size, info.mtime);
     ref.vpath = vpath;
     ref.path = real;
     ref.format = info.format;
@@ -948,6 +1026,7 @@ std::optional<BookRef> LibraryService::refresh_book(const std::string& book_id) 
     }
     BookRef ref;
     ref.book_id = info.book_id;
+    ref.rev = compute_file_rev(info.book_id, info.size, info.mtime);
     ref.vpath = vpath;
     ref.path = real;
     ref.format = info.format;

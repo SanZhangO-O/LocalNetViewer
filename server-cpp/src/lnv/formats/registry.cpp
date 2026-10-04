@@ -17,23 +17,27 @@
 // - MOBI/AZW3：create_mobi_adapter(cfg, ref)——预期在 "lnv/formats/mobi.h"（同一代理）。
 // 三个工厂函数目前均未在本仓库头文件中声明，这里给出前向声明以保持本文件自洽：
 namespace lnv {
-std::unique_ptr<BookAdapter> create_comic_adapter(const AppConfig& cfg, const BookRef& ref) {
+std::unique_ptr<BookAdapter> create_comic_adapter(const AppConfig& cfg, const BookRef& ref,
+                                                  const AdapterEnv&) {
     return std::make_unique<ComicAdapter>(cfg, ref);
 }
-std::unique_ptr<BookAdapter> create_pdf_adapter(const AppConfig& cfg, const BookRef& ref) {
+std::unique_ptr<BookAdapter> create_pdf_adapter(const AppConfig& cfg, const BookRef& ref,
+                                                const AdapterEnv&) {
     return std::make_unique<PdfAdapter>(cfg, ref);
 }
-std::unique_ptr<BookAdapter> create_mobi_adapter(const AppConfig& cfg, const BookRef& ref) {
-    return std::make_unique<MobiAdapter>(cfg, ref);
+std::unique_ptr<BookAdapter> create_mobi_adapter(const AppConfig& cfg, const BookRef& ref,
+                                                 const AdapterEnv& env) {
+    return std::make_unique<MobiAdapter>(cfg, ref, env);
 }
 }  // namespace lnv
 
 namespace lnv {
 
-std::unique_ptr<BookAdapter> create_adapter(const AppConfig& cfg, const BookRef& ref) {
+std::unique_ptr<BookAdapter> create_adapter(const AppConfig& cfg, const BookRef& ref,
+                                            const AdapterEnv& env) {
     // 虚拟书：文件夹图集
     if (ref.virtual_book && ref.format == "gallery") {
-        return create_comic_adapter(cfg, ref);
+        return create_comic_adapter(cfg, ref, env);
     }
 
     std::string fmt = ref.format;
@@ -66,12 +70,12 @@ std::unique_ptr<BookAdapter> create_adapter(const AppConfig& cfg, const BookRef&
     }
 
     if (fmt == "txt") return std::make_unique<TxtAdapter>(cfg, ref);
-    if (fmt == "epub") return std::make_unique<EpubAdapter>(cfg, ref);
+    if (fmt == "epub") return std::make_unique<EpubAdapter>(cfg, ref, env);
     if (fmt == "fb2") return std::make_unique<Fb2Adapter>(cfg, ref);
-    if (fmt == "pdf") return create_pdf_adapter(cfg, ref);
-    if (fmt == "mobi" || fmt == "azw3" || fmt == "azw") return create_mobi_adapter(cfg, ref);
+    if (fmt == "pdf") return create_pdf_adapter(cfg, ref, env);
+    if (fmt == "mobi" || fmt == "azw3" || fmt == "azw") return create_mobi_adapter(cfg, ref, env);
     // cbz/cbz3/zip、cbr/rar、cb7/7z、cbt/tar → 漫画容器适配器
-    return create_comic_adapter(cfg, ref);
+    return create_comic_adapter(cfg, ref, env);
 }
 
 std::optional<std::string> openable_reason(const std::string& fmt_in) {

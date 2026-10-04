@@ -35,7 +35,7 @@ MOBI_EXTS = {".mobi", ".azw3", ".azw"}
 COMIC_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z", ".cbt", ".tar", ".cbz3"}
 GALLERY_FORMAT = "gallery"
 
-# 后端探测缓存（进程内一次性；refresh_backend_status() 可显式失效）
+# 后端探测缓存（进程内一次性）
 _BACKEND_CACHE: Optional[Dict[str, Dict[str, object]]] = None
 _BACKEND_LOCK = threading.Lock()
 
@@ -82,14 +82,6 @@ def backend_status() -> Dict[str, Dict[str, object]]:
         status = _probe_backends()
         _BACKEND_CACHE = status
         return {name: dict(data) for name, data in status.items()}
-
-
-def refresh_backend_status() -> Dict[str, Dict[str, object]]:
-    """丢弃探测缓存并重新探测（配置变化后由调用方显式触发）。"""
-    global _BACKEND_CACHE
-    with _BACKEND_LOCK:
-        _BACKEND_CACHE = None
-    return backend_status()
 
 
 def _probe_backends() -> Dict[str, Dict[str, object]]:

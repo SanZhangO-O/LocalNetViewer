@@ -44,6 +44,7 @@ async def book_meta(book_id: str, ctx=Depends(get_ctx)) -> BookMetaResponse:
     ]
     return BookMetaResponse(
         book_id=ref.book_id,
+        revision=ref.revision,
         title=meta.title or ref.title_guess,
         author=meta.author,
         format=meta.format or ref.format,
@@ -51,7 +52,7 @@ async def book_meta(book_id: str, ctx=Depends(get_ctx)) -> BookMetaResponse:
         size=int(meta.size or ref.size or 0),
         mode=meta.mode,  # type: ignore[arg-type]
         page_count=meta.page_count,
-        cover_url=f"/api/v1/books/{ref.book_id}/cover",
+        cover_url=f"/api/v1/books/{ref.book_id}/cover?rev={ref.revision}",
         render_support=RenderSupport(png=True, json=bool(meta.supports_json)),
         chapters=chapters,
         source=ref.vpath,
@@ -62,12 +63,22 @@ async def book_meta(book_id: str, ctx=Depends(get_ctx)) -> BookMetaResponse:
 async def book_cover(
     book_id: str,
     w: int = Query(default=240, ge=40, le=1024),
+    rev: str = Query(
+        default="", description="客户端已知修订号（仅作缓存破坏，服务器不信任）"
+    ),
     if_none_match: str | None = Header(default=None, alias="If-None-Match"),
     ctx=Depends(get_ctx),
 ) -> Response:
-    """封面图（JPEG/PNG，强缓存）。无内嵌封面时用 Pillow 生成标题封面。"""
-    key = ("cover", book_id, int(w))
-    etag = f'"{book_id}:w{int(w)}"'
+    """封面图（JPEG/PNG，强缓存）。无内嵌封面时用 Pillow 生成标题封面。
+
+    ``rev`` 查询参数只用于客户端破坏 URL 缓存：ETag 必须用书籍当前的 revision，
+    且**解析书籍之后**才能判 304（书被删除/替换后不能凭旧 ETag 继续命中）。
+    """
+    # 先解析书籍：书不存在 → 404（不能在未解析的情况下返回 304）
+    ref = await ctx.require_book_async(book_id)
+    current_rev = ref.revision
+    key = ("cover", ref.book_id, current_rev, int(w))
+    etag = f'"{ref.book_id}:{current_rev}:w{int(w)}"'
     # 封面列表一次拉几十张：支持条件请求，命中直接 304，
     # 与 get_page 的 304 契约保持一致
     if _etag_matches(if_none_match, etag):
@@ -87,7 +98,6 @@ async def book_cover(
         body, mime = cached
         return Response(content=body, media_type=mime, headers=headers)
 
-    ref = await ctx.require_book_async(book_id)
     async with ctx.open_adapter_async(ref) as adapter:
         result = await asyncio.to_thread(adapter.cover, int(w))
         if result is None:

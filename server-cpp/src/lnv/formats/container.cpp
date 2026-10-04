@@ -2,6 +2,7 @@
 // ZIP 用 miniz；TAR 自写 ustar/pax 读取；RAR/7z 借外部工具：列表后用
 // unrar p / 7z e -so 按需把单条目解到内存（不整包落盘，见 ExternalContainer）。
 #include "lnv/formats/container.h"
+#include "lnv/util/concurrency.h"  // heavy_gate（外部子进程解压/列表）
 #include "lnv/util/paths.h"
 #include "lnv/util/textutil.h"
 
@@ -833,6 +834,8 @@ class ExternalContainer : public Container {
 public:
     ExternalContainer(std::string backend, const std::filesystem::path& archive)
         : backend_(std::move(backend)), archive_(archive) {
+        // 列表要起外部进程（重活）；可重入，外层适配器构造已持闸门时不会重复占槽
+        auto heavy = heavy_gate().acquire();
         if (backend_ == "rar") {
             unrar_ = find_tool_in_path(L"unrar");
             if (unrar_.empty()) bsdtar_ = find_tool_in_path(L"bsdtar");
@@ -854,6 +857,8 @@ public:
     const std::vector<ContainerEntry>& entries() const override { return entries_; }
 
     std::string read(const std::string& name, long long entry_max_bytes) override {
+        // 每次读取都起一个外部进程（unrar/bsdtar/7z）：按重活闸门限流
+        auto heavy = heavy_gate().acquire();
         std::string key = posix_normpath(name);
         auto it = index_.find(key);
         if (it == index_.end())

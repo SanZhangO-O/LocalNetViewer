@@ -74,6 +74,10 @@ class _TimedRunner:
 
         box: Dict[str, Any] = {}
         done = threading.Event()
+        # 超时判定与 worker 完成标记共用一把锁：超时路径要么确认 worker 仍在跑
+        # （orphaned=True，调用方不得 close 它持有的适配器），要么确认它在超时窗口
+        # 最后一刻已经完成（直接取回结果/异常，不误报超时）——不存在中间态。
+        state_lock = threading.Lock()
 
         def _target() -> None:
             try:
@@ -81,6 +85,8 @@ class _TimedRunner:
             except BaseException as exc:  # noqa: BLE001 - 原样带回调用方线程
                 box["error"] = exc
             finally:
+                with state_lock:
+                    box["finished"] = True
                 done.set()
                 # 先清 key 再放槽位：反过来的话，若 release() 抛异常，
                 # 这个 key 会永远停在"上一次仍在进行中"，那本书再也打不开
@@ -100,7 +106,14 @@ class _TimedRunner:
             raise
 
         if not done.wait(timeout_s):
-            raise ParseTimeoutError(f"{what}超时（>{timeout_s:.0f}s）")
+            with state_lock:
+                finished = bool(box.get("finished"))
+            if not finished:
+                # worker 仍在跑：适配器等资源可能在超时后继续被读取，标记 orphaned
+                # 让路由跳过 close()，由 GC 在其释放引用后兜底关闭
+                raise ParseTimeoutError(
+                    f"{what}超时（>{timeout_s:.0f}s）", orphaned=True
+                )
         if "error" in box:
             raise box["error"]
         return box.get("value")

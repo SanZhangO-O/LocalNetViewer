@@ -1,7 +1,10 @@
 #pragma once
 // PDF 适配器（对应 Python formats/pdf.py；后端 pdfium 动态加载）
+#include <vector>
+
 #include "lnv/config.h"
 #include "lnv/formats/adapter.h"
+#include "lnv/util/imaging.h"
 
 namespace lnv {
 
@@ -29,8 +32,18 @@ private:
     struct PtSize { double w = 1.0, h = 1.0; };
     PtSize page_pt(int page);                 // 页面 pt 尺寸（越界抛错）
     double clamp_scale(double w_pt, double h_pt, double scale);
-    // 渲染已加载页面（调用方负责 LoadPage/关闭），RAII 管理位图
-    ImageBytes render_loaded_page(void* pg, double w_pt, double h_pt, double scale, int quality);
+    // 位图原始数据（BGRA，含 stride）。锁只覆盖 FPDF 调用 + 这份拷贝；
+    // BGRA→RGBA 与 JPEG 编码都在锁外做，避免全局 pdfium 锁被编码拉长。
+    struct RawBitmap {
+        int w = 0;
+        int h = 0;
+        int stride = 0;
+        std::vector<unsigned char> bgra;
+    };
+    // 渲染已加载页面（调用方负责 LoadPage/关闭，且必须持有 pdfium_mutex）：
+    // 只做 FPDF 调用与原始位图拷贝，不做像素转换/编码。
+    RawBitmap render_page_raw(void* pg, double w_pt, double h_pt, double scale);
+    static ImageBuf raw_to_image(const RawBitmap& raw);  // BGRA→RGBA（锁外执行）
     std::string meta_text(const char* tag);   // FPDF_GetMetaText（UTF-16 → UTF-8）
 
     AppConfig cfg_;

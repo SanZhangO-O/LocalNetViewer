@@ -1,7 +1,7 @@
 """MOBI / AZW3 适配器：依赖 Calibre 的 ``ebook-convert`` 转 EPUB 后缓存（设计 7.1，P4 可选）。
 
 - 启动/打开时探测 ``ebook-convert``；缺失则明确报错（不支持的格式要在列表置灰）；
-- 转换结果落在 ``cache/converted/{book_id}.epub``，之后完全走 EPUB 解析路径；
+- 转换结果落在 ``cache/converted/{book_id}.{revision}.epub``，之后完全走 EPUB 解析路径；
 - 解析超时由调用方（解析缓存）控制，这里的子进程超时取 ``parse_timeout_s × 4``。
 """
 
@@ -28,10 +28,64 @@ from .epub import EpubAdapter
 
 CONVERT_TIMEOUT_FACTOR = 4.0
 
+# ``cache/converted`` 的总量上限：转换产物是"一次性"缓存，不设上限会被
+# 大量 MOBI 撑爆磁盘。按 mtime LRU 清理到 80%，与 parsed/layouts 缓存同一套策略。
+CONVERTED_CACHE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
 # 每本书一把锁：并发首次打开同一本 MOBI 时，第二个请求会等第一个转换完，
 # 而不是同时往同一个目标文件写（互相读到半成品 EPUB）
 _CONVERT_LOCKS: dict = {}
 _CONVERT_LOCKS_GUARD = threading.Lock()
+
+# 清理串行化：启动清理与转换后清理可能并发，避免同时删同一批文件
+_SWEEP_LOCK = threading.Lock()
+
+
+def sweep_converted_cache(
+    directory: Path,
+    limit_bytes: int = CONVERTED_CACHE_LIMIT_BYTES,
+    *,
+    keep: Optional[Path] = None,
+) -> int:
+    """按 mtime LRU 清理 ``cache/converted``，返回删除的文件数（线程安全）。
+
+    启动时与每次转换成功后调用；``keep`` 指向刚写好的文件，即使配额紧张
+    也不淘汰它（否则刚转完就被删，下一次打开又得重转）。
+    """
+    limit = int(limit_bytes or 0)
+    if limit <= 0:
+        return 0
+    with _SWEEP_LOCK:
+        entries = []
+        total = 0
+        try:
+            files = [p for p in Path(directory).glob("*.epub") if p.is_file()]
+        except OSError:
+            return 0
+        for path in files:
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, path))
+            total += st.st_size
+        if total <= limit:
+            return 0
+        target = int(limit * 0.8)
+        entries.sort(key=lambda item: item[0])
+        removed = 0
+        for _, size, path in entries:
+            if total <= target:
+                break
+            if keep is not None and path == keep:
+                continue
+            try:
+                path.unlink()
+                total -= size
+                removed += 1
+            except OSError:
+                continue
+        return removed
 
 
 def _lock_for(key: str) -> threading.Lock:
@@ -74,7 +128,11 @@ class MobiAdapter(FlowAdapter):
     def _converted_path(env: AdapterEnv, ref: BookRef) -> Path:
         out_dir = env.config.cache_dir / "converted"
         makedirs_quiet(out_dir)
-        return out_dir / f"{ref.book_id}.epub"
+        # 文件名带内容修订号（跨实现契约，与 C++ 一致）：内容变化后新 rev 指向新
+        # 文件，失效时仍在途的旧转换（先写 .tmp 再 replace）永远不会被新 rev 采用，
+        # 关闭"失效与转换竞态"导致的旧 EPUB 回灌。无 rev 时退回 book_id。
+        rev = str(getattr(ref, "revision", "") or "")
+        return out_dir / (f"{ref.book_id}.{rev}.epub" if rev else f"{ref.book_id}.epub")
 
     def _epub_ref(self, ref: BookRef, target: Path) -> BookRef:
         if not _is_usable(target):
@@ -132,6 +190,8 @@ class MobiAdapter(FlowAdapter):
             except OSError as exc:
                 _unlink_quiet(tmp)
                 raise ParseError(f"转换结果无法落盘: {exc}") from exc
+            # 转换产物受配额约束：超限时按 mtime LRU 淘汰旧书（保留刚转好的）
+            sweep_converted_cache(target.parent, keep=target)
 
     def close(self) -> None:
         self._inner.close()

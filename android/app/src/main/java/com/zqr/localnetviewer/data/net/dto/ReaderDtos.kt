@@ -60,6 +60,8 @@ data class LayoutResponseDto(
     val chapters: List<ChapterInfoDto> = emptyList(),
     @SerialName("cache_hit") val cacheHit: Boolean = false,
     val strip: Boolean = false,
+    /** 内容修订号：同 URL 内容变化时递增，页面 URL 携带它避免命中旧磁盘缓存（旧服务器缺省为空串）。 */
+    val revision: String = "",
 )
 
 /** 锚点：所有阅读位置都用它表示，而不是页码（设计 2.3）。 */

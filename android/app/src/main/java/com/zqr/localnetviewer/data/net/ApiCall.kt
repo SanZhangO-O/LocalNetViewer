@@ -37,6 +37,8 @@ class ApiException(
         const val CODE_LAYOUT_NOT_FOUND = "LAYOUT_NOT_FOUND"
         const val CODE_PAGE_OUT_OF_RANGE = "PAGE_OUT_OF_RANGE"
         const val CODE_BOOK_NOT_FOUND = "BOOK_NOT_FOUND"
+        /** 错误体缺失/不可解析时的 404 兜底码：不能臆断为 BOOK_NOT_FOUND（会掩盖 layout 失效恢复）。 */
+        const val CODE_NOT_FOUND = "NOT_FOUND"
         const val CODE_PARSE_FAILED = "PARSE_FAILED"
         const val CODE_INTERNAL = "INTERNAL"
 
@@ -70,7 +72,9 @@ class ApiException(
             val parsed = client?.decodeErrorBody(raw)
             val code = parsed?.code ?: when (status) {
                 401 -> CODE_UNAUTHORIZED
-                404 -> "BOOK_NOT_FOUND"
+                // 服务器通常返回 LAYOUT_NOT_FOUND / PAGE_OUT_OF_RANGE 等结构化错误体；
+                // 拿不到错误体时只能给"未知的 404"，把 BOOK_NOT_FOUND 留给明确语义的场景
+                404 -> CODE_NOT_FOUND
                 else -> "HTTP_$status"
             }
             val message = parsed?.message?.takeIf { it.isNotBlank() } ?: defaultMessage(status)

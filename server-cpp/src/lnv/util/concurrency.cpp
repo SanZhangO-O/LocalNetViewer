@@ -1,7 +1,14 @@
-// ParseGate 实现（对应 Python util/concurrency.py 的去重 + 有界并发语义）
+// ParseGate / HeavyGate 实现（对应 Python util/concurrency.py 的去重 + 有界并发语义）
 #include "lnv/util/concurrency.h"
 
 namespace lnv {
+
+HeavyGate& heavy_gate() {
+    // 4 槽：与 Python 的线程池重活占比对应；故意泄漏（同 parse_gate），
+    // 避免静态析构与仍在跑的重活/等待者竞争。
+    static HeavyGate* gate = new HeavyGate(4);
+    return *gate;
+}
 
 void ParseGate::acquire(const std::string& key, std::chrono::milliseconds wait,
                         const std::string& what) {
