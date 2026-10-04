@@ -15,9 +15,6 @@ namespace lnv {
 
 namespace {
 
-// 解析器版本（Python cache/parsed.py PARSER_VERSION = "1"）
-constexpr const char* kParserVersion = "1";
-
 // file_time → epoch 秒（浮点），用于配额清理的 mtime 排序
 double file_time_to_epoch(const std::filesystem::file_time_type& t) {
     auto sys = std::chrono::clock_cast<std::chrono::system_clock>(t);
@@ -222,7 +219,8 @@ void enforce_dir_quota(const std::filesystem::path& dir, long long max_bytes,
 // ------------------------------------------------------------------ ParsedCache
 
 std::optional<DocumentModel> ParsedCache::get(const std::string& book_id) const {
-    std::filesystem::path path = dir_ / (book_id + "." + kParserVersion + ".json.gz");
+    std::filesystem::path path =
+        dir_ / (book_id + "." + kParsedCacheVersion + ".json.gz");
     std::string raw;
     // 文件读取不加锁：mu_ 保护的是"配额清理"这段临界区（读-算-删），
     // 不是文件 IO。此前把 gzip 读取也塞进锁里，一本大书冷读会阻塞所有其他书的
@@ -251,7 +249,8 @@ std::optional<DocumentModel> ParsedCache::get(const std::string& book_id) const 
 
 void ParsedCache::put(const DocumentModel& doc) {
     if (doc.book_id.empty()) return;
-    std::filesystem::path path = dir_ / (doc.book_id + "." + kParserVersion + ".json.gz");
+    std::filesystem::path path =
+        dir_ / (doc.book_id + "." + kParsedCacheVersion + ".json.gz");
     std::string plain = doc.to_dict().dump();  // 紧凑分隔符，非 ASCII 原样输出
     std::string gz = gzip_compress(plain, 6);
     if (gz.empty()) return;

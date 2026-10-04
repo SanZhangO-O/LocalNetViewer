@@ -20,6 +20,11 @@ void enforce_dir_quota(const std::filesystem::path& dir, long long max_bytes,
 // 会让共享同一缓存目录的两个实现在配额上差 4.6%，C++ 先删掉 Python 还能用的文件。
 constexpr long long kMbToBytes = 1024LL * 1024LL;
 
+// 解析器版本（Python cache/parsed.py PARSER_VERSION = "1"）。缓存文件名
+// {book_id}.{version}.json.gz 的读写与 context 的失效路径必须共用同一常量，
+// 否则版本升级后一处改了另一处没改，失效/命中会错位。
+inline constexpr const char* kParsedCacheVersion = "1";
+
 class ParsedCache {
 public:
     ParsedCache(std::filesystem::path dir, long long max_mb)

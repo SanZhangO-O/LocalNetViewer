@@ -35,6 +35,9 @@ constexpr const char* kFontExts[] = {".ttf", ".otf", ".ttc", ".otc"};
 constexpr size_t kMaxFontFiles = 600;
 // can_draw_cjk 探测字号（px）
 constexpr int kGlyphProbeSize = 64;
+// 与 Python fonts.py::_MEASURE_CACHE_MAX 一致的字符宽度缓存上限：
+// 达到上限即整体清空（Python 同样 clear），避免逐字缓存无界吃内存
+constexpr size_t kMeasureCacheMax = 200000;
 
 // fonts.py CJK_HINTS：字形探测全军覆没时按文件名兜底
 constexpr const char* kCjkHints[] = {
@@ -155,7 +158,7 @@ struct FontManager::Impl {
     std::string loaded_id;                  // 当前 face 对应的 font_id
     int loaded_size = 0;                    // 当前 face 对应的像素字号
     std::unordered_map<std::string, std::filesystem::path> paths;  // id → 文件路径
-    // (font_id, size, codepoint) → advance 像素宽度 缓存
+    // (font_id, size, codepoint) → advance 像素宽度 缓存；超过 kMeasureCacheMax 清空
     std::map<std::tuple<std::string, int, char32_t>, double> char_cache;
 
     Impl() { FT_Init_FreeType(&lib); }
@@ -175,9 +178,11 @@ struct FontManager::Impl {
         if (FT_New_Memory_Face(lib, bytes.data(), static_cast<FT_Long>(bytes.size()),
                                0, &new_face) != 0)
             return false;
-        // 像素字号：Set_Pixel_Sizes(width=size_px, height=0)，
-        // 与 Python getlength 的像素字号语义对齐
-        if (FT_Set_Pixel_Sizes(new_face, size_px, 0) != 0) {
+        // 像素字号：Pillow 的调用形式是 FT_Set_Pixel_Sizes(face, 0, size)（height 位）。
+        // FreeType 会把为 0 的一侧复制成另一侧（ftobjs.c FT_Set_Pixel_Sizes），
+        // 因此 (size,0) 与 (0,size) 实际等价；这里按 Pillow 的参数序写，避免
+        // 源码层面看起来"参数写反"
+        if (FT_Set_Pixel_Sizes(new_face, 0, static_cast<FT_UInt>(size_px)) != 0) {
             FT_Done_Face(new_face);
             return false;
         }
@@ -194,16 +199,16 @@ FontManager::FontManager() : impl_(std::make_unique<Impl>()) {}
 FontManager::~FontManager() = default;
 
 FontManager::FaceGuard::FaceGuard(FontManager& fm, const std::string& font_id, int size_px)
-    : fm_(&fm) {
-    auto* lk = new std::unique_lock<std::recursive_mutex>(fm.impl_->mtx);
-    lock_ = lk;
+    // 锁随成员构造持有；此后 ensure() 若抛 bad_alloc（read_file_bytes 最大可
+    // resize 1GB），构造函数失败但已构造成员 lock_ 会被析构 → 正常解锁。
+    // 绝不能再写成"先 new 出堆上锁再 ensure"：异常路径不会执行 ~FaceGuard，
+    // 堆上的锁悬空，recursive_mutex 永久保持已锁状态。
+    : fm_(&fm), lock_(fm.impl_->mtx) {
     if (size_px < 4) size_px = 4;
     ok_ = fm.impl_->ensure(font_id, size_px);
 }
 
-FontManager::FaceGuard::~FaceGuard() {
-    delete static_cast<std::unique_lock<std::recursive_mutex>*>(lock_);
-}
+FontManager::FaceGuard::~FaceGuard() = default;
 
 // ---------------------------------------------------------------- init
 void FontManager::init(const std::filesystem::path& fonts_dir, const std::string& default_font) {
@@ -295,7 +300,20 @@ void FontManager::init(const std::filesystem::path& fonts_dir, const std::string
 }
 
 // ---------------------------------------------------------------- 查询
+std::string FontManager::default_id() const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mtx);
+    return default_id_.empty() ? "default" : default_id_;
+}
+
+std::string FontManager::default_id_raw() const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mtx);
+    return default_id_;
+}
+
 std::string FontManager::resolve_id(const std::string& family) const {
+    // init() 会重写 faces_/default_id_，读侧统一持锁（递归锁，可与
+    // char_length 等已持锁路径嵌套）；否则启动后并发 /render 可能读到半更新的表
+    std::lock_guard<std::recursive_mutex> lk(impl_->mtx);
     // 对齐 fonts.py::get()：空/auto → 默认；精确 id → 大小写不敏感 id 或 name →
     // 子串命中（"notosans" 命中 NotoSansSC-Regular）→ 默认
     std::string fam = ascii_lower(trim_ws(family));
@@ -310,6 +328,7 @@ std::string FontManager::resolve_id(const std::string& family) const {
 }
 
 std::vector<FontFaceInfo> FontManager::list_infos() const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mtx);
     // list_infos 语义：name = id，default 标记命中 default_id 的项
     std::vector<FontFaceInfo> out = faces_;
     const std::string did = default_id();
@@ -318,6 +337,7 @@ std::vector<FontFaceInfo> FontManager::list_infos() const {
 }
 
 std::filesystem::path FontManager::face_path(const std::string& font_id) const {
+    std::lock_guard<std::recursive_mutex> lk(impl_->mtx);
     // 对齐 fonts.py::get()：未知 id 回落到默认字体（不是 404），
     // 否则 /render/fonts/{未知}/file 两边一个 200 一个 404。
     auto it = impl_->paths.find(resolve_id(font_id));
@@ -343,6 +363,7 @@ double FontManager::char_length(char32_t ch) {
     FT_UInt gindex = FT_Get_Char_Index(impl_->face, ch);
     if (FT_Load_Glyph(impl_->face, gindex, FT_LOAD_DEFAULT) != 0) return 0.0;
     double w = impl_->face->glyph->advance.x / 64.0;  // 26.6 → 像素
+    if (impl_->char_cache.size() > kMeasureCacheMax) impl_->char_cache.clear();
     impl_->char_cache.emplace(std::move(key), w);
     return w;
 }
@@ -359,6 +380,7 @@ double FontManager::char_length_at(const std::string& font_id, int size_px, char
     FT_UInt gindex = FT_Get_Char_Index(impl_->face, ch);
     if (FT_Load_Glyph(impl_->face, gindex, FT_LOAD_DEFAULT) != 0) return 0.0;
     double w = impl_->face->glyph->advance.x / 64.0;
+    if (impl_->char_cache.size() > kMeasureCacheMax) impl_->char_cache.clear();
     impl_->char_cache.emplace(std::move(key), w);
     return w;
 }
@@ -409,7 +431,8 @@ bool FontManager::can_draw_cjk(const std::filesystem::path& font_path) {
         if (FT_New_Memory_Face(lib, bytes.data(), static_cast<FT_Long>(bytes.size()),
                                0, &face) != 0)
             break;
-        FT_Set_Pixel_Sizes(face, kGlyphProbeSize, 0);
+        // 与 Pillow 相同的参数序（0, size）；探测只做两字形对比，等价即可
+        FT_Set_Pixel_Sizes(face, 0, static_cast<FT_UInt>(kGlyphProbeSize));
 
         // 光栅化单个字符，返回像素缓冲（行间距按 pitch 压实）；失败返回空
         auto raster = [&](char32_t cp) {

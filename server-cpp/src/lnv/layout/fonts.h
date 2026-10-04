@@ -1,6 +1,7 @@
 #pragma once
 // 字体管理（对应 Python layout/fonts.py）
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "lnv/util/textutil.h"
@@ -46,10 +47,12 @@ public:
     // "auto"/空 → 默认字体 id；未知名 → 容错回退默认。返回解析后的字体 id。
     std::string resolve_id(const std::string& family) const;
     // 对齐 Python fonts.py::default_id —— 没有任何可用字体时返回字面量 "default"
-    // （空串会改变 layout_key 的 font 分量并与 Python 分叉，审查 L13）
-    std::string default_id() const { return default_id_.empty() ? "default" : default_id_; }
-    // 内部真实值（无字体时为空串），仅用于"是否装了字体"的判断
-    const std::string& default_id_raw() const { return default_id_; }
+    // （空串会改变 layout_key 的 font 分量并与 Python 分叉，审查 L13）。
+    // init() 会重写 default_id_/faces_，读侧也必须持锁（实现见 fonts.cpp）。
+    std::string default_id() const;
+    // 内部真实值（无字体时为空串），仅用于"是否装了字体"的判断。
+    // 按值返回：锁内拷贝，避免锁外引用到会被 init() 改写的 default_id_
+    std::string default_id_raw() const;
     std::vector<FontFaceInfo> list_infos() const;
 
     // 加载 face（id 已解析）；线程安全（内部锁）。size_px 为像素字号。
@@ -86,7 +89,10 @@ public:
     private:
         FontManager* fm_ = nullptr;
         bool ok_ = false;
-        void* lock_ = nullptr;  // std::unique_lock<std::recursive_mutex>*
+        // 按值持有锁：构造期间 ensure() 若抛 bad_alloc，成员析构必然解锁。
+        // 早期写成堆上 new std::unique_lock + void*，ensure 抛异常时构造函数
+        // 失败、堆上的锁既不解锁也不释放 → 互斥锁永久死锁（整条渲染管线挂死）。
+        std::unique_lock<std::recursive_mutex> lock_;
     };
 
     // 该字体是否"能画中文"（光栅化 U+4E2D 与 .notdef 基准比较）

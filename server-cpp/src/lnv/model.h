@@ -3,6 +3,7 @@
 // 对应 Python schemas.py / formats/base.py / layout/engine.py 的落盘契约。
 // 序列化必须与 Python json.dumps(..., ensure_ascii=False, sort_keys=按需,
 // separators=(",",":")) 逐字节兼容（缓存跨实现共用）。
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -39,8 +40,23 @@ struct LayoutProfile {
     std::string mode = "flow";          // flow | fixed | strip
     int strip_overlap_px = 0;
 
-    int avail_width() const { return std::max(1, viewport.w - margin.left - margin.right); }
-    int avail_height() const { return std::max(1, viewport.h - margin.top - margin.bottom); }
+    // Python 的 int 不会溢出：margin 只有 ge=0 校验（schemas.py），理论上可给
+    // 任意非负值；直接 int 相减在大 margin（或 from_dict 的负 margin）下是 UB。
+    // 用 64 位算差后钳到 [1, INT_MAX]，与 Python max(1, w-l-r) 语义一致。
+    int avail_width() const {
+        const long long v =
+            static_cast<long long>(viewport.w) - margin.left - margin.right;
+        if (v < 1) return 1;
+        if (v > std::numeric_limits<int>::max()) return std::numeric_limits<int>::max();
+        return static_cast<int>(v);
+    }
+    int avail_height() const {
+        const long long v =
+            static_cast<long long>(viewport.h) - margin.top - margin.bottom;
+        if (v < 1) return 1;
+        if (v > std::numeric_limits<int>::max()) return std::numeric_limits<int>::max();
+        return static_cast<int>(v);
+    }
 
     // geometry_dict 对应的 JSON（键排序、无空白、round(…,4)）
     nlohmann::json geometry_json() const;

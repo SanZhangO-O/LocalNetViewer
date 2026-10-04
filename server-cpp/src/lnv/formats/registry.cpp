@@ -69,7 +69,7 @@ std::unique_ptr<BookAdapter> create_adapter(const AppConfig& cfg, const BookRef&
     if (fmt == "epub") return std::make_unique<EpubAdapter>(cfg, ref);
     if (fmt == "fb2") return std::make_unique<Fb2Adapter>(cfg, ref);
     if (fmt == "pdf") return create_pdf_adapter(cfg, ref);
-    if (fmt == "mobi" || fmt == "azw3") return create_mobi_adapter(cfg, ref);
+    if (fmt == "mobi" || fmt == "azw3" || fmt == "azw") return create_mobi_adapter(cfg, ref);
     // cbz/cbz3/zip、cbr/rar、cb7/7z、cbt/tar → 漫画容器适配器
     return create_comic_adapter(cfg, ref);
 }

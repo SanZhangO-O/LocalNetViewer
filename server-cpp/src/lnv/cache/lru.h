@@ -44,6 +44,8 @@ public:
         order_.splice(order_.begin(), order_, it->second.second);
         return it->second.first;
     }
+    // 后写覆盖（对应 Python CountLRU.put / LayoutStore.save 的无条件 put）；
+    // 需要"先写者为准"的磁盘加载路径用 put_if_absent
     void put(const std::string& key, V value) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = index_.find(key);
@@ -59,6 +61,25 @@ public:
             index_.erase(order_.back());
             order_.pop_back();
         }
+    }
+    // 先写者为准的插入：键已存在时不覆盖，返回现有值（并把条目移到最新）；
+    // 不存在则插入并返回 nullopt。对应 Python LayoutStore.get 的 existing 检查：
+    // 并发从磁盘加载同一 layout 时，先写入内存的那份才是权威副本。
+    std::optional<V> put_if_absent(const std::string& key, V value) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            order_.splice(order_.begin(), order_, it->second.second);
+            return it->second.first;
+        }
+        if (max_items_ == 0) return std::nullopt;
+        order_.push_front(key);
+        index_[key] = {std::move(value), order_.begin()};
+        if (order_.size() > max_items_) {
+            index_.erase(order_.back());
+            order_.pop_back();
+        }
+        return std::nullopt;
     }
     void remove_if(const std::function<bool(const std::string&)>& pred) {
         std::lock_guard<std::mutex> lk(mu_);

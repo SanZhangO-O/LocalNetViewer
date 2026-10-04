@@ -12,8 +12,11 @@
 #include "lnv/util/md5.h"
 #include "lnv/util/sha1.h"
 
+#include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <regex>
 #include <windows.h>   // GetFileAttributesExW（字体文件 ETag 需要与 CPython 完全一致的 mtime）
@@ -869,17 +872,23 @@ void handle_progress_put(AppContext& ctx, const httplib::Request& req, httplib::
     } else {
         anchor_obj = &*it;
     }
-    long long anchor[3] = {0, 0, 0};
+    nlohmann::json anchor[3] = {0, 0, 0};
     if (anchor_obj) {
-        anchor[0] = jv_int(v, *anchor_obj, "chapter", {"body", "anchor", "chapter"}, 0, IntBound{});
-        anchor[1] = jv_int(v, *anchor_obj, "block", {"body", "anchor", "block"}, 0, IntBound{});
-        anchor[2] = jv_int(v, *anchor_obj, "char", {"body", "anchor", "char"}, 0, IntBound{});
+        jv_int_ex(v, *anchor_obj, "chapter", {"body", "anchor", "chapter"}, 0, IntBound{},
+                  false, false, &anchor[0]);
+        jv_int_ex(v, *anchor_obj, "block", {"body", "anchor", "block"}, 0, IntBound{},
+                  false, false, &anchor[1]);
+        jv_int_ex(v, *anchor_obj, "char", {"body", "anchor", "char"}, 0, IntBound{},
+                  false, false, &anchor[2]);
     }
-    // page / ratio 可空（Optional[...]：缺失或 null 都取 None）；page 保持 long long，
-    // 与 Python 的无界 int 一致（原样存回并回显，见审查 H4）
-    std::optional<long long> page;
-    if (body.contains("page") && !body["page"].is_null())
-        page = jv_int(v, body, "page", {"body", "page"}, 0, IntBound{}, false, true);
+    // page / ratio 可空（Optional[...]：缺失或 null 都取 None）；page 用 jv_int_ex
+    // 保留原始 JSON 整数（Python 无界 int：2^63..2^64-1 原样存回并回显，见审查 H4）
+    std::optional<nlohmann::json> page;
+    if (body.contains("page") && !body["page"].is_null()) {
+        nlohmann::json pv;
+        jv_int_ex(v, body, "page", {"body", "page"}, 0, IntBound{}, false, true, &pv);
+        if (pv.is_number()) page = std::move(pv);
+    }
     std::optional<double> ratio;
     if (body.contains("ratio") && !body["ratio"].is_null())
         // 写入前 clamp [0,1]（ProgressPutRequest._clamp）
@@ -921,18 +930,88 @@ static double file_mtime_for_etag(const std::filesystem::path& path) {
     const unsigned long long ft100 =
         (static_cast<unsigned long long>(info.ftLastWriteTime.dwHighDateTime) << 32) |
         info.ftLastWriteTime.dwLowDateTime;
-    constexpr long long kEpochDiffSec = 11644473600LL;  // 1601-01-01 → 1970-01-01
-    const long long ns = static_cast<long long>(ft100) * 100LL - kEpochDiffSec * 1000000000LL;
-    const long long sec = ns / 1000000000LL;
-    const long long rem = ns % 1000000000LL;
-    return static_cast<double>(sec) + static_cast<double>(rem) / 1e9;
+    // CPython timemodule.c 的算法：以 1601→1970 的差值做无符号减法，再拆成
+    // sec + nsec。旧的 `ft100*100 - 11644473600*1e9` 中间值超出 int64 范围
+    // （C4307 / 有符号溢出 UB），这里全程 unsigned 后再取结果。
+    constexpr unsigned long long kEpochDiff100ns = 11644473600ULL * 10000000ULL;
+    const unsigned long long delta = ft100 - kEpochDiff100ns;
+    const long long sec = static_cast<long long>(delta / 10000000ULL);
+    const long long nsec = static_cast<long long>(delta % 10000000ULL) * 100LL;
+    return static_cast<double>(sec) + static_cast<double>(nsec) / 1e9;
+}
+
+// Starlette set_stat_headers 的 Last-Modified：
+// email.utils.formatdate(st_mtime, usegmt=True) → "%a, %d %b %Y %H:%M:%S GMT"
+std::string http_date_utc(double epoch_s) {
+    time_t t = static_cast<time_t>(std::floor(epoch_s));
+    struct tm tmv;
+    gmtime_s(&tmv, &t);
+    char buf[40];
+    std::strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S GMT", &tmv);
+    return buf;
+}
+
+// CPython repr(float) 等价格式化（字体 ETag 需要与 Python 逐字相同）。
+// 先用 std::to_chars 取最短往返十进制（与 Python 3.1+ 的 repr 同为 shortest
+// round-trip），再按 Python 的显示规则重排：仅当十进制指数 < -4 或 >= 16 用
+// 科学计数法（指数至少两位），否则定点并在整数值后补 ".0"。
+// nlohmann 的 dump 走 %g 式阈值（1500000000.0 会输出 "1.5e+09"，Python repr 是
+// "1500000000.0"），md5 输入一旦不同，字体缓存就无法复用（审查 #7）。
+std::string py_repr_double(double v) {
+    if (std::isnan(v)) return "nan";
+    if (std::isinf(v)) return v < 0 ? "-inf" : "inf";
+    const bool neg = std::signbit(v);
+    const double a = neg ? -v : v;
+    char buf[64];
+    std::string s;
+    const auto res = std::to_chars(buf, buf + sizeof(buf), a, std::chars_format::scientific);
+    if (res.ec == std::errc()) {
+        s.assign(buf, static_cast<size_t>(res.ptr - buf));
+    } else {
+        // 兜底：MSVC/C++17 起 to_chars 浮点一定可用，这里只防意外
+        const int n = std::snprintf(buf, sizeof(buf), "%.17e", a);
+        if (n > 0)
+            s.assign(buf, static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n)
+                                                               : sizeof(buf) - 1);
+    }
+    const size_t epos = s.find('e');
+    if (epos == std::string::npos || epos == 0) return s;  // 理论上不可达
+    std::string digits;
+    for (size_t i = 0; i < epos; i++)
+        if (s[i] != '.') digits.push_back(s[i]);
+    while (digits.size() > 1 && digits.back() == '0') digits.pop_back();
+    int e = 0;
+    bool eneg = false;
+    size_t p = epos + 1;
+    if (p < s.size() && (s[p] == '+' || s[p] == '-')) eneg = s[p++] == '-';
+    for (; p < s.size(); p++) e = e * 10 + (s[p] - '0');
+    if (eneg) e = -e;
+    std::string out;
+    if (e < -4 || e >= 16) {  // Python repr 的指数阈值（decpt <= -4 || decpt > 16）
+        out.push_back(digits[0]);
+        if (digits.size() > 1) {
+            out.push_back('.');
+            out += digits.substr(1);
+        }
+        char eb[8];
+        std::snprintf(eb, sizeof(eb), "e%c%02d", e < 0 ? '-' : '+', e < 0 ? -e : e);
+        out += eb;
+    } else if (e >= 0) {
+        const size_t ip = static_cast<size_t>(e) + 1;
+        if (ip >= digits.size())
+            out = digits + std::string(ip - digits.size(), '0') + ".0";
+        else
+            out = digits.substr(0, ip) + "." + digits.substr(ip);
+    } else {
+        out = "0." + std::string(static_cast<size_t>(-e - 1), '0') + digits;
+    }
+    return neg ? "-" + out : out;
 }
 
 void handle_font_file(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string font_id = req.matches[1];
     auto path = ctx.fonts->face_path(font_id);
-    std::string bytes;
-    if (path.empty() || !read_file_bytes(path, bytes))
+    if (path.empty())
         throw AppError(ErrorCode::AssetNotFound, "字体不存在",
                        json::object({{"font_id", font_id}}));
     const std::string ext = ext_of(path.string());
@@ -940,19 +1019,52 @@ void handle_font_file(AppContext& ctx, const httplib::Request& req, httplib::Res
     res.set_header("Content-Disposition",
                    "attachment; filename=\"" + path.filename().string() + "\"");
     res.set_header("Cache-Control", "public, max-age=31536000, immutable");
-    // Starlette 的 FileResponse 会自动补 ETag / Last-Modified / Accept-Ranges
-    // （responses.py:321-341）。缺了它们客户端无法对字体做条件请求，
-    // 每次 JSON 模式对齐排版都要重下整个字体文件。
-    // ETag 公式与 Starlette 一致："{st_mtime}-{st_size}"，浮点用最短往返表示
-    // （nlohmann 的 dump 与 Python 的 repr 同为 shortest round-trip）。
+    // Starlette 的 FileResponse 会自动补 ETag / Accept-Ranges（responses.py:321-341）。
+    // 缺了它们客户端无法对字体做条件请求，每次 JSON 模式对齐排版都要重下整个字体。
+    // ETag 公式与 Starlette 一致：md5("{st_mtime repr}-{st_size}")，浮点必须用
+    // py_repr_double 生成与 Python repr 逐字相同的文本（nlohmann 的 dump 会分叉）。
     std::error_code ec;
     const auto st_size = std::filesystem::file_size(path, ec);
     if (!ec) {
+        // mtime 只取一次，ETag 与 Last-Modified 共用
         const double mtime = file_mtime_for_etag(path);
         if (mtime != 0.0) {
-            res.set_header("ETag", "\"" + md5_hex(json(mtime).dump() + "-" +
-                                       std::to_string(static_cast<long long>(st_size))) + "\"");
-            res.set_header("Accept-Ranges", "bytes");
+            const std::string etag =
+                "\"" + md5_hex(py_repr_double(mtime) + "-" +
+                               std::to_string(static_cast<long long>(st_size))) +
+                "\"";
+            // Last-Modified 与 Starlette 一致；If-Modified-Since 与 Python 一样不处理
+            res.set_header("Last-Modified", http_date_utc(mtime));
+            res.set_header("ETag", etag);
+            // 与其它端点一致的 If-None-Match 语义（*、W/ 前缀、逗号列表）
+            if (ctx.etag_matches(inm_ptr(req), etag)) { res.status = 304; return; }
+        }
+    }
+    // 条件请求未命中才读整份字体：避免 304 也全量读盘+分配（审查建议）
+    std::string bytes;
+    if (!read_file_bytes(path, bytes))
+        throw AppError(ErrorCode::AssetNotFound, "字体不存在",
+                       json::object({{"font_id", font_id}}));
+    // 与 Python 相同：文件可读即声明支持 Range（不依赖 ETag 是否算得出来）
+    res.set_header("Accept-Ranges", "bytes");
+    const long long total = static_cast<long long>(bytes.size());
+    if (req.has_header("Range")) {
+        // 与 pages 的 Range 语义共用同一解析器（§4.6）：语法无效 → 忽略按 200；
+        // 越界 → 416 + Content-Range；单段命中 → 206。
+        RangeSpec r;
+        const RangeKind kind = parse_range(req.get_header_value("Range"), total, r);
+        if (kind == RangeKind::Unsatisfiable) {
+            res.status = 416;
+            res.set_header("Content-Range", r.content_range);
+            return;
+        }
+        if (kind == RangeKind::Ok) {
+            res.status = 206;
+            res.set_header("Content-Range", r.content_range);
+            res.set_content(bytes.substr(static_cast<size_t>(r.start),
+                                         static_cast<size_t>(r.end - r.start + 1)),
+                            mime);
+            return;
         }
     }
     res.set_content(bytes, mime);
@@ -975,29 +1087,34 @@ void handle_healthz(AppContext& ctx, const httplib::Request&, httplib::Response&
 // 路径存在但方法不对 → 405（code BAD_REQUEST，message "Method Not Allowed"）。
 // 客户端按 code 分支，且这两条都是可观测契约（见 PORT_SPEC §1.2 补充映射）。
 void handle_unmatched(const httplib::Request& req, httplib::Response& res) {
-    struct Route { const char* pattern; const char* method; };
-    static const Route kRoutes[] = {
-        {R"(/api/v1/server/info)", "GET"},
-        {R"(/api/v1/files)", "GET"},
-        {R"(/api/v1/books/[^/]+/meta)", "GET"},
-        {R"(/api/v1/books/[^/]+/cover)", "GET"},
-        {R"(/api/v1/books/[^/]+/asset)", "GET"},
-        {R"(/api/v1/books/open-folder)", "POST"},
-        {R"(/api/v1/books/[^/]+/layout)", "POST"},
-        {R"(/api/v1/books/[^/]+/pages/[^/]+)", "GET"},
-        {R"(/api/v1/books/[^/]+/pages/[^/]+/meta)", "GET"},
-        {R"(/api/v1/books/[^/]+/locate)", "GET"},
-        {R"(/api/v1/books/[^/]+/search)", "GET"},
-        {R"(/api/v1/progress/[^/]+)", "GET"},
-        {R"(/api/v1/progress/[^/]+)", "PUT"},
-        {R"(/api/v1/render/fonts)", "GET"},
-        {R"(/api/v1/render/fonts/[^/]+/file)", "GET"},
-        {R"(/)", "GET"},
-        {R"(/healthz)", "GET"},
+    // 正则预编译为函数级 static（C++11 起首次初始化线程安全）：此前每个兜底请求
+    // 现场构造 2×17 个 std::regex（两个循环各一次），扫描期间 HTTP 风暴下纯浪费。
+    struct Route {
+        std::regex re;
+        const char* method;
+    };
+    static const std::vector<Route> kRoutes = {
+        {std::regex(R"(/api/v1/server/info)"), "GET"},
+        {std::regex(R"(/api/v1/files)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/meta)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/cover)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/asset)"), "GET"},
+        {std::regex(R"(/api/v1/books/open-folder)"), "POST"},
+        {std::regex(R"(/api/v1/books/[^/]+/layout)"), "POST"},
+        {std::regex(R"(/api/v1/books/[^/]+/pages/[^/]+)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/pages/[^/]+/meta)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/locate)"), "GET"},
+        {std::regex(R"(/api/v1/books/[^/]+/search)"), "GET"},
+        {std::regex(R"(/api/v1/progress/[^/]+)"), "GET"},
+        {std::regex(R"(/api/v1/progress/[^/]+)"), "PUT"},
+        {std::regex(R"(/api/v1/render/fonts)"), "GET"},
+        {std::regex(R"(/api/v1/render/fonts/[^/]+/file)"), "GET"},
+        {std::regex(R"(/)"), "GET"},
+        {std::regex(R"(/healthz)"), "GET"},
     };
     bool path_known = false;
     for (const auto& r : kRoutes) {
-        if (!std::regex_match(req.path, std::regex(r.pattern))) continue;
+        if (!std::regex_match(req.path, r.re)) continue;
         path_known = true;
         if (req.method == r.method) return;  // 理论上不可达（真实路由已注册）
     }
@@ -1005,7 +1122,7 @@ void handle_unmatched(const httplib::Request& req, httplib::Response& res) {
     if (!req.path.empty() && req.path.back() == '/' && req.path.size() > 1) {
         std::string trimmed = req.path.substr(0, req.path.size() - 1);
         for (const auto& r : kRoutes) {
-            if (!std::regex_match(trimmed, std::regex(r.pattern))) continue;
+            if (!std::regex_match(trimmed, r.re)) continue;
             if (req.method != r.method) continue;
             res.status = 307;
             res.set_header("Location", trimmed);
@@ -1033,10 +1150,12 @@ std::unique_ptr<httplib::Server> create_server(AppContext& ctx) {
     // 信封）原样返回（审查 M10）。
     svr->set_error_handler([](const httplib::Request&, httplib::Response& res) {
         // 已有 body（我们自己的错误信封）→ 原样返回。
-        // X-Page-Index 存在说明这是 handle_page 自己产出的响应：Range 越界时
-        // Python 返回的是**无 body、无 content-type** 的 416 + Content-Range
-        // （routes_read.py:306-310），补信封会让客户端/对拍看到多余字段。
-        if (!res.body.empty() || res.has_header("X-Page-Index"))
+        // X-Page-Index/Content-Range 存在说明这是 handle_page / handle_font_file
+        // 自己产出的 Range 响应：越界时 Python 返回的是**无 body、无 content-type**
+        // 的 416 + Content-Range（routes_read.py:306-310），补信封会让客户端/对拍
+        // 看到多余字段。
+        if (!res.body.empty() || res.has_header("X-Page-Index") ||
+            res.has_header("Content-Range"))
             return httplib::Server::HandlerResponse::Unhandled;
         ErrorCode code = ErrorCode::BadRequest;
         std::string msg = "请求参数缺失或非法";

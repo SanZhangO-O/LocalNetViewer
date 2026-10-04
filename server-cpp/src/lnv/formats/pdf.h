@@ -12,6 +12,8 @@ class PdfAdapter : public BookAdapter {
 public:
     // pdfium.dll 加载失败 → UnsupportedFormatError("缺少 PDF 后端","需放置 pdfium.dll")
     PdfAdapter(const AppConfig& cfg, const BookRef& ref);
+    // 释放 FPDF_DOCUMENT：适配器按请求创建，缺了析构每次请求都会泄漏整份文档
+    ~PdfAdapter() override;
 
     AdapterMeta meta() override;
     int page_count() override;
@@ -27,7 +29,8 @@ private:
     struct PtSize { double w = 1.0, h = 1.0; };
     PtSize page_pt(int page);                 // 页面 pt 尺寸（越界抛错）
     double clamp_scale(double w_pt, double h_pt, double scale);
-    ImageBytes render_page_jpeg(int page, double scale, int quality);
+    // 渲染已加载页面（调用方负责 LoadPage/关闭），RAII 管理位图
+    ImageBytes render_loaded_page(void* pg, double w_pt, double h_pt, double scale, int quality);
     std::string meta_text(const char* tag);   // FPDF_GetMetaText（UTF-16 → UTF-8）
 
     AppConfig cfg_;

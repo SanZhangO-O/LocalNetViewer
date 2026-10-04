@@ -8,6 +8,19 @@
 
 namespace lnv {
 
+namespace {
+// pydantic 端只有下界校验（Margin ge=0 / Viewport ge=1），Python int 无上界；
+// long long → int 的窄化在 >INT_MAX 时是实现定义行为（MSVC 回绕成负数，会让
+// avail_*、geometry_json/layout_id 变成垃圾值）。这里饱和到 INT_MAX，与
+// model.h::avail_* 的钳制策略一致（>INT_MAX 的几何值仍无法与 Python 逐位一致，
+// 属已知边界差异，但绝不再产生负值）。
+int saturating_int(long long v) {
+    if (v > std::numeric_limits<int>::max()) return std::numeric_limits<int>::max();
+    if (v < 0) return 0;
+    return static_cast<int>(v);
+}
+}  // namespace
+
 // ---------------------------------------------------------------- JSON 工具
 nlohmann::json py_num(double v, int ndigits) {
     double m = std::pow(10.0, ndigits);
@@ -99,20 +112,22 @@ LayoutProfile LayoutProfile::from_json(const nlohmann::json& j) {
     }
     LayoutProfile p;
     if (const nlohmann::json* vp = jv_object_required(v, j, "viewport", {"body", "viewport"})) {
-        p.viewport.w = static_cast<int>(
-            jv_int(v, *vp, "w", {"body", "viewport", "w"}, 0, int_ge(1), /*required=*/true));
-        p.viewport.h = static_cast<int>(
-            jv_int(v, *vp, "h", {"body", "viewport", "h"}, 0, int_ge(1), /*required=*/true));
+        p.viewport.w =
+            saturating_int(jv_int(v, *vp, "w", {"body", "viewport", "w"}, 0, int_ge(1),
+                                   /*required=*/true));
+        p.viewport.h =
+            saturating_int(jv_int(v, *vp, "h", {"body", "viewport", "h"}, 0, int_ge(1),
+                                   /*required=*/true));
     }
     if (const nlohmann::json* mg = jv_object(v, j, "margin", {"body", "margin"})) {
-        p.margin.left = static_cast<int>(
-            jv_int(v, *mg, "left", {"body", "margin", "left"}, 0, int_ge(0)));
-        p.margin.right = static_cast<int>(
-            jv_int(v, *mg, "right", {"body", "margin", "right"}, 0, int_ge(0)));
-        p.margin.top = static_cast<int>(
-            jv_int(v, *mg, "top", {"body", "margin", "top"}, 0, int_ge(0)));
-        p.margin.bottom = static_cast<int>(
-            jv_int(v, *mg, "bottom", {"body", "margin", "bottom"}, 0, int_ge(0)));
+        p.margin.left =
+            saturating_int(jv_int(v, *mg, "left", {"body", "margin", "left"}, 0, int_ge(0)));
+        p.margin.right =
+            saturating_int(jv_int(v, *mg, "right", {"body", "margin", "right"}, 0, int_ge(0)));
+        p.margin.top =
+            saturating_int(jv_int(v, *mg, "top", {"body", "margin", "top"}, 0, int_ge(0)));
+        p.margin.bottom =
+            saturating_int(jv_int(v, *mg, "bottom", {"body", "margin", "bottom"}, 0, int_ge(0)));
     }
     if (const nlohmann::json* fs = jv_object(v, j, "font", {"body", "font"})) {
         p.font.family = jv_str(v, *fs, "family", {"body", "font", "family"}, "auto");

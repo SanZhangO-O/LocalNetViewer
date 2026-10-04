@@ -33,6 +33,9 @@ std::string to_lower(std::string s) {
 }  // namespace
 
 std::vector<NetAddr> enumerate_addresses() {
+    // 仅枚举 IPv4（GetAdaptersAddresses(AF_INET, ...) + 下面的 AF_INET 过滤）；
+    // Python 参照版会同时输出 IPv6（netinfo.py:89），本移植不实现 IPv6，
+    // 因此 url_host 恒为点分四段、不需要方括号。
     std::vector<NetAddr> out;
     ULONG buf_len = 15 * 1024;
     std::vector<char> buf;

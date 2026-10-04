@@ -36,18 +36,23 @@ const LibraryRootCfg* AppConfig::root_by_name(const std::string& name) const {
 std::optional<std::string> AppConfig::encoding_override(const std::string& vpath) const {
     const auto& ov = library.encoding_overrides;
     if (ov.empty()) return std::nullopt;
-    if (auto it = ov.find(vpath); it != ov.end()) return it->second;
+    // 精确匹配：Python 的 dict 查找。键不重复（重复键在解析时已按 dict 语义合并），
+    // 所以线性查找与哈希查找结果一致。
+    auto find_key = [&ov](const std::string& key) -> const std::string* {
+        for (const auto& [k, enc] : ov)
+            if (k == key) return &enc;
+        return nullptr;
+    };
+    if (const std::string* enc = find_key(vpath)) return *enc;
     std::string name = vpath;
     size_t pos = name.rfind('/');
     if (pos != std::string::npos) name = name.substr(pos + 1);
-    if (auto it = ov.find(name); it != ov.end()) return it->second;
+    if (const std::string* enc = find_key(name)) return *enc;
+    // 后缀/文件名匹配按插入顺序（config.py:200-202 的 dict 遍历顺序）
     for (const auto& [key, enc] : ov) {
-        if (!key.empty()) {
-            if (vpath.size() >= key.size() &&
-                vpath.compare(vpath.size() - key.size(), key.size(), key) == 0)
-                return enc;
-            if (name == key) return enc;
-        }
+        if (!key.empty() && vpath.size() >= key.size() &&
+            vpath.compare(vpath.size() - key.size(), key.size(), key) == 0)
+            return enc;
     }
     return std::nullopt;
 }
@@ -117,11 +122,6 @@ std::string expand_env(const std::string& raw) {
     return out;
 }
 
-std::string as_string(const YAML::Node& n, const std::string& def = "") {
-    if (!n || n.IsNull()) return def;
-    return n.as<std::string>();
-}
-
 std::vector<std::string> string_list(const YAML::Node& n) {
     std::vector<std::string> out;
     if (n && n.IsSequence())
@@ -139,17 +139,34 @@ LibraryCfg parse_library(const YAML::Node& n) {
             c.include_ext.push_back(DEFAULT_INCLUDE_EXT[i]);
     }
     if (!n) return c;
-    if (n["roots"] && n["roots"].IsSequence()) {
+    if (n["roots"]) {
+        // Python：roots 是 List[LibraryRootCfg]，name/path 均为必填 str。此前缺字段
+        // 时静默补空串，`naem:` 之类拼写错误被吞掉，启动后只表现为"书库不见了"，
+        // 没有任何报错；这里按 config.py 的校验语义抛 ConfigError（与其它配置错误
+        // 同一条异常路径：run.py/ main 统一打印并 exit 2）。
+        if (n["roots"].IsNull() || !n["roots"].IsSequence())
+            throw ConfigError("配置校验失败: library.roots 必须是列表");
+        size_t idx = 0;
         for (const auto& r : n["roots"]) {
+            const std::string at = "library.roots[" + std::to_string(idx) + "]";
+            if (!r.IsMap())
+                throw ConfigError("配置校验失败: " + at + " 必须是映射（name/path）");
+            const YAML::Node name_node = r["name"];
+            const YAML::Node path_node = r["path"];
+            if (!name_node || name_node.IsNull())
+                throw ConfigError("配置校验失败: " + at + ".name 缺失或为 null");
+            if (!path_node || path_node.IsNull())
+                throw ConfigError("配置校验失败: " + at + ".path 缺失或为 null");
             LibraryRootCfg root;
-            root.name = as_string(r["name"]);
-            std::string p = as_string(r["path"]);
+            root.name = name_node.as<std::string>();
+            std::string p = path_node.as<std::string>();
             p = expand_env(p);
             // strip
             size_t b = p.find_first_not_of(" \t");
             size_t e = p.find_last_not_of(" \t");
             root.path = b == std::string::npos ? "" : p.substr(b, e - b + 1);
             c.roots.push_back(std::move(root));
+            idx++;
         }
     }
     if (n["include_ext"]) {
@@ -174,9 +191,17 @@ LibraryCfg parse_library(const YAML::Node& n) {
             throw ConfigError("library.sort 只支持 natural/name: " + sv);
         c.sort = sv;
     }
-    if (n["encoding_overrides"] && n["encoding_overrides"].IsMap())
-        for (const auto& kv : n["encoding_overrides"])
-            c.encoding_overrides[kv.first.as<std::string>()] = kv.second.as<std::string>();
+    if (n["encoding_overrides"] && n["encoding_overrides"].IsMap()) {
+        for (const auto& kv : n["encoding_overrides"]) {
+            const std::string key = kv.first.as<std::string>();
+            const std::string val = kv.second.as<std::string>();
+            // PyYAML + dict：重复键保留"最后值 + 首次出现的位置"
+            bool replaced = false;
+            for (auto& [k, v] : c.encoding_overrides)
+                if (k == key) { v = val; replaced = true; break; }
+            if (!replaced) c.encoding_overrides.emplace_back(key, val);
+        }
+    }
     return c;
 }
 
@@ -193,10 +218,22 @@ AppConfig load_config(const std::optional<std::string>& path) {
         // Path(__file__).parent.parent/"config.yaml"，与 cwd 无关）。
         // exe 在 server-cpp/build/ 下 → 上溯三级才是仓库根，上溯两级会得到
         // server-cpp/server/config.yaml（不存在）→ 静默以空书库启动。
+        // GetModuleFileNameA 按 ANSI 代码页编码：中文用户名/安装路径会被截断成 '?'
+        // 或乱码，默认配置根本找不到；改用宽字符 API + 动态扩容，直接得到原生
+        // wchar_t 的 fs::path（fs::path 在 Windows 上本就是宽路径，无需再转换）。
         fs::path exe = [] {
-            char buf[MAX_PATH];
-            GetModuleFileNameA(nullptr, buf, MAX_PATH);
-            return fs::path(buf);
+            std::wstring buf(MAX_PATH, L'\0');
+            for (;;) {
+                const DWORD n = GetModuleFileNameW(nullptr, buf.data(),
+                                                   static_cast<DWORD>(buf.size()));
+                if (n == 0) return fs::path();
+                // Vista+ 截断时返回 size 并置 ERROR_INSUFFICIENT_BUFFER → 翻倍重试
+                if (n < buf.size()) {
+                    buf.resize(n);
+                    return fs::path(buf);
+                }
+                buf.resize(buf.size() * 2);
+            }
         }();
         std::vector<fs::path> candidates = {
             exe.parent_path().parent_path().parent_path() / "server" / "config.yaml",

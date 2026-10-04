@@ -23,13 +23,20 @@ std::optional<std::string> detect_bomless_utf16(const std::string& bytes);
 std::string detect_encoding(const std::string& bytes);
 
 // 严格解码（失败返回 nullopt）。enc 见 FALLBACK_ENCODINGS 与 "utf-16-le/be"、
-// "utf-32"、"utf-8-sig"、"gb18030"、"big5"、"shift_jis"、"cp1252"、"ascii"。
+// "utf-32"、"utf-8-sig"、"gb18030"、"big5"、"shift_jis"、"cp949"、"euc_jp"、
+// "cp1252"、"ascii"。
 std::optional<U32Text> decode_strict(const std::string& bytes, const std::string& enc);
 
 // decode_text：encoding 提示 → 检测 → FALLBACK_ENCODINGS 逐级降级，最后 replace。
 DecodedText decode_text(const std::string& bytes, const std::optional<std::string>& encoding);
 
+// 编码名 → Windows 代码页（0 = 未知）。textutil 解码与 fb2 转码共用同一张表；
+// 返回值即 UINT（unsigned int），不在此公共头引入 windows.h。
+unsigned int codepage_of(const std::string& enc);
+
 // ---------------------------------------------------------------- 行处理
+// Python str.isspace 语义的空白判定（str.strip() 与正则 \s 共用，含 0x1C-0x1F）
+bool is_py_space(char32_t c);
 std::vector<U32Text> split_lines(const U32Text& text);
 U32Text normalize_spaces(const U32Text& text);
 

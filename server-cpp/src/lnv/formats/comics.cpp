@@ -3,7 +3,6 @@
 #include "lnv/util/imaging.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 
 namespace lnv {
@@ -40,16 +39,20 @@ static ImageBuf hstack_imgs(const std::vector<ImageBuf>& imgs) {
     return out;
 }
 
-// 裁剪纵向切片 [y0, y0+height)，对应 imaging.crop_slice
+// 裁剪纵向切片 [y0, y0+height)，对应 imaging.crop_slice：top 先夹到 h-1、
+// bottom 至少 top+1。probe 声明高度与实际解码高度不一致（截断图）时也保证
+// 非空切片，不会产出 0 高图片（Python crop_slice 同样夹取，审查 M8）。
 static ImageBuf crop_slice(const ImageBuf& src, long long y0, long long height) {
+    long long h = src.h;
+    long long top = std::max<long long>(0, std::min<long long>(y0, std::max<long long>(0, h - 1)));
+    long long bottom = std::min<long long>(h, top + std::max<long long>(1, height));
     ImageBuf out;
     out.w = src.w;
-    out.h = (int)std::min<long long>(height, src.h - y0 < 0 ? 0 : src.h - y0);
-    if (out.h < 0) out.h = 0;
+    out.h = (int)std::max<long long>(0, bottom - top);
     out.has_alpha = src.has_alpha;
     out.rgba.resize((size_t)out.w * out.h * 4);
     for (int y = 0; y < out.h; ++y) {
-        const auto* s = src.rgba.data() + ((size_t)(y0 + y) * src.w) * 4;
+        const auto* s = src.rgba.data() + ((size_t)(top + y) * src.w) * 4;
         auto* d = out.rgba.data() + (size_t)y * out.w * 4;
         std::memcpy(d, s, (size_t)out.w * 4);
     }
@@ -98,6 +101,9 @@ ComicAdapter::ComicAdapter(const AppConfig& cfg, const BookRef& ref)
         throw UnsupportedFormatError("不支持的漫画容器: " + (ext.empty() ? ref.name() : ext),
                                      "未知容器类型");
     }
+    // RAR/7z 按需单条目解压：声明尺寸可能不可信，把总量上限交给容器读取路径
+    // 累计校验（超过即杀子进程并抛错，审查 M3）
+    container_->set_total_limit(cfg.limits.max_archive_total_mb * 1024 * 1024);
     build_names();
 }
 
@@ -113,7 +119,7 @@ void ComicAdapter::build_names() {
     long long max_total = cfg_.limits.max_archive_total_mb * 1024 * 1024;  // 0 = 不限
     std::vector<std::string> out;
     for (const auto& e : entries) {
-        const std::string& name = e.name;  // 容器层已规范化（normpath + 去重）
+        const std::string& name = e.name;  // 容器层已规范化（normpath；ZIP 额外去重）
         if (should_skip_entry(name, cfg_.comic.skip_entries)) continue;
         if (!is_image_ext(ext_of(name))) continue;
         if (!single_.empty() && name != single_) continue;
@@ -121,11 +127,8 @@ void ComicAdapter::build_names() {
         out.push_back(name);
         total += (long long)e.size;
     }
-    if (max_total > 0 && total > max_total) {
-        char buf[128];
-        std::snprintf(buf, sizeof(buf), "压缩包解压总量超过上限（%.1fMB），已拒绝", total / 1048576.0);
-        throw ParseError(buf);
-    }
+    if (max_total > 0 && total > max_total)
+        throw ParseError(archive_total_limit_error(total));
     std::sort(out.begin(), out.end(), natural_key_less);  // 自然排序页序（§4.9）
     names_ = std::move(out);
 }
@@ -302,6 +305,9 @@ ImageBytes ComicAdapter::strip_slice_bytes(const StripPage& sp, int quality, int
     } catch (const ParseError&) {
         throw;
     }
+    // 解码结果为空图（畸形头）时直接按解码失败处理；否则 crop_slice 之后可能
+    // 拿到 0 高图片编出空体（200）。Python 侧这里走 ImageDecodeError → ParseError
+    if (img.w <= 0 || img.h <= 0) throw ParseError("长图解码失败: " + name);
     ImageBuf piece = crop_slice(img, sp.y0, sp.height);
     // PNG/GIF 源保持无损 PNG，其余 JPEG
     if (mime == "image/png" || mime == "image/gif") return {encode_png(piece), "image/png"};

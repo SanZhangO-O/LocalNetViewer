@@ -69,9 +69,17 @@ std::string pv_str(const Validator& v, const std::optional<std::string>& raw,
 // ---------------------------------------------------------- JSON body（对象字段）
 // 字段缺失：required → missing 错误；否则取 def。
 // nullable：字段为 null 时取 def 且不报错（对应 Optional[...]）。
+// 超出 long long 范围的 JSON 数值（无符号整数 ≥2^63 或整数值浮点）饱和到边界值
+// （绝不环绕/UB）。需要"Python 无界 int 原样回显"的字段用 jv_int_ex 拿原始数值。
 long long jv_int(const Validator& v, const nlohmann::json& obj, const char* key,
                  std::vector<std::string> loc, long long def, IntBound b, bool required = false,
                  bool nullable = false);
+// 与 jv_int 完全相同的校验路径，但成功时把原始 JSON 数值写入 raw_out（可空）：
+// number_unsigned 保留 uint64（2^63..2^64-1 不饱和）、number_integer 原样、
+// 布尔/字符串/整数值浮点归一为等值 JSON 整数。raw_out 仅在成功路径写入。
+long long jv_int_ex(const Validator& v, const nlohmann::json& obj, const char* key,
+                    std::vector<std::string> loc, long long def, IntBound b, bool required,
+                    bool nullable, nlohmann::json* raw_out);
 double jv_num(const Validator& v, const nlohmann::json& obj, const char* key,
               std::vector<std::string> loc, double def, NumBound b, bool required = false,
               bool nullable = false);

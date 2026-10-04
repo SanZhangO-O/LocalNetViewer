@@ -3,6 +3,7 @@
 #include "lnv/layout/engine.h"
 
 #include <cmath>
+#include <limits>
 
 #include "lnv/util/sha1.h"
 
@@ -123,6 +124,11 @@ struct TokenStream {
         return false;
     }
 };
+
+// LineBreaker 的占位文本：has_breaker=false 时不会被读。绝不能写
+// *(const U32Text*)nullptr 来构造空引用（即使不解引用也是 UB），
+// 用一个真实空串的引用即可。
+const U32Text kEmptyBreakerText;
 
 }  // namespace
 
@@ -355,7 +361,7 @@ struct FlowLayoutEngine::Impl {
         size_t pos = 0, total = 0;
         bool first_segment = true;
         bool has_breaker = false;
-        LineBreaker cur{nullptr, *(const U32Text*)nullptr, 0, 0, 0, 0, true};
+        LineBreaker cur{nullptr, kEmptyBreakerText, 0, 0, 0, 0, true};
 
         explicit BlockLineStream(Impl* e, const U32Text& t, size_t off, int sz, int ind)
             : E(e), text(&t), offset(off), size(sz), indent_chars(ind) {
@@ -432,15 +438,12 @@ struct FlowLayoutEngine::Impl {
         return {last_ch, last_block + 1, 0};
     }
 
-    // 单个条目能否放进当前页；不能则置断点锚
+    // 单个条目能否放进当前页；不能则置断点锚。
+    // Python engine.py:563 还有一条"height > avail_h 也换页"，但 used ≥ 0，
+    // used+height > avail_h 已将其完全覆盖（死分支，原样保留只会误导读者）。
     bool fits(double used, double height, bool page_has_items,
               const std::array<int, 3>& anchor, std::optional<std::array<int, 3>>& pending) {
         if (page_has_items && used + height > avail_h + EPS) {
-            pending = anchor;
-            return false;
-        }
-        if (height > avail_h + EPS && page_has_items) {
-            // 单个条目高于整页（防御）：此时也应换页，避免死循环
             pending = anchor;
             return false;
         }
@@ -569,7 +572,13 @@ std::optional<FlowLayoutEngine::PageResult> FlowLayoutEngine::layout_page(const 
                 it.italic = st.italic;
                 it.font_size = st.size;
                 it.line_text = txt;
-                it.char_offset = static_cast<int>(cs);
+                // 锚点 char 是 int：>2^31 的块内偏移理论上不会出现（约 86 亿字符），
+                // 但直接 static_cast 收窄在越界时是回绕/UB；钳到 INT_MAX 保证
+                // 锚点单调不减（配合 build() 的锚点前进防御）
+                it.char_offset =
+                    cs > static_cast<size_t>(std::numeric_limits<int>::max())
+                        ? std::numeric_limits<int>::max()
+                        : static_cast<int>(cs);
                 return it;
             };
             while (true) {

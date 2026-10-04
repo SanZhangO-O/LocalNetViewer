@@ -2,6 +2,7 @@
 #include "lnv/formats/fb2.h"
 
 #include <pugixml.hpp>
+#include <windows.h>  // MultiByteToWideChar：把声明编码（cp1251/koi8-r/gb2312…）转 UTF-8
 
 #include "lnv/util/imaging.h"
 #include "lnv/util/paths.h"
@@ -113,12 +114,85 @@ std::string base64_decode(const std::string& in) {
     return out;
 }
 
+// ---- XML 声明编码嗅探 -------------------------------------------------
+// pugixml 只认 UTF 家族（外加 latin1）：声明 windows-1251/koi8-r/gb2312 的 FB2
+// （俄文/中文常见）按 UTF-8 硬解会整本乱码，还会被 parsed 缓存固化。Python 的
+// lxml 按声明解码，这里先把字节转成 UTF-8 再交给 pugixml（对齐 fb2.py 的行为）。
+
+// 读 XML 声明里的 encoding 名（声明必须在文件开头；缺失返回空）
+std::string declared_xml_encoding(const std::string& bytes) {
+    size_t limit = std::min<size_t>(bytes.size(), 1024);
+    std::string_view head(bytes.data(), limit);
+    if (head.rfind("<?xml", 0) != 0) return "";
+    size_t decl_end = head.find("?>", 5);
+    if (decl_end == std::string_view::npos) return "";
+    size_t e = head.find("encoding", 5);
+    if (e == std::string_view::npos || e > decl_end) return "";
+    size_t i = e + 8;
+    while (i < decl_end && (head[i] == ' ' || head[i] == '\t')) ++i;
+    if (i >= decl_end || head[i] != '=') return "";
+    ++i;
+    while (i < decl_end && (head[i] == ' ' || head[i] == '\t')) ++i;
+    if (i >= decl_end || (head[i] != '"' && head[i] != '\'')) return "";
+    char q = head[i++];
+    size_t endq = head.find(q, i);
+    if (endq == std::string_view::npos || endq > decl_end) return "";
+    return std::string(head.substr(i, endq - i));
+}
+
+// 按 XML 声明把非 UTF 字节转 UTF-8；无需转换/无法识别返回 nullopt
+std::optional<std::string> transcode_xml_to_utf8(const std::string& bytes) {
+    if (bytes.size() < 4) return std::nullopt;
+    const unsigned char b0 = (unsigned char)bytes[0], b1 = (unsigned char)bytes[1];
+    // BOM（UTF-8/16/32）与无 BOM UTF-16/32 的零字节模式都由 pugixml 自己识别
+    if ((b0 == 0xEF && b1 == 0xBB) || (b0 == 0xFF && b1 == 0xFE) ||
+        (b0 == 0xFE && b1 == 0xFF) || (b0 == 0 && b1 == 0))
+        return std::nullopt;
+    std::string enc = declared_xml_encoding(bytes);
+    std::string low;
+    low.reserve(enc.size());
+    for (char c : enc) low.push_back(c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c);
+    // UTF 家族/ascii/latin1 保持原行为：不转换，交给 pugixml（共享表里
+    // ascii→20127、latin1→1252，直接走转码会改变这些声明的解码口径）
+    if (low.rfind("utf", 0) == 0 || low == "ascii" || low == "latin1" ||
+        low == "latin-1")
+        return std::nullopt;
+    unsigned cp = codepage_of(enc);
+    if (cp == 0 || bytes.size() > 0x7FFFFFFFull) return std::nullopt;  // 超 int 上限不转
+    // 只信 Windows NLS 实际支持的代码页；不认识的名字仍按 pugixml 原行为
+    static const unsigned kKnown[] = {437,   850,   852,   855,   857,   858,   860,   861,
+                                      862,   863,   864,   865,   866,   869,   874,   932,
+                                      936,   949,   950,   1250,  1251,  1252,  1253,  1254,
+                                      1255,  1256,  1257,  1258,  20866, 21866, 51932, 28591,
+                                      28592, 28593, 28594, 28595, 28596, 28597, 28598, 28599,
+                                      28603, 28604, 28605, 28606, 54936};
+    bool known = false;
+    for (unsigned k : kKnown)
+        if (k == cp) { known = true; break; }
+    if (!known) return std::nullopt;
+    int n = MultiByteToWideChar(cp, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (n <= 0) return std::nullopt;
+    std::wstring wide((size_t)n, L'\0');
+    if (MultiByteToWideChar(cp, 0, bytes.data(), (int)bytes.size(), wide.data(), n) != n)
+        return std::nullopt;
+    int m = WideCharToMultiByte(CP_UTF8, 0, wide.data(), n, nullptr, 0, nullptr, nullptr);
+    if (m <= 0) return std::nullopt;
+    std::string out((size_t)m, '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, wide.data(), n, out.data(), m, nullptr, nullptr) != m)
+        return std::nullopt;
+    return out;
+}
+
 }  // namespace
 
 Fb2Adapter::Fb2Adapter(const AppConfig& cfg, const BookRef& ref) : cfg_(cfg), ref_(ref) {
     format = "fb2";
     mode = "flow";
 }
+
+// doc_ 挂载前由 load() 内的 unique_ptr 托管，析构时必须 delete（审查 B1：原实现
+// 只在解析失败分支 delete，成功路径整棵 DOM 随适配器泄漏）
+Fb2Adapter::~Fb2Adapter() { delete static_cast<pugi::xml_document*>(doc_); }
 
 void Fb2Adapter::load() {
     if (loaded_) return;
@@ -133,18 +207,26 @@ void Fb2Adapter::load() {
         ss << in.rdbuf();
         xml_bytes_ = ss.str();
     }
-    auto* doc = new pugi::xml_document();
+    // 声明非 UTF 编码（windows-1251/koi8-r/gb2312 等）先转 UTF-8：pugixml 遇到
+    // 不认识的声明只会按 UTF-8 硬解，lxml 则按声明解码（Python 行为基准）
+    if (auto converted = transcode_xml_to_utf8(xml_bytes_))
+        xml_bytes_ = std::move(*converted);
+
+    // unique_ptr 承接解析：解析失败与后续任何提前 return/异常都不会泄漏 DOM
+    // （审查 B1：原实现只在解析失败分支 delete，成功路径整棵 DOM 泄漏）
+    auto doc = std::make_unique<pugi::xml_document>();
     // 禁 DTD/实体（防 XXE）
     pugi::xml_parse_result res = doc->load_buffer(
         xml_bytes_.data(), xml_bytes_.size(), pugi::parse_default);
     if (!res) {
-        delete doc;
         throw ParseError(std::string("FB2 XML 解析失败: ") + res.description());
     }
-    doc_ = doc;
 
-    // binary：id → (原始字节, content-type)
+    // binary：id → (原始字节, content-type)。先写局部，全部成功后再提交，
+    // load() 失败后重试不会留下半成品索引
     pugi::xml_node root = doc->document_element();
+    std::vector<std::pair<std::string, std::pair<std::string, std::string>>> binaries;
+    std::map<std::string, size_t> binary_index;
     std::vector<pugi::xml_node> bins;
     find_all_local(root, "binary", bins);
     for (const pugi::xml_node& b : bins) {
@@ -164,9 +246,12 @@ void Fb2Adapter::load() {
         size_t pe = payload.find_last_not_of(" \t\r\n");
         payload = payload.substr(ps, pe - ps + 1);
         std::string raw = base64_decode(payload);
-        binary_index_[bid] = binaries_.size();
-        binaries_.push_back({bid, {std::move(raw), std::move(ctype)}});
+        binary_index[bid] = binaries.size();
+        binaries.push_back({bid, {std::move(raw), std::move(ctype)}});
     }
+    binaries_ = std::move(binaries);
+    binary_index_ = std::move(binary_index);
+    doc_ = doc.release();
     loaded_ = true;
 }
 
@@ -279,9 +364,11 @@ std::optional<Block> image_block_of(Fb2Adapter& adapter, const pugi::xml_node& e
     return b;
 }
 
-// _section_blocks 的递归实现
-void section_blocks(const pugi::xml_node& section, int level, Fb2Adapter& adapter,
+// _section_blocks 的递归实现。depth 与 find_* 同一上限：十万层嵌套 section/
+// epigraph 会让递归走栈溢出（审查 B2），超限子树直接不再下钻（正常书深度 << 200）
+void section_blocks(const pugi::xml_node& section, int level, int depth, Fb2Adapter& adapter,
                     std::vector<Block>& blocks) {
+    if (depth > kMaxXmlDepth) return;
     static const char* const kTextTags[] = {"v", "text-author", "date", "td", "th"};
     static const char* const kRecurseTags[] = {"epigraph", "cite", "poem", "stanza",
                                                "annotation", "table", "tr"};
@@ -335,11 +422,11 @@ void section_blocks(const pugi::xml_node& section, int level, Fb2Adapter& adapte
             continue;
         }
         if (tag == "section") {
-            section_blocks(child, level + 1, adapter, blocks);  // 嵌套 section 递归 +1
+            section_blocks(child, level + 1, depth + 1, adapter, blocks);  // 嵌套 section +1
             continue;
         }
         if (in(kRecurseTags, 7, tag)) {
-            section_blocks(child, level, adapter, blocks);  // 同层递归
+            section_blocks(child, level, depth + 1, adapter, blocks);  // 同层递归
             continue;
         }
     }
@@ -420,7 +507,7 @@ DocumentModel Fb2Adapter::document() {
         std::string t = section_title(sections[i]);
         ch.title = utf8_to_u32(t.empty() ? "第 " + std::to_string(i + 1) + " 节" : t);
         std::vector<Block> blocks;
-        section_blocks(sections[i], 1, *this, blocks);
+        section_blocks(sections[i], 1, 0, *this, blocks);
         ch.blocks = std::move(blocks);
         total_chars += ch.total_chars();
         model.chapters.push_back(std::move(ch));
@@ -459,9 +546,10 @@ std::optional<ImageBytes> Fb2Adapter::cover(int width) {
     if (info) {
         pugi::xml_node coverpage = find_first_local(info, "coverpage");
         if (coverpage) {
-            // coverpage 后代里的 image 元素
-            std::function<void(const pugi::xml_node&)> walk =
-                [&](const pugi::xml_node& n) {
+            // coverpage 后代里的 image 元素（depth 上限同 find_*，防深嵌套栈溢出）
+            std::function<void(const pugi::xml_node&, int)> walk =
+                [&](const pugi::xml_node& n, int depth) {
+                    if (depth > kMaxXmlDepth) return;
                     for (pugi::xml_node c = n.first_child(); c && name.empty();
                          c = c.next_sibling()) {
                         if (local_name(c.name()) == "image") {
@@ -471,10 +559,10 @@ std::optional<ImageBytes> Fb2Adapter::cover(int width) {
                                 name = hb == std::string::npos ? "" : href.substr(hb);
                             }
                         }
-                        if (name.empty()) walk(c);
+                        if (name.empty()) walk(c, depth + 1);
                     }
                 };
-            walk(coverpage);
+            walk(coverpage, 0);
         }
     }
     // 退化：第一个 binary

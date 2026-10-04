@@ -2,6 +2,7 @@
 // 语义对齐 Python formats/pdf.py（pypdfium2 直渲、fixed、恒 JPEG）
 #include "lnv/formats/pdf.h"
 #include "lnv/util/imaging.h"
+#include "lnv/util/paths.h"
 
 #include <mutex>
 #include <cmath>
@@ -41,6 +42,7 @@ using Fn_Bitmap_GetBuffer = void* (*)(FPDF_BITMAP);
 using Fn_Bitmap_GetStride = int (*)(FPDF_BITMAP);
 using Fn_GetMetaText = FPDF_STRLEN (*)(FPDF_DOCUMENT, FPDF_BYTESTRING tag,
                                        void* buffer, FPDF_STRLEN buflen);
+using Fn_GetLastError = unsigned long (*)();
 
 struct PdfiumApi {
     bool ok = false;
@@ -60,6 +62,7 @@ struct PdfiumApi {
     Fn_Bitmap_GetBuffer Bitmap_GetBuffer = nullptr;
     Fn_Bitmap_GetStride Bitmap_GetStride = nullptr;
     Fn_GetMetaText GetMetaText = nullptr;
+    Fn_GetLastError GetLastError = nullptr;
 };
 
 template <typename T>
@@ -97,6 +100,7 @@ const PdfiumApi& pdfium_api() {
         a.Bitmap_GetBuffer = get_fn<Fn_Bitmap_GetBuffer>(m, "FPDFBitmap_GetBuffer");
         a.Bitmap_GetStride = get_fn<Fn_Bitmap_GetStride>(m, "FPDFBitmap_GetStride");
         a.GetMetaText = get_fn<Fn_GetMetaText>(m, "FPDF_GetMetaText");
+        a.GetLastError = get_fn<Fn_GetLastError>(m, "FPDF_GetLastError");
         a.ok = a.LoadDocument && a.CloseDocument && a.GetPageCount && a.LoadPage &&
                a.GetPageWidthF && a.GetPageHeightF && a.RenderPageBitmap &&
                a.Bitmap_Create && a.Bitmap_Destroy && a.Bitmap_FillRect &&
@@ -114,6 +118,31 @@ const PdfiumApi& pdfium_api() {
 void require_pdfium() {
     if (!pdfium_api().ok) throw_no_pdfium();
 }
+
+// FPDF_ERR_* → pypdfium2 的 ErrorToStr 文案（Python 侧 PdfiumError 消息逐字来源）
+std::string pdfium_error_str(unsigned long err) {
+    switch (err) {
+        case 0: return "Success";
+        case 2: return "File access error";
+        case 3: return "Data format error";
+        case 4: return "Incorrect password error";  // 口令 PDF 的区分点
+        case 5: return "Unsupported security scheme error";
+        case 6: return "Page not found or content error";
+        default: return "Unknown error";
+    }
+}
+
+// FPDF_PAGE / FPDF_BITMAP 的 RAII 守卫：encode_jpeg 抛出时也保证释放
+struct PageGuard {
+    const PdfiumApi& api;
+    FPDF_PAGE pg;
+    ~PageGuard() { if (pg && api.ClosePage) api.ClosePage(pg); }
+};
+struct BitmapGuard {
+    const PdfiumApi& api;
+    FPDF_BITMAP bmp;
+    ~BitmapGuard() { if (bmp && api.Bitmap_Destroy) api.Bitmap_Destroy(bmp); }
+};
 
 }  // namespace
 
@@ -152,9 +181,26 @@ PdfAdapter::PdfAdapter(const AppConfig& cfg, const BookRef& ref)
     max_pixels_ = cfg.render.max_page_pixels;
     require_pdfium();
     const auto& api = pdfium_api();
-    doc_ = api.LoadDocument(ref.path.string().c_str(), nullptr);
-    if (!doc_) throw ParseError("PDF 无法打开: " + ref.path.string());
-    page_count_ = api.GetPageCount(doc_);
+    // FPDF_LoadDocument 与 pypdfium2 一样要求 UTF-8 路径（path::string() 非 ACP 时给错编码）
+    std::string path_u8 = path_to_utf8(ref.path);
+    doc_ = api.LoadDocument(path_u8.c_str(), nullptr);
+    page_count_ = doc_ ? api.GetPageCount(doc_) : 0;
+    if (!doc_ || page_count_ < 1) {
+        // pypdfium2 的等义行为：加载失败/空文档 → PdfiumError("Failed to load document
+        // (PDFium: <原因>).")；口令 PDF 报 FPDF_ERR_PASSWORD(4) → "Incorrect password
+        // error"，Python 的 422 消息就是据此区分口令的
+        unsigned long err = api.GetLastError ? api.GetLastError() : 1;
+        if (doc_) { api.CloseDocument(doc_); doc_ = nullptr; }
+        throw ParseError("PDF 无法打开: Failed to load document (PDFium: " +
+                         pdfium_error_str(err) + ").");
+    }
+}
+
+PdfAdapter::~PdfAdapter() {
+    if (!doc_) return;
+    const auto& api = pdfium_api();
+    if (api.CloseDocument) api.CloseDocument(doc_);
+    doc_ = nullptr;
 }
 
 PdfAdapter::PtSize PdfAdapter::page_pt(int page) {
@@ -163,10 +209,10 @@ PdfAdapter::PtSize PdfAdapter::page_pt(int page) {
     const auto& api = pdfium_api();
     FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
     if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页无法读取");
+    PageGuard guard{api, pg};
     PtSize sz;
     sz.w = api.GetPageWidthF(pg);
     sz.h = api.GetPageHeightF(pg);
-    api.ClosePage(pg);
     if (sz.w <= 0) sz.w = 1.0;
     if (sz.h <= 0) sz.h = 1.0;
     return sz;
@@ -202,14 +248,14 @@ double PdfAdapter::clamp_scale(double w_pt, double h_pt, double scale) {
     return scale * std::sqrt((double)max_pixels_ / pixels);
 }
 
-ImageBytes PdfAdapter::render_page_jpeg(int page, double scale, int quality) {
+ImageBytes PdfAdapter::render_loaded_page(FPDF_PAGE pg, double w_pt, double h_pt,
+                                          double scale, int quality) {
     const auto& api = pdfium_api();
-    FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
-    if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页渲染失败");
-    int w = std::max(1, (int)std::lround(page_pt(page).w * scale));
-    int h = std::max(1, (int)std::lround(page_pt(page).h * scale));
+    int w = std::max(1, (int)std::lround(w_pt * scale));
+    int h = std::max(1, (int)std::lround(h_pt * scale));
     FPDF_BITMAP bmp = api.Bitmap_Create(w, h, 0);
-    if (!bmp) { api.ClosePage(pg); throw ParseError("PDF 渲染位图创建失败"); }
+    if (!bmp) throw ParseError("PDF 渲染位图创建失败");
+    BitmapGuard guard{api, bmp};  // encode_jpeg 抛出时也释放位图
     api.Bitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFF);  // 白底（PDFium 渲染自带底色，防御）
     api.RenderPageBitmap(bmp, pg, 0, 0, w, h, 0, 0);
     ImageBuf img;
@@ -232,22 +278,30 @@ ImageBytes PdfAdapter::render_page_jpeg(int page, double scale, int quality) {
         }
     }
     img.has_alpha = false;
-    api.Bitmap_Destroy(bmp);
-    api.ClosePage(pg);
     return {encode_jpeg(img, quality > 0 ? quality : 85), "image/jpeg"};
 }
 
 ImageBytes PdfAdapter::page_bytes(int page, const std::string& fit, int quality,
                                   int viewport_w, double render_scale) {
     require_pdfium();
-    PtSize pt = page_pt(page);
+    if (page < 1 || page > page_count_)
+        throw UnsupportedFormatError("页码越界: " + std::to_string(page));
+    const auto& api = pdfium_api();
+    FPDF_PAGE pg = api.LoadPage(doc_, page - 1);
+    if (!pg) throw ParseError("PDF 第 " + std::to_string(page) + " 页无法读取");
+    PageGuard guard{api, pg};
+    // 单次 LoadPage：原实现 page_pt + render 内各再 LoadPage 一次（共 3 次）
+    double w_pt = api.GetPageWidthF(pg);
+    double h_pt = api.GetPageHeightF(pg);
+    if (w_pt <= 0) w_pt = 1.0;
+    if (h_pt <= 0) h_pt = 1.0;
     double sc;
     if (fit == "original")
         sc = kRenderPtToPx * std::max(0.5, std::min(2.0, render_scale));
     else
-        sc = (std::max(1, viewport_w) * std::max(0.5, std::min(2.0, render_scale))) / pt.w;
-    sc = clamp_scale(pt.w, pt.h, std::max(0.05, sc));
-    return render_page_jpeg(page, sc, quality);
+        sc = (std::max(1, viewport_w) * std::max(0.5, std::min(2.0, render_scale))) / w_pt;
+    sc = clamp_scale(w_pt, h_pt, std::max(0.05, sc));
+    return render_loaded_page(pg, w_pt, h_pt, sc, quality);
 }
 
 std::optional<ImageBytes> PdfAdapter::cover(int width) {
@@ -265,14 +319,19 @@ ImageBytes PdfAdapter::pair_bytes(int page, int quality, int viewport_w,
     if (page + 1 > page_count_)
         return page_bytes(page, "viewport", quality, viewport_w, render_scale);  // 末页落单
     std::vector<ImageBuf> imgs;
+    const auto& api = pdfium_api();
     for (int p : {page, page + 1}) {
-        PtSize pt = page_pt(p);
+        FPDF_PAGE pg = api.LoadPage(doc_, p - 1);
+        if (!pg) throw ParseError("PDF 第 " + std::to_string(p) + " 页无法读取");
+        PageGuard guard{api, pg};
+        double w_pt = api.GetPageWidthF(pg);
+        double h_pt = api.GetPageHeightF(pg);
+        if (w_pt <= 0) w_pt = 1.0;
+        if (h_pt <= 0) h_pt = 1.0;
         // Python pair 不做 0.5..2 clamp，只做像素上限钳制
-        double sc = clamp_scale(pt.w, pt.h, (viewport_w * render_scale) / pt.w);
+        double sc = clamp_scale(w_pt, h_pt, (viewport_w * render_scale) / w_pt);
         sc = std::max(0.05, sc);
-        // render_page_jpeg 内部会重新 LoadPage 并编码；这里需要 ImageBuf 拼接，
-        // 借位图渲染后再解码成本高，因此直接走同一渲染路径再拼接
-        auto bytes = render_page_jpeg(p, sc, quality > 0 ? quality : 85);
+        auto bytes = render_loaded_page(pg, w_pt, h_pt, sc, quality > 0 ? quality : 85);
         ImageBuf im = decode_image(bytes.bytes, 0);
         imgs.push_back(std::move(im));
     }

@@ -6,7 +6,7 @@
 namespace lnv {
 
 struct NetAddr {
-    std::string url_host;  // IPv6 需带方括号
+    std::string url_host;  // 本移植仅枚举 AF_INET，恒为点分四段（不产生 IPv6 方括号形式）
     std::string label;
 };
 

@@ -10,17 +10,7 @@ constexpr size_t kSectionChars = 64 * 1024;          // 切节阈值（字符）
 constexpr size_t kNoChapterSplitThreshold = 512 * 1024;  // UTF-8 字节阈值
 
 // ---- U32 上的字符工具 -------------------------------------------------
-// Python str.strip() 语义的近似空白集（ASCII 空白 + 常见 Unicode 空白）
-inline bool is_py_space(char32_t c) {
-    switch (c) {
-        case U'\t': case U'\n': case U'\v': case U'\f': case U'\r': case U' ':
-        case 0x85: case 0xA0: case 0x1680:
-        case 0x2028: case 0x2029: case 0x202F: case 0x205F: case 0x3000:
-            return true;
-        default:
-            return c >= 0x2000 && c <= 0x200A;
-    }
-}
+// Python str.strip() 的空白判定统一用 textutil.h 的 is_py_space（单一实现，避免漂移）
 
 U32Text strip_u32(const U32Text& s) {
     size_t b = 0, e = s.size();
@@ -96,9 +86,17 @@ const DecodedText& TxtAdapter::load_text() {
     {
         std::ifstream in(ref_.path, std::ios::binary);
         if (!in) throw ParseError("文件无法读取: " + ref_.path.string());
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        data = ss.str();
+        // 一次 seek/tell/read 读入：原 `ss << in.rdbuf()` + `ss.str()` 会多拷
+        // 一份整书，解码峰值再叠 wstring/U32 时很容易达到数倍文件大小。
+        in.seekg(0, std::ios::end);
+        std::streamoff len = in.tellg();
+        if (len < 0) throw ParseError("文件无法读取: " + ref_.path.string());
+        in.seekg(0, std::ios::beg);
+        data.resize(size_t(len));
+        if (len > 0) {
+            in.read(data.data(), len);
+            if (size_t(in.gcount()) != size_t(len)) data.resize(size_t(in.gcount()));
+        }
     }
     // 编码：配置覆盖优先 → 检测链 → 逐级降级（textutil.h）
     text_ = decode_text(data, cfg_.encoding_override(ref_.vpath));
@@ -257,13 +255,13 @@ DocumentModel TxtAdapter::document() {
             Block hb;
             hb.type = BlockType::Heading;
             hb.level = 1;
-            hb.spans.push_back(Span{*title, SpanStyle::None});
+            hb.spans.push_back(Span{std::move(*title), SpanStyle::None});
             blocks.push_back(std::move(hb));
             continue;
         }
         Block pb;
         pb.type = BlockType::Paragraph;
-        pb.spans.push_back(Span{line, SpanStyle::None});
+        pb.spans.push_back(Span{std::move(line), SpanStyle::None});
         blocks.push_back(std::move(pb));
     }
     flush();

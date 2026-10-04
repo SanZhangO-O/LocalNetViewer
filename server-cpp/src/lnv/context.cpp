@@ -53,6 +53,9 @@ void AppContext::shutdown() {
         library->wait_idle(10.0);
         library->save_index();
     }
+    // 再等解析/分页 worker 收尾（最多 10s）：它们捕获了 FontManager/AppContext 资源，
+    // 销毁上下文时仍在跑会访问悬垂对象。超时的卡死任务放弃等待（无法强杀）。
+    wait_parse_tasks_idle(10.0);
     if (progress) progress->flush();
 }
 
@@ -72,9 +75,14 @@ std::optional<BookRef> AppContext::require_book(const std::string& book_id) cons
 }
 
 void AppContext::invalidate_book_caches(const std::string& book_id) {
+    // 与 Python context.invalidate_book_caches 对齐：布局（磁盘 + LayoutsService 内存层）、
+    // 解析（磁盘 + 热文档）、页面图与封面。只清磁盘不清 LayoutsService 的内存 LRU 时，
+    // 内容变更后 /layout 仍会命中旧 PageMap 直到进程重启。
+    layouts->invalidate_book(book_id);
     layouts_cache->invalidate_book(book_id);
     std::error_code ec;
-    std::filesystem::remove(cfg.parsed_cache_dir() / (book_id + ".1.json.gz"), ec);
+    std::filesystem::remove(
+        cfg.parsed_cache_dir() / (book_id + "." + kParsedCacheVersion + ".json.gz"), ec);
     auto contains = [&](const std::string& key) {
         return key.find(book_id) != std::string::npos;
     };

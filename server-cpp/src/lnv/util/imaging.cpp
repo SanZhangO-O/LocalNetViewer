@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #ifdef _WIN32
 // WIC：stb 不支持 WebP/TIFF/AVIF，而 Python(Pillow) 支持；用系统解码器兜底
@@ -331,7 +332,11 @@ bool com_ready() {
 
 // 用 Windows Imaging Component 解码（stb 不支持的 WebP/TIFF/AVIF 等）。
 // 失败返回 false（可能是系统没装对应解码器 → 调用方报"图片解码失败"）。
-bool wic_decode(const std::string& bytes, int* out_w, int* out_h,
+// max_source_pixels：AVIF 等 WIC-only 格式绕过了 probe_size/stbi_info 的头部预检，
+// 必须在分配像素缓冲前用帧元数据尺寸做同样的 2× 上限检查——几 KB 的 AVIF 可以
+// 声明 30000×30000，若等到 CopyPixels 才分配 ~3.6GB（bad_alloc → 500），
+// 就不是 Python/Pillow 的 DecompressionBomb → 422 语义了。
+bool wic_decode(const std::string& bytes, long long max_source_pixels, int* out_w, int* out_h,
                 std::vector<unsigned char>* out_rgba) {
     if (bytes.empty() || bytes.size() > 0xFFFFFFFFull) return false;
     if (!com_ready()) return false;
@@ -354,6 +359,11 @@ bool wic_decode(const std::string& bytes, int* out_w, int* out_h,
     if (FAILED(decoder->GetFrame(0, frame.put()))) return false;
     UINT w = 0, h = 0;
     if (FAILED(frame->GetSize(&w, &h)) || w == 0 || h == 0) return false;
+    // 与 stb/头部预检相同的 2×max_source_pixels 语义（检查在分配 out_rgba 之前）
+    if (max_source_pixels > 0 &&
+        static_cast<double>(w) * static_cast<double>(h) >
+            2.0 * static_cast<double>(max_source_pixels))
+        throw ImageTooLargeError();
     ComPtr<IWICFormatConverter> conv;
     if (FAILED(factory->CreateFormatConverter(conv.put()))) return false;
     if (FAILED(conv->Initialize(frame.get(), GUID_WICPixelFormat32bppRGBA,
@@ -381,9 +391,15 @@ ImageBuf decode_image(const std::string& bytes, long long max_source_pixels) {
     //
     // 探测失败时（TGA/PSD/PNM/HDR 等魔数表外的格式）必须再用 stb 的头部解析兜一层：
     // 只按魔数表判断会让这些格式完全绕过像素上限（审查 H7）。
+    //
+    // stb 的长度参数是 int：>2GB 的输入 static_cast<int> 会截断成负数，stb 可能
+    // 越界读。这种输入直接跳过 stb，Windows 上交给 WIC（长度参数是 DWORD，上限 4GB），
+    // 其余平台按解码失败处理。
+    const bool stb_ok =
+        bytes.size() <= static_cast<size_t>(std::numeric_limits<int>::max());
     if (max_source_pixels > 0) {
         auto [pw, ph] = probe_size(bytes);
-        if (!(pw > 0 && ph > 0)) {
+        if (!(pw > 0 && ph > 0) && stb_ok) {
             int iw = 0, ih = 0, ic = 0;
             if (stbi_info_from_memory(reinterpret_cast<const unsigned char*>(bytes.data()),
                                       int(bytes.size()), &iw, &ih, &ic)) {
@@ -395,8 +411,10 @@ ImageBuf decode_image(const std::string& bytes, long long max_source_pixels) {
             throw ImageTooLargeError();
     }
     int w = 0, h = 0, n = 0;
-    unsigned char* data = stbi_load_from_memory(
-        reinterpret_cast<const unsigned char*>(bytes.data()), int(bytes.size()), &w, &h, &n, 4);
+    unsigned char* data = nullptr;
+    if (stb_ok)
+        data = stbi_load_from_memory(reinterpret_cast<const unsigned char*>(bytes.data()),
+                                     int(bytes.size()), &w, &h, &n, 4);
     std::vector<unsigned char> rgba;
     if (data) {
         rgba.assign(data, data + size_t(w) * h * 4);
@@ -404,7 +422,7 @@ ImageBuf decode_image(const std::string& bytes, long long max_source_pixels) {
     } else {
 #ifdef _WIN32
         // stb 解不了 → 试系统解码器（WebP/TIFF/AVIF 等）
-        if (!wic_decode(bytes, &w, &h, &rgba)) throw ImageDecodeError();
+        if (!wic_decode(bytes, max_source_pixels, &w, &h, &rgba)) throw ImageDecodeError();
 #else
         throw ImageDecodeError();
 #endif
@@ -597,6 +615,9 @@ std::string encode_png(const ImageBuf& img) {
 }
 
 std::string encode_jpeg(const ImageBuf& img, int quality) {
+    // 与 encode_png 相同的守卫：w/h ≤0 时 to_rgb_buffer 的
+    // size_t(w)*h*3 会变成天文数字（负 int → size_t 回绕）→ bad_alloc
+    if (img.w <= 0 || img.h <= 0) return std::string();
     quality = std::clamp(quality, 1, 100);
     auto rgb = to_rgb_buffer(img);  // JPEG 无 alpha，透明合成到白底
     std::string out;

@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "lnv/formats/container.h"
+#include "lnv/formats/registry.h"
 #include "lnv/util/concurrency.h"
 #include "lnv/util/paths.h"
 #include "lnv/util/sha1.h"
@@ -40,6 +41,33 @@ std::filesystem::path resolve_vpath_local(const AppConfig& cfg, const std::strin
 // 码点级小写化（ASCII；非 ASCII 原样——搜索只对纯 ASCII 查询词做忽略大小写）
 char32_t lower_cp(char32_t c) {
     return (c >= U'A' && c <= U'Z') ? c + (U'a' - U'A') : c;
+}
+
+// Python str.isprintable() 的码点判定：Cc/Cf/Cs/Co/Zl/Zp 与除空格外所有 Zs
+// 均为不可打印。Cn（未分配码点）需要完整 Unicode 表，这里只覆盖非字符区，
+// 其余按可打印处理——device_id 是外部输入，差异面仅限于未分配码点。
+bool is_printable_cp(char32_t c) {
+    if (c == U' ') return true;                                  // 唯一的可打印 Zs
+    if (c < 0x20 || (c >= 0x7F && c <= 0x9F)) return false;      // Cc
+    if (c >= 0xD800 && c <= 0xDFFF) return false;                // Cs（代理区）
+    if ((c & 0xFFFEu) == 0xFFFEu) return false;                  // 各平面 FFFE/FFFF 非字符
+    if (c >= 0xFDD0 && c <= 0xFDEF) return false;                // 非字符
+    if (c >= 0xE000 && c <= 0xF8FF) return false;                // Co（BMP 私用区）
+    if (c >= 0xF0000 && c <= 0x10FFFD) return false;             // Co/Cn（15/16 平面私用区）
+    static const struct { char32_t lo, hi; } kNonPrintable[] = {
+        {0x00A0, 0x00A0}, {0x00AD, 0x00AD}, {0x0600, 0x0605}, {0x061C, 0x061C},
+        {0x06DD, 0x06DD}, {0x070F, 0x070F}, {0x0890, 0x0891}, {0x08E2, 0x08E2},
+        {0x1680, 0x1680}, {0x180E, 0x180E}, {0x2000, 0x200A}, {0x200B, 0x200F},
+        {0x2028, 0x2029}, {0x202A, 0x202E}, {0x202F, 0x202F}, {0x205F, 0x205F},
+        {0x2060, 0x2064}, {0x2066, 0x206F}, {0x3000, 0x3000}, {0xFEFF, 0xFEFF},
+        {0xFFF9, 0xFFFB}, {0x110BD, 0x110BD}, {0x110CD, 0x110CD},
+        {0x13430, 0x1343F}, {0x1BCA0, 0x1BCA3}, {0x1D173, 0x1D17A},
+        {0xE0001, 0xE0001}, {0xE0020, 0xE007F},
+    };
+    for (const auto& r : kNonPrintable) {
+        if (c >= r.lo && c <= r.hi) return false;
+    }
+    return true;
 }
 
 // u32 串内查找子串（返回首下标，找不到 npos）
@@ -98,19 +126,20 @@ void GalleryService::load_registry() {
 }
 
 void GalleryService::save_registry() {
+    // 快照与写盘必须在同一把锁内（Python gallery.py save_registry 在 RLock 内完成）：
+    // 分离时并发 register 的快照可能后于他人写盘落盘，把已注册的条目覆盖回旧状态，
+    // galleries.json 丢失注册（book_id 是哈希，无法反推路径）。
+    std::unique_lock lk(mu_);
     nlohmann::json data = nlohmann::json::object();
-    {
-        std::shared_lock lk(mu_);
-        for (auto& [book_id, e] : registry_) {
-            data[book_id] = {
-                {"path", e.path},
-                {"recursive", e.recursive},
-                {"title", e.title},
-                {"page_count", e.page_count},
-                {"created_at", e.created_at},
-                {"updated_at", e.updated_at},
-            };
-        }
+    for (auto& [book_id, e] : registry_) {
+        data[book_id] = {
+            {"path", e.path},
+            {"recursive", e.recursive},
+            {"title", e.title},
+            {"page_count", e.page_count},
+            {"created_at", e.created_at},
+            {"updated_at", e.updated_at},
+        };
     }
     // dump(1)：ensure_ascii=false + indent=1，与 Python save_registry 一致
     atomic_write(cfg_.gallery_registry_path(), data.dump(1));
@@ -247,9 +276,19 @@ std::vector<std::filesystem::path> GalleryService::list_images(
              it.increment(ec)) {
             if (ec) { ec.clear(); continue; }
             std::error_code ec2;
-            if (it->is_symlink(ec2) || ec2) { ec2.clear(); continue; }
-            if (!it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
-            std::string name = u8_name(it->path());
+            const std::string name = u8_name(it->path());
+            if (it->is_directory(ec2) && !ec2) {
+                // junction 只可能出现在目录（MSVC 的 is_symlink 不识别它），漏判会在
+                // 递归目录里成环（library 扫描同款防护）
+                // Python os.walk 会把隐藏目录与符号链接目录从 dirnames 里剪掉：
+                // 不剪枝会整棵遍历 .git 等目录（即使文件最终被过滤，符号链接目录
+                // 的遍历语义也与 Python 不同）
+                if (it->is_symlink(ec2) || is_symlink_or_junction(it->path()) ||
+                    is_hidden_name(name))
+                    it.disable_recursion_pending();
+                continue;
+            }
+            if (it->is_symlink(ec2) || !it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
             if (is_hidden_name(name)) continue;
             // rel 路径（UTF-8，'/' 分隔）
             std::string rel = it->path().lexically_relative(dir).generic_string();
@@ -328,9 +367,18 @@ static std::vector<nlohmann::json> chapters_json(const PageMap& pm,
 }
 
 // 进程级解析闸门（一个进程只有一个 AppContext，等价于 Python 的模块级 _TimedRunner）
+// 所有超时任务（解析、分页）共用同一个 8 槽上限。
+// 故意不析构：超时任务可能在 main 返回后仍在跑，静态析构会让 worker 的
+// guard.release() 访问已销毁的 mutex；进程退出时由 OS 回收（Python 的 _RUNNER
+// 同样是模块级对象、活到解释器结束）。
 static ParseGate& parse_gate() {
-    static ParseGate gate;
-    return gate;
+    static ParseGate* gate = new ParseGate();
+    return *gate;
+}
+
+void wait_parse_tasks_idle(double timeout_s) {
+    parse_gate().wait_idle(std::chrono::milliseconds(
+        static_cast<long long>(std::max(0.0, timeout_s) * 1000.0)));
 }
 
 // LayoutBuildResult 组装（对应 Python LayoutService._result）
@@ -357,29 +405,34 @@ LayoutBuildResult LayoutsService::build(const BookRef& ref, BookAdapter& adapter
         if (cached) {
             return make_result(cached->pagemap, layout_id, nullptr, true);
         }
-        // 并发闸门（对应 Python layouts.py:128-142 的 run_with_timeout + _TimedRunner）：
-        // 同一个 (book, layout) 的重复请求 → 503 SERVER_BUSY（去重，不重复跑重活）；
-        // 同时在跑的解析任务达上限 → 503。没有闸门时，12 个线程可以同时为同一本书
-        // 做全量解析与分页，把整台机器拖死。
-        // 顺序很重要：**先** try_acquire 拿到槽位，**再**武装 RAII Guard。
-        // Guard 析构会无条件 release()（concurrency.h），若先武装再 acquire，
-        // 被 503 拒绝的请求会顺手删掉正在跑任务的去重键、并释放一个自己没占的槽位
-        // ——去重与"并发上限 8"会同时失效（审查 H1）。
-        const std::string gate_key = "layout:" + ref.book_id + ":" + layout_id;
-        parse_gate().try_acquire(gate_key);   // 失败抛 ServerBusyError，此时 Guard 尚未武装
-        ParseGate::Guard gate_guard(parse_gate(), gate_key);
-        // 等闸门期间别的线程可能已经算完 → 再查一次缓存
+        // 同一 (book, layout) 的首次分页串行化（Python LayoutService._locks 的 KeyedLocks）：
+        // 后到者**阻塞等待**前者的结果，再查缓存返回 cache_hit=true。直接 503 是
+        // Python 没有的可观测失败；等锁期间不占闸门槽位，槽位留给真正在跑的重活。
+        auto layout_lock = layout_locks_.acquire("layout:" + ref.book_id + ":" + layout_id);
         if (auto again = entry(ref.book_id, layout_id)) {
             return make_result(again->pagemap, layout_id, nullptr, true);
         }
-        DocumentModel doc = document(ref, adapter);
-        FlowLayoutEngine::Deps d;
-        d.doc = &doc;
-        d.fonts = &fonts_;
-        d.profile = &prof;
-        d.font_id = font_id;
-        FlowLayoutEngine engine(d);
-        PageMap pm = engine.build();  // 页数超限内部抛 ParseError
+        const double parse_timeout = cfg_.limits.parse_timeout_s;
+        std::shared_ptr<const DocumentModel> doc =
+            std::make_shared<DocumentModel>(document_internal(ref, "解析分页"));
+        // 分页同样受超时保护（Python：run_with_timeout(lambda: engine.build(...),
+        // key=("layout", …))）。worker 持有 DocumentModel 的 shared_ptr 与
+        // profile/font_id 副本：调用方超时返回后它们仍然有效；超时的分页继续在后台跑，
+        // 槽位等它真正结束才释放（不强杀线程）。
+        LayoutProfile prof_copy = prof;
+        std::string fid = font_id;
+        PageMap pm = run_with_timeout(
+            parse_gate(),
+            [doc, prof_copy, fid, fonts = &fonts_]() {
+                FlowLayoutEngine::Deps d;
+                d.doc = doc.get();
+                d.fonts = fonts;
+                d.profile = &prof_copy;
+                d.font_id = fid;
+                FlowLayoutEngine engine(d);
+                return engine.build();  // 页数超限内部抛 ParseError
+            },
+            parse_timeout, "分页", "layout:" + ref.book_id + ":" + layout_id);
         pm.layout_id = layout_id;
         // created_at 保持 0.0：Python engine.py:647 构造 PageMap 时恒写 0.0，
         // 这里写真实时间戳会让共享 layouts/*.json.gz 出现无意义差异（审查 L16）
@@ -391,7 +444,7 @@ LayoutBuildResult LayoutsService::build(const BookRef& ref, BookAdapter& adapter
             std::lock_guard<std::shared_mutex> lk(mu_);
             memory_.put(ref.book_id + ":" + layout_id, e);
         }
-        return make_result(e.pagemap, layout_id, &doc, false);
+        return make_result(e.pagemap, layout_id, doc.get(), false);
     }
 
     // 固定版式 / 条漫：页集合每次实时枚举（不缓存页内容）
@@ -460,11 +513,29 @@ std::optional<LayoutEntry> LayoutsService::entry(const std::string& book_id,
     auto e = disk_.get(book_id, layout_id);
     if (!e) return std::nullopt;
     std::lock_guard<std::shared_mutex> lk(mu_);
-    memory_.put(key, *e);  // 并发加载同一 layout 时以先写入内存的为准（语义可接受）
+    // 与 Python LayoutStore.get 一致：并发从磁盘加载同一 layout 时保留**先写入内存**的
+    // 权威副本；put_if_absent 同时把命中的条目移到最新（LRU 语义不变）
+    if (auto existing = memory_.put_if_absent(key, *e)) return existing;
     return e;
 }
 
 DocumentModel LayoutsService::document(const BookRef& ref, BookAdapter& adapter) {
+    // Python 的 document() 用调用方传入的 adapter；C++ 的实际解析由超时 worker 执行，
+    // 而分离的 worker 无法安全使用调用方栈上、超时返回即析构的 adapter（悬垂指针），
+    // 因此 worker 自行打开等价 adapter（同一 cfg+ref，结果一致）。参数保留以兼容签名。
+    (void)adapter;
+    return document_internal(ref, "解析");
+}
+
+DocumentModel LayoutsService::document_internal(const BookRef& ref, const std::string& what) {
+    {
+        std::lock_guard<std::shared_mutex> lk(mu_);
+        auto hit = doc_memory_.get(ref.book_id);
+        if (hit) return *hit;
+    }
+    // 同一本书的解析串行化（Python ParsedCache._locks）：后到者阻塞等待前者写入
+    // 内存/磁盘，冷书不会被 N 个请求同时全量解析。等锁期间不占闸门槽位。
+    auto parse_lock = parse_locks_.acquire("parse:" + ref.book_id);
     {
         std::lock_guard<std::shared_mutex> lk(mu_);
         auto hit = doc_memory_.get(ref.book_id);
@@ -472,12 +543,34 @@ DocumentModel LayoutsService::document(const BookRef& ref, BookAdapter& adapter)
     }
     auto doc = parsed_.get(ref.book_id);  // 磁盘解析缓存（损坏自动删除）
     if (!doc) {
-        doc = adapter.document();  // 实际解析（超时保护由调用方/上层负责）
+        // 解析放进超时 runner（Python run_with_timeout，key=("parse", book_id)）：
+        // 超时 → 422 PARSE_FAILED + reason=timeout；任务继续在后台跑，槽位等它结束才
+        // 释放。worker 自持 cfg/ref 副本并自行打开 adapter，超时返回后不会悬垂。
+        AppConfig cfg_copy = cfg_;
+        BookRef ref_copy = ref;
+        doc = run_with_timeout(
+            parse_gate(),
+            [cfg = std::move(cfg_copy), bref = std::move(ref_copy)]() {
+                auto own = create_adapter(cfg, bref);
+                return own->document();
+            },
+            cfg_.limits.parse_timeout_s, what, "parse:" + ref.book_id);
         parsed_.put(*doc);
     }
-    std::lock_guard<std::shared_mutex> lk(mu_);
-    doc_memory_.put(ref.book_id, *doc);
+    {
+        std::lock_guard<std::shared_mutex> lk(mu_);
+        doc_memory_.put(ref.book_id, *doc);
+    }
     return *doc;
+}
+
+void LayoutsService::invalidate_book(const std::string& book_id) {
+    // Python context.invalidate_book_caches 会清 LayoutStore 的内存 PageMap 与
+    // ParsedCache 的热文档：少了这一步，内容变更后旧分页会一直服务到进程重启。
+    std::string prefix = book_id + ":";
+    std::lock_guard<std::shared_mutex> lk(mu_);
+    memory_.remove_if([&](const std::string& key) { return key.rfind(prefix, 0) == 0; });
+    doc_memory_.remove_if([&](const std::string& key) { return key == book_id; });
 }
 
 std::optional<int> LayoutsService::page_of_anchor(const PageMap& pm, const int target[3]) {
@@ -506,17 +599,35 @@ std::optional<int> LayoutsService::page_of_anchor(const PageMap& pm, const int t
 
 // ================================================================== ProgressService
 
+namespace {
+// json 数值 → ordered_json：nlohmann 不提供跨 object_t 类型的隐式转换，
+// 外层必须用 ordered_json 保持 Python 的字段序。
+nlohmann::ordered_json num_to_ordered(const nlohmann::json& v) {
+    if (v.is_number_unsigned()) return nlohmann::ordered_json(v.get<unsigned long long>());
+    if (v.is_number_integer()) return nlohmann::ordered_json(v.get<long long>());
+    if (v.is_number_float()) return nlohmann::ordered_json(v.get<double>());
+    return nlohmann::ordered_json(nullptr);
+}
+}  // namespace
+
 // record → 落盘/外发 JSON（updated_at 为 ISO 字符串；updated_at_ts 仅落盘不外发）
-nlohmann::json ProgressService::Record::to_public_json() const {
-    // device_id / page / ratio 可空；updated_at 为 ISO 字符串（updated_at_ts 不外发）
-    nlohmann::json jdev = device_id ? nlohmann::json(*device_id) : nlohmann::json(nullptr);
-    nlohmann::json jpage = page ? nlohmann::json(*page) : nlohmann::json(nullptr);
-    nlohmann::json jratio = ratio ? nlohmann::json(*ratio) : nlohmann::json(nullptr);
+nlohmann::ordered_json ProgressService::Record::to_public_json() const {
+    // device_id / page / ratio 可空；updated_at 为 ISO 字符串（updated_at_ts 不外发）。
+    // ordered_json：字段序与 Python put() 构造 dict 的顺序一致（book_id, device_id,
+    // anchor, page, ratio, updated_at），普通 json 会按键名排序导致落盘字节不同。
+    nlohmann::ordered_json jdev =
+        device_id ? nlohmann::ordered_json(*device_id) : nlohmann::ordered_json(nullptr);
+    nlohmann::ordered_json jpage =
+        page ? num_to_ordered(*page) : nlohmann::ordered_json(nullptr);
+    nlohmann::ordered_json jratio =
+        ratio ? nlohmann::ordered_json(*ratio) : nlohmann::ordered_json(nullptr);
     return {
         {"book_id", book_id},
         {"device_id", jdev},
         {"anchor",
-         {{"chapter", anchor[0]}, {"block", anchor[1]}, {"char", anchor[2]}}},
+         {{"chapter", num_to_ordered(anchor[0])},
+          {"block", num_to_ordered(anchor[1])},
+          {"char", num_to_ordered(anchor[2])}}},
         {"page", jpage},
         {"ratio", jratio},
         {"updated_at", iso_time_utc(updated_at_ts)},
@@ -524,15 +635,17 @@ nlohmann::json ProgressService::Record::to_public_json() const {
 }
 
 std::string ProgressService::normalize_device(const std::string& device) {
-    // strip → 空 → "default" → 剔除不可打印(iscntrl)与 :"\/ → 截断 64 字符
+    // strip → 空 → "default" → 剔除 Unicode 不可打印字符与 :"\/ → 截断 64 字符。
+    // 只按 ASCII 空白 strip 与 Python str.strip() 等价：会被 Python strip 掉的
+    // 空白/控制码点都是不可打印字符，随后也会被打印性过滤删除，最终串一致。
     size_t b = device.find_first_not_of(" \t\r\n\f\v");
     if (b == std::string::npos) return "default";
     size_t e = device.find_last_not_of(" \t\r\n\f\v");
     U32Text cps = utf8_to_u32(device.substr(b, e - b + 1));
     U32Text cleaned;
     for (char32_t c : cps) {
-        bool cntrl = c < 0x20 || c == 0x7F;
-        if (cntrl || c == U':' || c == U'"' || c == U'/' || c == U'\\') continue;
+        if (!is_printable_cp(c) || c == U':' || c == U'"' || c == U'/' || c == U'\\')
+            continue;
         cleaned.push_back(c);
     }
     if (cleaned.size() > 64) cleaned.resize(64);
@@ -543,15 +656,16 @@ std::string ProgressService::normalize_device(const std::string& device) {
 void ProgressService::load() {
     std::string raw;
     if (!read_all(file_, raw)) return;
-    nlohmann::json data;
+    nlohmann::ordered_json data;  // 保留文件内的键序（Python dict 顺序）
     try {
-        data = nlohmann::json::parse(raw);
+        data = nlohmann::ordered_json::parse(raw);
     } catch (...) {
         return;
     }
     if (!data.is_object()) return;
     std::unique_lock lk(mu_);
     records_.clear();
+    order_seq_ = 0;
     for (auto& [key, val] : data.items()) {
         if (!val.is_object()) continue;
         Record r;
@@ -559,37 +673,93 @@ void ProgressService::load() {
         if (val.contains("device_id") && val["device_id"].is_string())
             r.device_id = val["device_id"].get<std::string>();
         if (val.contains("anchor") && val["anchor"].is_object()) {
-            r.anchor[0] = val["anchor"].value("chapter", 0LL);
-            r.anchor[1] = val["anchor"].value("block", 0LL);
-            r.anchor[2] = val["anchor"].value("char", 0LL);
+            // 原样保留整数数值（含 2^63..2^64-1）；浮点按 Python int() 的截断语义归一。
+            // 注意 val 是 ordered_json，跨类型赋值要显式取数值。
+            static constexpr const char* kNames[3] = {"chapter", "block", "char"};
+            const auto& a = val["anchor"];
+            for (int i = 0; i < 3; ++i) {
+                if (!a.contains(kNames[i])) continue;
+                const auto& n = a[kNames[i]];
+                if (n.is_number_unsigned())
+                    r.anchor[i] = n.get<unsigned long long>();
+                else if (n.is_number_integer())
+                    r.anchor[i] = n.get<long long>();
+                else if (n.is_number_float())
+                    r.anchor[i] = static_cast<long long>(n.get<double>());
+            }
         }
-        if (val.contains("page") && val["page"].is_number()) r.page = val["page"].get<long long>();
+        if (val.contains("page") && val["page"].is_number()) {
+            const auto& n = val["page"];
+            if (n.is_number_unsigned())
+                r.page = n.get<unsigned long long>();
+            else if (n.is_number_integer())
+                r.page = n.get<long long>();
+            else
+                r.page = static_cast<long long>(n.get<double>());
+        }
         if (val.contains("ratio") && val["ratio"].is_number())
             r.ratio = val["ratio"].get<double>();
         r.updated_at_ts = val.value("updated_at_ts", 0.0);
+        r.order = ++order_seq_;
         records_[key] = std::move(r);
     }
 }
 
 void ProgressService::flush() {
-    std::lock_guard<std::mutex> fg(flush_mu_);  // 串行化：并发落盘会互相覆盖
-    flush_locked();
-}
-
-// 调用方必须持有 flush_mu_（节流判定与落盘在同一把锁下，last_flush_ 不再是竞态）
-void ProgressService::flush_locked() {
-    // 整文件重写（节流由 put 控制；关停时调用 flush 强制落盘）
-    nlohmann::json data = nlohmann::json::object();
     {
         std::shared_lock lk(mu_);
-        for (auto& [key, r] : records_) {
-            nlohmann::json j = r.to_public_json();
-            j["updated_at_ts"] = r.updated_at_ts;  // 内部字段，不外发但落盘
-            data[key] = j;
+        if (!dirty_) return;  // 没有未落盘改动就不写（Python flush 的 dirty 检查）
+    }
+    std::lock_guard<std::mutex> fg(flush_mu_);  // 串行化：并发落盘会互相覆盖
+    save_locked(/*force=*/true);
+}
+
+// 调用方必须持有 flush_mu_。节流判定、快照与写盘完成后的 dirty 处理都在锁下，
+// last_flush_/dirty_/generation_ 不会成为竞态（审查 M6）。
+bool ProgressService::save_locked(bool force) {
+    double now = now_epoch();
+    uint64_t gen = 0;
+    std::string payload;
+    {
+        std::unique_lock lk(mu_);
+        if (!force && now - last_flush_ < 1.0) {
+            dirty_ = true;  // 有改动但还在合并窗口内，等下次 put / 关停 flush
+            return false;
+        }
+        payload = dump_locked();
+        last_flush_ = now;
+        generation_++;
+        gen = generation_;
+    }
+    bool ok = atomic_write(file_, payload);
+    {
+        std::unique_lock lk(mu_);
+        if (ok) {
+            // 写盘期间没有新写入（代数未变）才清 dirty：否则那段新数据还没落盘，
+            // 清掉会让关停 flush 直接跳过（Python save 的 generation 语义）
+            if (generation_ == gen) dirty_ = false;
+        } else {
+            dirty_ = true;  // 落盘失败保留 dirty，下次重试
         }
     }
-    atomic_write(file_, data.dump());  // 紧凑 dump
-    last_flush_ = now_epoch();
+    return ok;
+}
+
+// 调用方必须持有 mu_。按插入序落盘并用 indent=1：
+// 与 Python json.dumps(self._data, ensure_ascii=False, indent=1) 逐字节一致。
+std::string ProgressService::dump_locked() const {
+    std::vector<const std::pair<const std::string, Record>*> ordered;
+    ordered.reserve(records_.size());
+    for (auto& kv : records_) ordered.push_back(&kv);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto* a, const auto* b) { return a->second.order < b->second.order; });
+    nlohmann::ordered_json data = nlohmann::ordered_json::object();
+    for (const auto* kv : ordered) {
+        nlohmann::ordered_json j = kv->second.to_public_json();
+        j["updated_at_ts"] = kv->second.updated_at_ts;  // 内部字段，不外发但落盘
+        data[kv->first] = std::move(j);
+    }
+    return data.dump(1);
 }
 
 std::optional<ProgressService::Record> ProgressService::get(const std::string& book_id,
@@ -617,8 +787,8 @@ std::optional<ProgressService::Record> ProgressService::get_any(
 
 ProgressService::Record ProgressService::put(const std::string& book_id,
                                              const std::optional<std::string>& device,
-                                             const long long anchor[3],
-                                             std::optional<long long> page,
+                                             const nlohmann::json anchor[3],
+                                             std::optional<nlohmann::json> page,
                                              std::optional<double> ratio) {
     Record r;
     r.book_id = book_id;
@@ -633,7 +803,11 @@ ProgressService::Record ProgressService::put(const std::string& book_id,
 
     {
         std::unique_lock lk(mu_);
-        records_[book_id + ":" + dev] = r;
+        std::string key = book_id + ":" + dev;
+        auto it = records_.find(key);
+        // Python dict 语义：覆盖已有 key 不改变插入位置，新 key 追加到末尾
+        r.order = it != records_.end() ? it->second.order : ++order_seq_;
+        records_[key] = r;
         // 上限 5000 条：按 updated_at_ts 淘汰最旧
         if (records_.size() > 5000) {
             std::vector<std::pair<double, const std::string*>> ordered;
@@ -644,15 +818,14 @@ ProgressService::Record ProgressService::put(const std::string& book_id,
             size_t overflow = records_.size() - 5000;
             for (size_t i = 0; i < overflow; i++) records_.erase(*ordered[i].second);
         }
+        dirty_ = true;
+        generation_++;  // 与 save 的快照代数配对：写盘期间的更新不能被误清 dirty
     }
-    // 写入节流 ≥1s：间隔内仅保留内存态，由下次 put / 关停 flush 落盘。
-    // 判定与落盘都在 flush_mu_ 下完成（否则两个线程可能各自判定"该落盘"，
-    // 旧快照后写覆盖新记录，审查 M6）。
-    double now = now_epoch();
-    {
-        std::lock_guard<std::mutex> fg(flush_mu_);
-        if (now - last_flush_ >= 1.0) flush_locked();
-    }
+    // 落盘必须持 flush_mu_（save_locked 契约；锁序 flush_mu_ → mu_，与 flush() 一致）：
+    // 否则并发 put 可能旧快照后落盘覆盖新记录
+    std::lock_guard<std::mutex> fg(flush_mu_);
+    // 写入节流 ≥1s：间隔内仅保留内存态，由下次 put / 关停 flush 落盘
+    save_locked(/*force=*/false);
     return r;
 }
 

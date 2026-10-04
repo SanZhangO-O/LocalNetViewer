@@ -27,7 +27,7 @@ struct AppContext {
     ObjectLru<DocumentModel> doc_memory{3};
 
     // 并发解析闸门（concurrency.py 语义）：上限 8、同任务去重 → SERVER_BUSY
-    struct ParseGate* gate = nullptr;
+    class ParseGate* gate = nullptr;
 
     // ---- 生命周期 ----
     static std::unique_ptr<AppContext> create(AppConfig config, bool background_scan);

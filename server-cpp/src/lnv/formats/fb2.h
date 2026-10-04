@@ -11,6 +11,7 @@ namespace lnv {
 class Fb2Adapter : public BookAdapter {
 public:
     Fb2Adapter(const AppConfig& cfg, const BookRef& ref);
+    ~Fb2Adapter() override;
 
     AdapterMeta meta() override;
     DocumentModel document() override;
@@ -29,7 +30,7 @@ private:
     // binary id → (原始字节, content-type)
     std::vector<std::pair<std::string, std::pair<std::string, std::string>>> binaries_;
     std::map<std::string, size_t> binary_index_;  // id → binaries_ 下标
-    // XML 解析结果（pugixml 文档指针，避免在头里引 pugixml）
+    // XML 解析结果（pugixml 文档指针，析构时 delete；避免在头里引 pugixml）
     void* doc_ = nullptr;
     std::string xml_bytes_;  // load_buffer 不拷贝，文档字节须与 document 同生命周期
 };

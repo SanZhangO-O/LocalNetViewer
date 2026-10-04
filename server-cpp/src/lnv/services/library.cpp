@@ -10,13 +10,11 @@
 #include "lnv/util/sha1.h"
 
 namespace lnv {
-namespace { std::string u8_name(const std::filesystem::path& p) {
-    auto w = p.filename().wstring();
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
-    return s;
-} }
+namespace {
+// 宽 → UTF-8 统一走 paths.h 共享实现（不抛异常；path.string() 可能抛异常）
+std::string u8_name(const std::filesystem::path& p) { return path_to_utf8(p.filename()); }
+std::string u8_path(const std::filesystem::path& p) { return path_to_utf8(p); }
+}  // namespace
 
 
 namespace {
@@ -37,12 +35,12 @@ double path_mtime(const std::filesystem::path& p) {
     return file_time_to_epoch(t);
 }
 
-// 自然排序 helper：按数字段拆分，文本段 casefold、数字段数值比较
+// 自然排序 helper：按数字段拆分，文本段 casefold、数字段按十进制数值比较
 // （对应 Python util/natural.py 的 natural_key；空文本段跳过，与 Python 一致）。
 struct NatSeg {
     bool is_num = false;
-    long long num = 0;
-    std::string text;  // casefold 后
+    std::string digits;  // 数字段：已去前导零，空串代表 0（Python int 语义）
+    std::string text;    // casefold 后
 };
 
 void split_natural(const std::string& s, std::vector<NatSeg>& out) {
@@ -60,17 +58,14 @@ void split_natural(const std::string& s, std::vector<NatSeg>& out) {
         unsigned char c = static_cast<unsigned char>(s[i]);
         if (c >= '0' && c <= '9') {
             flush_text();
-            long long v = 0;
             size_t j = i;
-            while (j < s.size() && s[j] >= '0' && s[j] <= '9') {
-                v = v * 10 + (s[j] - '0');
-                if (v > (1LL << 62)) v = 1LL << 62;  // 防溢出（Python 为大整数，截断足够）
-                j++;
-            }
+            while (j < s.size() && s[j] >= '0' && s[j] <= '9') j++;
+            size_t k = i;
+            while (k < j && s[k] == '0') k++;  // Python int() 忽略前导零
             NatSeg seg;
             seg.is_num = true;
-            seg.num = v;
-            out.push_back(seg);
+            seg.digits = s.substr(k, j - k);
+            out.push_back(std::move(seg));
             i = j;
         } else {
             // 文本段 casefold：ASCII 小写化（多字节 UTF-8 原样保留）
@@ -93,7 +88,10 @@ bool natural_key_less_local(const std::string& a, const std::string& b) {
         const NatSeg& y = kb[i];
         if (x.is_num != y.is_num) return y.is_num;  // 文本段(0) 排在数字段(1) 前
         if (x.is_num) {
-            if (x.num != y.num) return x.num < y.num;
+            // 任意精度数字的等价比法：先比有效位数，同位再字典序（无 long long 溢出）
+            if (x.digits.size() != y.digits.size()) return x.digits.size() < y.digits.size();
+            int c = x.digits.compare(y.digits);
+            if (c != 0) return c < 0;
         } else {
             int c = x.text.compare(y.text);
             if (c != 0) return c < 0;
@@ -134,8 +132,12 @@ std::filesystem::path resolve_vpath_real(const AppConfig& cfg, const std::string
                            std::vector<std::string>(parts.begin() + 1, parts.end()));
 }
 
+// 目录递归深度上限：链接/junction 已被跳过，这里只作兜底（伪装成普通目录的
+// 异常重解析点等），防止成环把线程栈打爆。正常书库远达不到。
+constexpr int kMaxScanDepth = 256;
+
 // 目录图片数（对应 Python gallery.list_images / count_images 的计数用途）：
-// 跳过隐藏与 skip_entries glob、符号链接不计。
+// 跳过隐藏与 skip_entries glob、符号链接/junction 不计。
 long long count_images_in(const std::filesystem::path& dir, bool recursive,
                           const std::vector<std::string>& patterns) {
     std::error_code ec;
@@ -145,9 +147,19 @@ long long count_images_in(const std::filesystem::path& dir, bool recursive,
         for (std::filesystem::recursive_directory_iterator it(dir, ec), end; it != end;
              it.increment(ec)) {
             if (ec) { ec.clear(); continue; }
+            if (it.depth() >= kMaxScanDepth) {  // 深度超限：只停递归，兜底防环
+                it.disable_recursion_pending();
+                continue;
+            }
             std::error_code ec2;
             if (it->is_symlink(ec2) || ec2) { ec2.clear(); continue; }
-            if (!it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
+            if (!it->is_regular_file(ec2) || ec2) {
+                ec2.clear();
+                // 目录若是 symlink/junction 必须阻止下钻（is_symlink 不识别 junction）
+                if (it->is_directory(ec2) && !ec2 && is_symlink_or_junction(it->path()))
+                    it.disable_recursion_pending();
+                continue;
+            }
             std::string name = u8_name(it->path());
             if (is_hidden_name(name)) continue;
             if (should_skip_entry(name, patterns)) continue;
@@ -212,34 +224,49 @@ void LibraryService::load_index() {
     try {
         data = nlohmann::json::parse(ss.str());
     } catch (...) {
-        return;  // 索引文件损坏，已忽略
+        std::fprintf(stderr, "警告：索引文件损坏，已忽略: %s\n", u8_path(path).c_str());
+        return;
     }
-    if (data.value("version", 0) != 1) return;  // INDEX_VERSION
+    // 字段类型错误（book_id 是数字、size 是字符串等）与 JSON 损坏同等处理：
+    // 整份索引不可信 → 忽略并等下次扫描重建，绝不能让异常逃出 load_index 终止启动。
+    // Python 侧损坏索引同样只记 warning 后跳过（library.py load_index）。
+    std::map<std::string, LibraryBook> books;
+    std::unordered_map<std::string, std::string> by_id;
+    std::map<std::string, GalleryCount> counts;
+    double scanned_at = 0.0;
+    try {
+        if (data.value("version", 0) != 1) return;  // INDEX_VERSION
+        if (data.contains("books") && data["books"].is_object()) {
+            for (auto& [vpath, val] : data["books"].items()) {
+                if (!val.is_object() || !val.contains("book_id")) continue;
+                LibraryBook b;
+                b.vpath = vpath;
+                b.book_id = val.value("book_id", std::string());
+                b.format = val.value("format", std::string());
+                b.size = val.value("size", 0LL);
+                b.mtime = val.value("mtime", 0.0);
+                if (b.book_id.empty()) continue;
+                books[vpath] = b;
+                by_id[b.book_id] = vpath;
+            }
+        }
+        if (data.contains("gallery_counts") && data["gallery_counts"].is_object()) {
+            for (auto& [vpath, val] : data["gallery_counts"].items()) {
+                if (!val.is_object()) continue;
+                counts[vpath] = {val.value("count", 0), val.value("mtime", 0.0)};
+            }
+        }
+        scanned_at = data.value("scanned_at", 0.0);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "警告：索引文件损坏，已忽略: %s (%s)\n",
+                     u8_path(path).c_str(), e.what());
+        return;
+    }
     std::unique_lock lk(mu_);
-    by_vpath_.clear();
-    id_to_vpath_.clear();
-    gallery_counts_.clear();
-    if (data.contains("books") && data["books"].is_object()) {
-        for (auto& [vpath, val] : data["books"].items()) {
-            if (!val.is_object() || !val.contains("book_id")) continue;
-            LibraryBook b;
-            b.vpath = vpath;
-            b.book_id = val.value("book_id", std::string());
-            b.format = val.value("format", std::string());
-            b.size = val.value("size", 0LL);
-            b.mtime = val.value("mtime", 0.0);
-            if (b.book_id.empty()) continue;
-            by_vpath_[vpath] = b;
-            id_to_vpath_[b.book_id] = vpath;
-        }
-    }
-    if (data.contains("gallery_counts") && data["gallery_counts"].is_object()) {
-        for (auto& [vpath, val] : data["gallery_counts"].items()) {
-            if (!val.is_object()) continue;
-            gallery_counts_[vpath] = {val.value("count", 0), val.value("mtime", 0.0)};
-        }
-    }
-    scanned_at_ = data.value("scanned_at", 0.0);
+    by_vpath_ = std::move(books);
+    id_to_vpath_ = std::move(by_id);
+    gallery_counts_ = std::move(counts);
+    scanned_at_ = scanned_at;
 }
 
 void LibraryService::save_index() {
@@ -275,7 +302,13 @@ void LibraryService::save_index_locked() {
         {"books", books},
         {"gallery_counts", counts},
     };
-    atomic_write(cfg_.index_path(), payload.dump());
+    // 写盘失败（磁盘满/权限等）必须留痕：Python save_index 失败会保留 dirty 并记
+    // warnings；这里没有 dirty 标记，但扫描结束的 save_index 无条件重写，30s 节流
+    // 后的 maybe_save 也会再试，不会因一次失败永久丢索引。
+    if (!atomic_write(cfg_.index_path(), payload.dump())) {
+        std::fprintf(stderr, "警告：索引落盘失败: %s\n",
+                     u8_path(cfg_.index_path()).c_str());
+    }
     last_save_ = now_epoch();
 }
 
@@ -304,12 +337,14 @@ void LibraryService::scan_blocking() {
     std::map<std::string, GalleryCount> counts;
     const auto& patterns = cfg_.comic.skip_entries;
 
-    // 递归遍历（os.walk 语义：目录按 natural 排序、跳过隐藏与符号链接目录/文件）
+    // 递归遍历（os.walk 语义：目录按 natural 排序、跳过隐藏与符号链接/junction 目录/文件；
+    // depth 上限兜底防成环栈溢出）
     std::function<void(const std::filesystem::path&, const std::string&,
-                       const std::map<std::string, LibraryBook>&)>
+                       const std::map<std::string, LibraryBook>&, int)>
         walk = [&](const std::filesystem::path& dirpath, const std::string& vdir,
-                   const std::map<std::string, LibraryBook>& prev) {
+                   const std::map<std::string, LibraryBook>& prev, int depth) {
             if (cancel_.load()) return;
+            if (depth >= kMaxScanDepth) return;
             std::error_code ec;
             std::vector<std::filesystem::directory_entry> dir_entries, file_entries;
             for (std::filesystem::directory_iterator it(dirpath, ec), end; it != end;
@@ -320,9 +355,12 @@ void LibraryService::scan_blocking() {
                 std::string name = u8_name(e.path());
                 if (is_hidden_name(name)) continue;
                 if (e.is_symlink(ec2) || ec2) { ec2.clear(); continue; }
-                if (e.is_directory(ec2) && !ec2)
+                if (e.is_directory(ec2) && !ec2) {
+                    // is_symlink 不识别 junction；junction 成环会无限递归（Python 的
+                    // os.walk 会跟进 junction，bpo-23407），这里按链接跳过
+                    if (is_symlink_or_junction(e.path())) continue;
                     dir_entries.push_back(e);
-                else if (e.is_regular_file(ec2) && !ec2)
+                } else if (e.is_regular_file(ec2) && !ec2)
                     file_entries.push_back(e);
             }
             std::sort(dir_entries.begin(), dir_entries.end(),
@@ -379,7 +417,7 @@ void LibraryService::scan_blocking() {
 
             for (const auto& d : dir_entries) {
                 if (cancel_.load()) return;
-                walk(d.path(), join_vpath(vdir, {u8_name(d.path())}), prev);
+                walk(d.path(), join_vpath(vdir, {u8_name(d.path())}), prev, depth + 1);
             }
         };
 
@@ -393,7 +431,7 @@ void LibraryService::scan_blocking() {
         if (cancel_.load()) break;
         std::filesystem::path root_path = std::filesystem::u8path(root.path);
         if (!std::filesystem::is_directory(root_path)) continue;  // 根不存在，跳过
-        walk(root_path, "/" + root.name, prev);
+        walk(root_path, "/" + root.name, prev, 0);
     }
     if (cfg_.gallery.recursive) {
         // recursive=true：目录计数自底向上 rollup（父 = 子孙之和）

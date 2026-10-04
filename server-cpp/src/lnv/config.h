@@ -4,6 +4,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <filesystem>
 
@@ -21,7 +22,10 @@ struct LibraryCfg {
     std::vector<std::string> include_ext;   // 小写、带点
     bool show_all_files = false;
     std::string sort = "natural";           // natural | name
-    std::map<std::string, std::string> encoding_overrides;
+    // 用有序表而非 std::map：Python 的 dict 保留 YAML 插入顺序，多后缀命中时
+    // 取"最先插入且匹配"的一条；std::map 按字典序迭代会让命中项与 Python 不同
+    // （如同时配了 ".txt" 与 "book.txt" 时）。重复键按 dict 语义"保留最后值"。
+    std::vector<std::pair<std::string, std::string>> encoding_overrides;
 };
 
 struct GalleryCfg {

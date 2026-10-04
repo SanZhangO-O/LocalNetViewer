@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 #include "lnv/util/sha1.h"
@@ -170,7 +171,10 @@ void draw_missing_image(ImageBuf& canvas, double x, double y, int w, int h,
     if (fonts == nullptr || fonts->default_id_raw().empty()) return;
     // 字号 = max(10, min(28, h//6 or 12))（对齐 Python default_font 取号）
     const int font_size = std::max(10, std::min(28, h / 6 > 0 ? h / 6 : 12));
-    if (!fonts->load(fonts->default_id(), font_size)) return;
+    // FaceGuard：占位文字同样要“load（ensure）→ ascent → render_glyph”整体独占
+    // face，否则并发渲染会在其间把 face 切成别的字号（与正文路径同类问题）
+    FontManager::FaceGuard guard(*fonts, fonts->default_id(), font_size);
+    if (!guard.ok()) return;
     const Rgb label_fg{120, 120, 120};
     const double baseline = std::lround(y) + 8 + fonts->ascent();
     draw_text(canvas, *fonts, utf8_to_u32("图片无法显示"), std::lround(x) + 8,
@@ -255,16 +259,6 @@ bool is_photo_page(const std::vector<LayoutItem>& items, double content_area,
 }
 
 // ============================================================ 文字封面辅助
-// 封面字体：fonts 为空 / 加载失败 → false（调用方跳过绘制、宽度退化估算）
-bool cover_font(FontManager* fonts, int size) {
-    if (fonts == nullptr) return false;
-    try {
-        return fonts->load(fonts->resolve_id(std::string()), size);
-    } catch (...) {
-        return false;
-    }
-}
-
 // 文本宽度（优先字体度量，失败退 len×size×0.6，对齐 Python 兜底）
 double cover_text_width(FontManager* fonts, const U32Text& text, int size) {
     if (fonts == nullptr) return double(text.size()) * size * 0.6;
@@ -464,33 +458,54 @@ ImageBytes text_cover(const std::string& title, const std::optional<std::string>
     const int author_size = std::max(10, int(w * 0.082));
     const double max_width = double(w - int(w * 0.16));
     const double x0 = double(int(w * 0.08));
-
-    // 标题：字号 w×0.13，逐字符贪心换行最多 4 行（超出加 "…"）
-    const bool have_font = cover_font(fonts, title_size);
-    const std::vector<U32Text> lines = wrap_for_cover(
-        have_font ? fonts : nullptr, utf8_to_u32(title.empty() ? "无标题" : title),
-        title_size, max_width, 4);
     const int line_h = int(title_size * 1.35);
-    const int total_h = line_h * int(lines.size());
-    int y = std::max(int(h * 0.18), int((h - total_h) / 2) - int(h * 0.06));
-    if (have_font && fonts != nullptr) {
-        double baseline = y + fonts->ascent();  // draw.text 顶部对齐 → 基线下移 ascent
-        for (const auto& line : lines) {
-            draw_text(canvas, *fonts, line, x0, baseline, 0.0, fg, false,
-                      double(title_size));
-            baseline += line_h;
+
+    // 标题：字号 w×0.13，逐字符贪心换行最多 4 行（超出加 "…"）。
+    // FaceGuard：换行度量 + 绘制整段独占 face；没有它时并发 /cover（12 线程池）
+    // 会在两次 char_length 之间把全局唯一 face 换成别的字号，文字按错误字号
+    // 光栅化（与 render_flow_page 的正文路径是同一个问题）。
+    {
+        std::optional<FontManager::FaceGuard> guard;
+        if (fonts != nullptr) {
+            try {
+                guard.emplace(*fonts, fonts->resolve_id(std::string()), title_size);
+            } catch (...) {
+                // 与旧 cover_font 的容错一致：加载失败/内存不足 → 无字体封面
+            }
+        }
+        const bool have_font = guard.has_value() && guard->ok();
+        const std::vector<U32Text> lines = wrap_for_cover(
+            have_font ? fonts : nullptr, utf8_to_u32(title.empty() ? "无标题" : title),
+            title_size, max_width, 4);
+        const int total_h = line_h * int(lines.size());
+        const int y = std::max(int(h * 0.18), int((h - total_h) / 2) - int(h * 0.06));
+        if (have_font) {
+            double baseline = y + fonts->ascent();  // draw.text 顶部对齐 → 基线下移 ascent
+            for (const auto& line : lines) {
+                draw_text(canvas, *fonts, line, x0, baseline, 0.0, fg, false,
+                          double(title_size));
+                baseline += line_h;
+            }
         }
     }
 
     // 作者：字号 w×0.082，底部最多 2 行，配色 blend(fg,bg,0.25)；
     // 注意 Python 中 line_h // 2 * len(author_lines) 用的是标题的 line_h
     if (author && !author->empty()) {
-        const bool have_author_font = cover_font(fonts, author_size);
+        std::optional<FontManager::FaceGuard> guard;
+        if (fonts != nullptr) {
+            try {
+                guard.emplace(*fonts, fonts->resolve_id(std::string()), author_size);
+            } catch (...) {
+                // 同上：失败退化为无字体作者行
+            }
+        }
+        const bool have_author_font = guard.has_value() && guard->ok();
         const std::vector<U32Text> author_lines = wrap_for_cover(
             have_author_font ? fonts : nullptr, utf8_to_u32(*author),
             author_size, max_width, 2);
         const int ay = h - int(h * 0.14) - line_h / 2 * int(author_lines.size());
-        if (have_author_font && fonts != nullptr) {
+        if (have_author_font) {
             const Rgb author_fg = blend(fg, bg, 0.25);
             double baseline = ay + fonts->ascent();
             for (const auto& line : author_lines) {
@@ -538,13 +553,17 @@ nlohmann::json build_page_json(const DocumentModel& doc, const PageMap& pm, int 
                                const std::string& book_id) {
     const PageRecord* record = pm.record(page);
     if (record == nullptr) throw std::out_of_range("页码越界: " + std::to_string(page));
+    // Python jsonout.build_page_json 的 fonts 是必填 FontManager（引擎内部无条件
+    // 用它度量字符宽度）。此处之前允许 nullptr 继续走，会在 engine 里解引用崩溃；
+    // 与 render_flow_page 一样显式报错，由调用方保证传入有效实例。
+    if (fonts == nullptr) throw std::invalid_argument("build_page_json 需要 FontManager");
     const std::string bid = book_id.empty() ? doc.book_id : book_id;
 
     FlowLayoutEngine::Deps ed;
     ed.doc = &doc;
     ed.fonts = fonts;
     ed.profile = &profile;
-    ed.font_id = fonts ? fonts->resolve_id(profile.font.family) : std::string();
+    ed.font_id = fonts->resolve_id(profile.font.family);
     FlowLayoutEngine engine(ed);
     auto laid = engine.items_for_page(pm, page);
     if (!laid) throw std::out_of_range("页码越界: " + std::to_string(page));

@@ -79,10 +79,19 @@ cd server
   **补丁文件在 `patches/`，重新 vendor 时必须重新应用**（build.ps1 会校验）。
 - 列表条目 `openable`/`reason` 会探测可选后端（unrar/bsdtar、7z、Calibre、
   pdfium.dll），与 Python 一致；探测结果进程内缓存。
-- 解析并发：已接入与 Python 同语义的解析闸门（同任务去重 + 并发上限 8 →
-  503 SERVER_BUSY），但没有"到点中断"的超时（C++ 无法安全强杀线程）：
-  Python 超时后任务仍在后台跑、只是对外报 422，本实现会一直等到算完。
-  超长/异常书籍上表现为"慢"而不是 PARSE_FAILED{reason:timeout}。
+- 解析并发：与 Python 同语义的解析闸门（同任务去重、并发上限 8、槽位先等 5s 再
+  503、等待超过 `limits.parse_timeout_s` 报 422 `PARSE_FAILED{reason:timeout}`）。
+  与 Python 一样，超时不会强杀任务：后台继续跑完、槽位随之释放；超时后的重试会
+  命中同任务去重（同 Python）。`/document`（页/搜索入口）同样按书去重。
+- 书库扫描与递归计数会跳过符号链接与 NTFS junction（按 reparse tag 识别，深度
+  上限 256），避免 junction 成环导致无限递归/栈溢出；CPython `os.walk` 实际会
+  跟进 junction（bpo-23407 未修），因此扫描结果可能有差异（仅能经 junction
+  到达的文件不会进索引，但仍可在列表中浏览打开）。
+- 外部解压后端（unrar/bsdtar/7z）按需把**单个条目**解到内存并全程限长（不再整包
+  落盘）；列表/单条目读取有 120s 超时并在超时后杀掉整棵进程树（Python 无超时）。
+  RAR 的“每条目一次 unrar 进程”与 Python rarfile 的逐文件进程语义一致；py7zr 是
+  进程内读取，CB7 的逐条目 7z 进程相对更慢。适配器实例内对已读条目做 32MB 上限
+  的缓存，同一请求内重复读取（probe 后再取页/切片）不会重复解压。
 - 缓存文件与 Python 互相可读（parsed / layouts / index / galleries / progress），
   但 JSON 键序不同：Python 用插入序，本实现用 nlohmann 的按键排序；
   `PageRecord.y0/height` 在 Python 里是 int（`0`）、这里是 double（`0.0`）。
@@ -98,8 +107,20 @@ cd server
   实测 6 万层嵌套时 Python 得 0 字符/0 页，本实现同样 0 字符/0 页；正常文档
   （深度远小于 200）不受影响。若无此上限，6 万层嵌套会让进程栈溢出直接死掉。
 - 未实现 FastAPI 的 `/docs`、`/redoc`、`/openapi.json`（返回 404）。
-- `GET /render/fonts/{id}/file` 不带 ETag/Last-Modified、不支持 Range
-  （Python 用 Starlette FileResponse，会带这些头）。
+- `GET /render/fonts/{id}/file` 已带 ETag / Last-Modified / Accept-Ranges，并支持
+  单段 Range（206；越界 416 带 `Content-Range: bytes */size`）。两处有意超集：
+  本实现对 `If-None-Match` 返回 304，而 Python 的 Starlette FileResponse（0.50）
+  只处理 Range/If-Range、不处理 If-None-Match（条件请求仍 200 全量重发）；
+  多段 Range 本实现按第一段处理，Python 返回 multipart/byteranges。
+- 进度 `anchor`/`page` 接受任意 JSON 整数（含 2^63..2^64-1）并原样落盘/回显，
+  与 Python 的无界 int 一致；超出 2^64 的整数 nlohmann 解析为 double，会有精度差。
+- 加密 EPUB：本实现读条目时检测加密并返回 422（提示需要密码）；Python 走 zipfile
+  抛 RuntimeError → 500。
+- 几何参数（`viewport`/`margin`）超过 32 位整数范围时本实现饱和到 `INT_MAX`
+  （Python 无界 int 会继续参与布局计算）；正常取值远小于该范围。
+- 少数编码标签差异：SJIS/EUC-JP 系文本 Python 可能因 charset-normalizer 的
+  fingerprint 合并报 `cp932`/`euc_jis_2004`，本实现报 `shift_jis`/`euc_jp`
+  （正文一致，`meta.encoding` 可能不同）。
 - httplib 自身的错误（超长 URI → 414、超长请求头 → 400）现在也带统一 JSON 错误信封；
   Python 对超长 URI 返回 400。两者状态码不同但都返回可解析的错误体。
 - **非 ASCII 令牌**：本实现按原始字节比较，可正常工作；Python 用 latin-1 解码后的头再

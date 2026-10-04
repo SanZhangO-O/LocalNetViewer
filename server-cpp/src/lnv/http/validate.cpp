@@ -404,6 +404,12 @@ const nlohmann::json* jv_object_required(const Validator& v, const nlohmann::jso
 long long jv_int(const Validator& v, const nlohmann::json& obj, const char* key,
                  std::vector<std::string> loc, long long def, IntBound b, bool required,
                  bool nullable) {
+    return jv_int_ex(v, obj, key, std::move(loc), def, b, required, nullable, nullptr);
+}
+
+long long jv_int_ex(const Validator& v, const nlohmann::json& obj, const char* key,
+                    std::vector<std::string> loc, long long def, IntBound b, bool required,
+                    bool nullable, nlohmann::json* raw_out) {
     if (!obj.is_object()) return def;
     auto it = obj.find(key);
     if (it == obj.end()) {
@@ -418,8 +424,20 @@ long long jv_int(const Validator& v, const nlohmann::json& obj, const char* key,
     long long value = def;
     if (it->is_boolean()) {
         value = it->get<bool>() ? 1 : 0;
-    } else if (it->is_number_integer() || it->is_number_unsigned()) {
+        if (raw_out) *raw_out = value;
+    } else if (it->is_number_unsigned()) {
+        // nlohmann 的 get<long long>() 会把 ≥2^63 的无符号 JSON 整数按位环绕成负数。
+        // Python 的 int 无界，绝不允许这种环绕：先按无符号语义取值，放不进
+        // long long 时饱和到 LLONG_MAX（越界上界比较仍给出与 pydantic 一致的
+        // less_than_equal）；raw_out 保留原始 uint64 供进度字段原样回显。
+        const unsigned long long u = it->get<unsigned long long>();
+        value = u > static_cast<unsigned long long>(std::numeric_limits<long long>::max())
+                    ? std::numeric_limits<long long>::max()
+                    : static_cast<long long>(u);
+        if (raw_out) *raw_out = u;
+    } else if (it->is_number_integer()) {
         value = it->get<long long>();
+        if (raw_out) *raw_out = value;
     } else if (it->is_number_float()) {
         double d = it->get<double>();
         if (d != std::floor(d) || !std::isfinite(d)) {
@@ -427,7 +445,27 @@ long long jv_int(const Validator& v, const nlohmann::json& obj, const char* key,
                   "int_from_float");
             return def;
         }
-        value = static_cast<long long>(d);
+        // 整数值 float 超出 long long 范围时 static_cast 是 UB（MSVC 实测得到
+        // LLONG_MIN 之类的负数）；饱和而非环绕。[2^63, 2^64) 仍可精确表示，
+        // raw_out 用 uint64 保住与 Python int(float) 一致的数值。
+        if (d >= 9223372036854775808.0) {
+            if (d < 18446744073709551616.0) {
+                const unsigned long long u = static_cast<unsigned long long>(d);
+                value = u > static_cast<unsigned long long>(std::numeric_limits<long long>::max())
+                            ? std::numeric_limits<long long>::max()
+                            : static_cast<long long>(u);
+                if (raw_out) *raw_out = u;
+            } else {
+                value = std::numeric_limits<long long>::max();
+                if (raw_out) *raw_out = value;
+            }
+        } else if (d < -9223372036854775808.0) {
+            value = std::numeric_limits<long long>::min();
+            if (raw_out) *raw_out = value;
+        } else {
+            value = static_cast<long long>(d);
+            if (raw_out) *raw_out = value;
+        }
     } else if (it->is_string()) {
         if (!str_to_int(it->get<std::string>(), value)) {
             v.add(std::move(loc),
@@ -435,6 +473,7 @@ long long jv_int(const Validator& v, const nlohmann::json& obj, const char* key,
                   "int_parsing");
             return def;
         }
+        if (raw_out) *raw_out = value;
     } else {
         v.add(std::move(loc), "Input should be a valid integer", "int_type");
         return def;

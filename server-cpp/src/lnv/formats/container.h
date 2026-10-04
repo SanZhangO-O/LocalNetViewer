@@ -18,6 +18,9 @@ public:
     virtual const std::vector<ContainerEntry>& entries() const = 0;
     // 读取条目（限制 entry_max_bytes；超出抛 ParseError）。失败抛 ParseError/AssetNotFoundError
     virtual std::string read(const std::string& name, long long entry_max_bytes) = 0;
+    // 可选：给按需解压的容器（RAR/7z）设置 max_archive_total_mb 累计上限（字节；0 = 不限）。
+    // 默认空实现：ZIP/TAR/目录的声明尺寸总量在 comics.build_names 已校验。
+    virtual void set_total_limit(long long /*bytes*/) {}
 };
 
 // ZIP（miniz）。entry_names 已做 cp437 还原 + 规范化。
@@ -27,14 +30,19 @@ std::unique_ptr<Container> open_zip(const std::filesystem::path& path);
 std::unique_ptr<Container> open_dir(const std::filesystem::path& path, bool recursive = false);
 // TAR（自写 ustar 读取）
 std::unique_ptr<Container> open_tar(const std::filesystem::path& path);
-// RAR：unrar/bsdtar 子进程；工具缺失 → UnsupportedFormatError("需要 RAR 后端","需安装 unrar")
+// RAR：unrar/bsdtar 子进程，列表后按需单条目解到内存（unrar p / bsdtar -xO）；
+// 工具缺失 → UnsupportedFormatError("需要 RAR 后端","需安装 unrar")
 std::unique_ptr<Container> open_rar(const std::filesystem::path& path);
-// 7z：7z 子进程；缺失 → UnsupportedFormatError("需要 7z 后端","需安装 7-Zip")
+// 7z：7z 子进程，列表后按需单条目解到内存（7z e -so）；
+// 缺失 → UnsupportedFormatError("需要 7z 后端","需安装 7-Zip")
 std::unique_ptr<Container> open_7z(const std::filesystem::path& path);
 
 // 可选后端可用性探测（进程内缓存；对应 Python registry.backend_status/openable_reason）
 bool rar_backend_available();    // unrar 或 bsdtar 在 PATH 上
 bool seven_backend_available();  // 7z.exe 在 PATH 上
+
+// 解压总量超限的错误文案（container/epub/comics 共用；逐字对齐 Python）
+std::string archive_total_limit_error(long long total_bytes);
 
 // ---- 容器条目筛选（§4.3，EPUB/漫画共用语义）----
 // should_skip_entry：隐藏段、skip_entries glob（三重匹配）
