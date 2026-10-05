@@ -10,7 +10,7 @@ server:
 library:
   roots:
     - name: 我的书库
-      path: C:/Books
+      path: F:\book
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序
