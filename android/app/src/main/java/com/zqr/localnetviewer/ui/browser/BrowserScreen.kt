@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -20,10 +21,16 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.LastPage
 import androidx.compose.material.icons.filled.Collections
+import androidx.compose.material.icons.filled.FirstPage
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Refresh
@@ -34,6 +41,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -42,9 +50,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +61,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.wrapContentHeight
@@ -68,7 +81,7 @@ import com.zqr.localnetviewer.ui.common.ErrorView
 import com.zqr.localnetviewer.ui.common.LoadingView
 import com.zqr.localnetviewer.ui.common.formatSize
 
-/** 浏览页（设计 6.3）：面包屑 + 目录/书籍列表 + "打开为图集"入口。 */
+/** 浏览页（设计 6.3）：面包屑 + 目录/书籍列表 + 底部分页栏 + "打开为图集"入口。 */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BrowserScreen(
@@ -151,10 +164,13 @@ fun BrowserScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                // 底部分页栏含输入框：edge-to-edge 下键盘不会自动缩窗（API 30+），
+                // 必须 imePadding 才能在输入时露出分页栏（旧系统走窗口 resize，此项为 0）
+                .imePadding()
         ) {
             Breadcrumb(
                 path = state.path,
-                onNavigate = vm::load,
+                onNavigate = { vm.load(it) },
             )
             HorizontalDivider()
             if (state.scanning || (state.loading && state.entries.isNotEmpty())) {
@@ -162,7 +178,7 @@ fun BrowserScreen(
             }
 
             when {
-                state.loading -> LoadingView()
+                state.loading && state.entries.isEmpty() -> LoadingView()
                 state.error != null -> ErrorView(
                     message = state.error ?: "加载失败",
                     onRetry = vm::refresh,
@@ -172,64 +188,53 @@ fun BrowserScreen(
                 state.entries.isEmpty() -> EmptyView("此目录为空")
                 else -> {
                     val listState = rememberLazyListState()
-                    // 分页滚动加载：接近列表末尾时自动取下一页（服务端 offset 分页）。
-                    // 大目录可能有几万个条目，靠手动点"加载更多"要点几百次；
-                    // derivedStateOf 只在"进入/离开末尾附近"时才触发重组与重试。
-                    val nearEnd by remember {
-                        derivedStateOf {
-                            val info = listState.layoutInfo
-                            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
-                            info.totalItemsCount > 0 && last >= info.totalItemsCount - 4
-                        }
+                    // 换页数据真正到达后再回列表顶部：请求期内仍显示旧页内容，
+                    // 提前滚动会让旧列表无意义地跳顶
+                    LaunchedEffect(state.entries) {
+                        listState.scrollToItem(0)
                     }
-                    LaunchedEffect(nearEnd, state.hasMore, state.loadingMore) {
-                        if (nearEnd && state.hasMore && !state.loadingMore) {
-                            vm.loadMore()
-                        }
-                    }
-                    LazyColumn(
-                        modifier = Modifier.fillMaxSize(),
-                        state = listState,
-                    ) {
-                        if (state.canOpenCurrentAsGallery) {
-                            item(key = "current-gallery") {
-                                GalleryEntryCard(
-                                    title = "查看本文件夹图片（${state.gallery?.imageCount ?: 0} 张）",
-                                    subtitle = "不打开文件，直接把当前文件夹作为图集阅读",
-                                    enabled = !state.opening,
-                                    onClick = { vm.openFolderAsGallery(state.path) },
-                                )
-                            }
-                        }
-                        // key 带 index 前缀：服务器在分页边界/重命名竞态下可能返回重复
-                        // path，LazyColumn 的重复 key 会直接抛 IllegalArgumentException
-                        // （与 SearchSheet 同样的防护）
-                        itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
-                            EntryRow(
-                                entry = entry,
-                                coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
-                                onClick = { vm.onEntryClick(entry) },
-                                onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
-                                opening = state.opening,
-                            )
-                            HorizontalDivider()
-                        }
-                        if (state.hasMore) {
-                            item(key = "load-more") {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clickable { vm.loadMore() }
-                                        .padding(16.dp),
-                                    contentAlignment = Alignment.Center,
-                                ) {
-                                    if (state.loadingMore) {
-                                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                                    } else {
-                                        Text("加载更多（${state.entries.size}/${state.total}）")
-                                    }
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            state = listState,
+                        ) {
+                            if (state.canOpenCurrentAsGallery) {
+                                item(key = "current-gallery") {
+                                    GalleryEntryCard(
+                                        title = "查看本文件夹图片（${state.gallery?.imageCount ?: 0} 张）",
+                                        subtitle = "不打开文件，直接把当前文件夹作为图集阅读",
+                                        enabled = !state.opening,
+                                        onClick = { vm.openFolderAsGallery(state.path) },
+                                    )
                                 }
                             }
+                            // key 带 index 前缀：服务器在分页边界/重命名竞态下可能返回重复
+                            // path，LazyColumn 的重复 key 会直接抛 IllegalArgumentException
+                            // （与 SearchSheet 同样的防护）
+                            itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
+                                EntryRow(
+                                    entry = entry,
+                                    coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
+                                    onClick = { vm.onEntryClick(entry) },
+                                    onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
+                                    opening = state.opening,
+                                )
+                                HorizontalDivider()
+                            }
+                        }
+                        if (state.totalPages > 1) {
+                            HorizontalDivider()
+                            PaginationBar(
+                                page = state.page,
+                                totalPages = state.totalPages,
+                                total = state.total,
+                                enabled = !state.loading,
+                                onFirst = vm::firstPage,
+                                onPrev = vm::prevPage,
+                                onNext = vm::nextPage,
+                                onLast = vm::lastPage,
+                                onJump = vm::goToPage,
+                            )
                         }
                     }
                 }
@@ -413,5 +418,89 @@ private fun IconBox(icon: ImageVector) {
         contentAlignment = Alignment.Center,
     ) {
         Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/**
+ * 底部分页栏（设计 6.3）：第一页 / 上一页 / 下一页 / 最后一页 + 页码指示 + 页码跳转。
+ * 越界页码由 ViewModel 收敛；加载中整栏禁用，避免连点发出竞态请求。
+ */
+@Composable
+private fun PaginationBar(
+    page: Int,
+    totalPages: Int,
+    total: Int,
+    enabled: Boolean,
+    onFirst: () -> Unit,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onLast: () -> Unit,
+    onJump: (Int) -> Unit,
+) {
+    var jumpText by remember { mutableStateOf("") }
+    val focusManager = LocalFocusManager.current
+
+    fun submitJump() {
+        val target = jumpText.trim().toIntOrNull() ?: return
+        onJump(target)
+        jumpText = ""
+        focusManager.clearFocus()
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onFirst, enabled = enabled && page > 1) {
+                Icon(Icons.Filled.FirstPage, contentDescription = "第一页")
+            }
+            IconButton(onClick = onPrev, enabled = enabled && page > 1) {
+                Icon(Icons.AutoMirrored.Filled.KeyboardArrowLeft, contentDescription = "上一页")
+            }
+            Text(
+                text = "第 $page / $totalPages 页 · 共 $total 项",
+                style = MaterialTheme.typography.labelLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(onClick = onNext, enabled = enabled && page < totalPages) {
+                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = "下一页")
+            }
+            IconButton(onClick = onLast, enabled = enabled && page < totalPages) {
+                Icon(Icons.AutoMirrored.Filled.LastPage, contentDescription = "最后一页")
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            OutlinedTextField(
+                value = jumpText,
+                onValueChange = { jumpText = it.filter(Char::isDigit).take(7) },
+                modifier = Modifier.width(140.dp),
+                label = { Text("页码") },
+                // 聚焦后显示有效范围；label 只写"页码"，避免大 N 时把 140dp 的标签撑爆
+                placeholder = { Text("1 - $totalPages") },
+                singleLine = true,
+                enabled = enabled,
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = { submitJump() }),
+            )
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = { submitJump() }, enabled = enabled) {
+                Text("跳转")
+            }
+        }
     }
 }

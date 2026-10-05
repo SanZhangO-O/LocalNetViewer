@@ -17,7 +17,8 @@ import kotlinx.coroutines.launch
 /**
  * 浏览页状态机（设计 6.3 BrowserScreen）。
  *
- * 目录优先 + 自然排序由服务器完成；这里负责分页加载、"打开为图集"入口与错误提示。
+ * 目录优先 + 自然排序由服务器完成；列表按页显示（页码制分页，服务端 offset/limit），
+ * 这里负责翻页/跳页、"打开为图集"入口与错误提示。
  */
 class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
@@ -30,8 +31,9 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
         val gallery: GalleryInfoDto? = null,
         val entries: List<FileEntryDto> = emptyList(),
         val total: Int = 0,
+        /** 当前页（1 基）。 */
+        val page: Int = 1,
         val loading: Boolean = true,
-        val loadingMore: Boolean = false,
         val opening: Boolean = false,
         val scanning: Boolean = false,
         val error: String? = null,
@@ -39,13 +41,13 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
         /** 已连接服务器概要（原名 App.serverSummary，移到这里避免 Composable 直接读 App）。 */
         val serverSummary: String = "",
     ) {
+        val totalPages: Int get() = totalPagesOf(total)
+
         val canOpenCurrentAsGallery: Boolean
             get() = gallery?.canOpenAsBook == true
 
         val currentName: String
             get() = if (path == "/") "书库" else path.trimEnd('/').substringAfterLast('/')
-
-        val hasMore: Boolean get() = entries.size < total
     }
 
     private val _state = MutableStateFlow(UiState())
@@ -56,44 +58,75 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     val openBook: StateFlow<String?> = _openBook.asStateFlow()
 
     private var loadJob: Job? = null
-    private var loadMoreJob: Job? = null
 
     init {
         _state.update { it.copy(serverSummary = appRef.serverSummary) }
         load("/")
     }
 
-    /** 加载目录：取消上一次未完成的加载，避免旧响应覆盖新目录（快速连点面包屑/文件夹）。 */
-    fun load(path: String) {
+    /**
+     * 加载指定目录的指定页：取消上一次未完成的加载，避免旧响应覆盖新状态
+     * （快速连点面包屑/文件夹/翻页）。page 默认 1 = 进入新目录；翻页时带当前 path 调用。
+     */
+    fun load(path: String, page: Int = 1) {
         loadJob?.cancel()
-        loadMoreJob?.cancel()
+        val changingDir = path != _state.value.path
+        // 同目录翻页失败时列表仍是旧页内容：页码指示必须跟着回退（见 catch 分支），
+        // 否则会出现"指示第 3 页、显示第 2 页"的错位
+        val restorePage = if (changingDir) 1 else _state.value.page
+        _state.update {
+            it.copy(
+                path = path,
+                page = page,
+                loading = true,
+                error = null,
+                // 切换目录时清空旧列表，避免加载中仍显示上一个目录的内容
+                entries = if (changingDir) emptyList() else it.entries,
+                gallery = if (changingDir) null else it.gallery,
+            )
+        }
         loadJob = viewModelScope.launch {
-            _state.update { it.copy(loading = true, error = null, loadingMore = false) }
             try {
-                val response = repository.listFiles(path, PAGE_SIZE, 0)
+                var targetPage = page
+                var response = repository.listFiles(path, PAGE_SIZE, (targetPage - 1) * PAGE_SIZE)
+                if (_state.value.path != path) return@launch
+                // 内容缩短后当前页可能已越过最后一页：自动收敛到最后一页重取
+                if (response.entries.isEmpty() && targetPage > 1 && response.total > 0) {
+                    targetPage = totalPagesOf(response.total)
+                    response = repository.listFiles(path, PAGE_SIZE, (targetPage - 1) * PAGE_SIZE)
+                    if (_state.value.path != path) return@launch
+                }
                 _state.update {
                     it.copy(
-                        path = response.path,
+                        page = targetPage,
                         parent = response.parent,
                         gallery = response.gallery,
                         entries = response.entries,
                         total = response.total,
                         scanning = response.scanning,
                         loading = false,
-                        loadingMore = false,
                         serverSummary = appRef.serverSummary,
                     )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: ApiException) {
-                _state.update { it.copy(loading = false, error = error.message) }
+                if (_state.value.path != path || _state.value.page != page) return@launch
+                if (_state.value.entries.isEmpty()) {
+                    // 目录加载失败（列表为空）：整页错误视图
+                    _state.update { it.copy(loading = false, error = error.message) }
+                } else {
+                    // 翻页失败：页码指示回退到已显示的旧页，保留当前列表，用 Snackbar 提示
+                    _state.update {
+                        it.copy(loading = false, page = restorePage, message = error.message ?: "加载失败")
+                    }
+                }
             }
         }
     }
 
     fun refresh() {
-        load(_state.value.path)
+        load(_state.value.path, _state.value.page)
     }
 
     fun navigateUp() {
@@ -101,32 +134,23 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
         load(parent)
     }
 
-    fun loadMore() {
+    /** 跳到指定页（越界自动收敛并提示）；已在目标页时不重复请求。 */
+    fun goToPage(page: Int) {
         val snapshot = _state.value
-        if (snapshot.loadingMore || !snapshot.hasMore) return
-        val requestedPath = snapshot.path
-        _state.update { it.copy(loadingMore = true) }
-        loadMoreJob?.cancel()
-        loadMoreJob = viewModelScope.launch {
-            try {
-                val response = repository.listFiles(requestedPath, PAGE_SIZE, snapshot.entries.size)
-                // 目录可能已经切换：丢弃过期响应的追加结果
-                if (_state.value.path != requestedPath) return@launch
-                _state.update {
-                    it.copy(
-                        entries = it.entries + response.entries,
-                        total = response.total,
-                        scanning = response.scanning,
-                        loadingMore = false,
-                    )
-                }
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: ApiException) {
-                _state.update { it.copy(loadingMore = false, message = error.message) }
-            }
-        }
+        if (snapshot.loading) return
+        val target = page.coerceIn(1, snapshot.totalPages)
+        if (page != target) showMessage("页码超出范围（1 - ${snapshot.totalPages}）")
+        if (target == snapshot.page) return
+        load(snapshot.path, target)
     }
+
+    fun firstPage() = goToPage(1)
+
+    fun lastPage() = goToPage(_state.value.totalPages)
+
+    fun nextPage() = goToPage(_state.value.page + 1)
+
+    fun prevPage() = goToPage(_state.value.page - 1)
 
     fun onEntryClick(entry: FileEntryDto) {
         when {
@@ -190,6 +214,9 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     }
 
     private companion object {
-        const val PAGE_SIZE = 300
+        /** 每页条目数（服务器 /files 的 limit 上限为 5000；页大小取小些便于按页翻找）。 */
+        const val PAGE_SIZE = 100
+
+        fun totalPagesOf(total: Int): Int = if (total <= 0) 1 else (total + PAGE_SIZE - 1) / PAGE_SIZE
     }
 }
