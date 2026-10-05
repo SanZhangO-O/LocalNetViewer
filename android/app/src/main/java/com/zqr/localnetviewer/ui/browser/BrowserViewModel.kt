@@ -40,6 +40,13 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
         val message: String? = null,
         /** 已连接服务器概要（原名 App.serverSummary，移到这里避免 Composable 直接读 App）。 */
         val serverSummary: String = "",
+        /** 目录历史栈深度：> 0 时可"返回上一页"（恢复离开时的页码与滚动位置）。 */
+        val backStackDepth: Int = 0,
+        /**
+         * 成功加载数据的版本号（每次成功 +1）。UI 用它区分"新数据到达"（需要
+         * 回顶/恢复滚动）与"从阅读页返回重建组合"（版本没变，保持原有位置）。
+         */
+        val dataVersion: Int = 0,
     ) {
         val totalPages: Int get() = totalPagesOf(total)
 
@@ -59,6 +66,59 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
     private var loadJob: Job? = null
 
+    /** 目录访问历史：进入新目录时压入离开处的（目录, 页码, 滚动位置），返回时弹出恢复。 */
+    private class HistoryEntry(val path: String, val page: Int, val scrollIndex: Int, val scrollOffset: Int)
+
+    private val history = ArrayDeque<HistoryEntry>()
+
+    /** 待恢复的滚动位置（返回上一页时设置，UI 在新数据渲染后取走并清空）。非 Compose 状态。 */
+    class ScrollRestore(val index: Int, val offset: Int)
+
+    @Volatile
+    private var pendingScrollRestore: ScrollRestore? = null
+
+    /** 已把滚动指令交给 UI 的 dataVersion（从阅读页返回重建组合时，effect 会重跑，靠它去重）。 */
+    @Volatile
+    private var scrollHandledVersion = 0
+
+    // 当前列表滚动位置由 UI 持续上报（不用 Compose 状态，避免每帧滚动触发全页重组），
+    // 离开目录时用它快照，返回时才能恢复到原位
+    @Volatile
+    private var curScrollIndex = 0
+
+    @Volatile
+    private var curScrollOffset = 0
+
+    /** UI 每次列表滚动后上报位置（首可见项下标 + 像素偏移）。 */
+    fun updateScroll(index: Int, offset: Int) {
+        curScrollIndex = index
+        curScrollOffset = offset
+    }
+
+    /**
+     * UI 在数据版本 [version] 渲染后领取滚动指令：返回"恢复位置"（返回上一页）或
+     * null（回顶部）。同一版本只发一次——Navigation 在进阅读页后会销毁本页组合、
+     * 返回时重建，LaunchedEffect 会重新执行；版本未变时必须返回"无需滚动"，
+     * 让 rememberSaveable 恢复的位置得以保留。
+     */
+    fun pendingScrollAction(version: Int): ScrollRestore? {
+        if (version <= scrollHandledVersion) return null
+        scrollHandledVersion = version
+        val restore = pendingScrollRestore
+        pendingScrollRestore = null
+        return restore
+    }
+
+    private fun syncBackStackDepth() {
+        _state.update { it.copy(backStackDepth = history.size) }
+    }
+
+    private fun pushHistory(current: UiState) {
+        if (history.size >= MAX_HISTORY) history.removeFirst()
+        history.addLast(HistoryEntry(current.path, current.page, curScrollIndex, curScrollOffset))
+        syncBackStackDepth()
+    }
+
     init {
         _state.update { it.copy(serverSummary = appRef.serverSummary) }
         load("/")
@@ -67,10 +127,47 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     /**
      * 加载指定目录的指定页：取消上一次未完成的加载，避免旧响应覆盖新状态
      * （快速连点面包屑/文件夹/翻页）。page 默认 1 = 进入新目录；翻页时带当前 path 调用。
+     * 切换目录时把离开处的（目录, 页码, 滚动位置）压入历史，供返回时恢复。
      */
     fun load(path: String, page: Int = 1) {
         loadJob?.cancel()
+        val snapshot = _state.value
+        val changingDir = path != snapshot.path
+        if (changingDir) pushHistory(snapshot)
+        startLoad(path, page, restore = null)
+    }
+
+    /**
+     * 返回上一页（系统返回键 / 顶栏返回箭头）：弹出历史栈并恢复离开时的目录、
+     * 页码与滚动位置；历史为空时退化为回到上一级目录。
+     */
+    fun navigateBack() {
+        val entry = history.removeLastOrNull()
+        if (entry == null) {
+            navigateUp()
+            return
+        }
+        syncBackStackDepth()
+        loadJob?.cancel()
+        val restore = ScrollRestore(entry.scrollIndex, entry.scrollOffset)
+        pendingScrollRestore = restore
+        startLoadInternal(entry.path, entry.page)
+    }
+
+    private fun startLoad(path: String, page: Int, restore: ScrollRestore?) {
+        // 每次加载都覆盖待恢复位置：失败的旧恢复请求不能泄漏到下一次成功加载
+        pendingScrollRestore = restore
+        startLoadInternal(path, page)
+    }
+
+    private fun startLoadInternal(path: String, page: Int) {
         val changingDir = path != _state.value.path
+        if (changingDir) {
+            // 换目录期间旧列表已离屏、不再上报滚动位置：清零，避免把上一目录的
+            // 位置错误快照进随后 push 的历史里（新列表组合后 snapshotFlow 会立即上报）
+            curScrollIndex = 0
+            curScrollOffset = 0
+        }
         // 同目录翻页失败时列表仍是旧页内容：页码指示必须跟着回退（见 catch 分支），
         // 否则会出现"指示第 3 页、显示第 2 页"的错位
         val restorePage = if (changingDir) 1 else _state.value.page
@@ -106,6 +203,7 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
                         scanning = response.scanning,
                         loading = false,
                         serverSummary = appRef.serverSummary,
+                        dataVersion = it.dataVersion + 1,
                     )
                 }
             } catch (cancelled: CancellationException) {
@@ -126,10 +224,16 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     }
 
     fun refresh() {
-        load(_state.value.path, _state.value.page)
+        loadJob?.cancel()
+        // 不走 load()：路径不变不入历史，且保留未消费的待恢复位置——
+        // "返回上一页"加载失败后点重试，成功时仍能恢复原页码与滚动位置
+        startLoad(_state.value.path, _state.value.page, restore = pendingScrollRestore)
     }
 
     fun navigateUp() {
+        // 加载中 parent 还是上一个目录的旧值：此时回上级会跳错目录
+        // （如"返回书库根目录"加载途中连按返回），等加载完成后再走
+        if (_state.value.loading) return
         val parent = _state.value.parent ?: return
         load(parent)
     }
@@ -216,6 +320,9 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     private companion object {
         /** 每页条目数（服务器 /files 的 limit 上限为 5000；页大小取小些便于按页翻找）。 */
         const val PAGE_SIZE = 100
+
+        /** 目录历史栈深度上限（防无限深度浏览撑爆内存）。 */
+        const val MAX_HISTORY = 32
 
         fun totalPagesOf(total: Int): Int = if (total <= 0) 1 else (total + PAGE_SIZE - 1) / PAGE_SIZE
     }

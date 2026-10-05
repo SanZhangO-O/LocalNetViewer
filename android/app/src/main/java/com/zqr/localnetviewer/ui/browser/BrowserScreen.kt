@@ -99,8 +99,9 @@ fun BrowserScreen(
     val openBook by vm.openBook.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    // 系统返回键 = 回到上一级目录；已在书库根目录时交给系统（退出 App）
-    BackHandler(enabled = state.parent != null) { vm.navigateUp() }
+    // 系统返回键 = 返回上一页（恢复离开时的页码与滚动位置）；无历史时回到上一级目录，
+    // 已在书库根目录且无历史时交给系统（退出 App）
+    BackHandler(enabled = state.parent != null || state.backStackDepth > 0) { vm.navigateBack() }
 
     LaunchedEffect(openBook) {
         openBook?.let {
@@ -144,9 +145,10 @@ fun BrowserScreen(
                     }
                 },
                 navigationIcon = {
-                    if (state.parent != null) {
-                        IconButton(onClick = vm::navigateUp) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "上一级")
+                    // 有目录历史就显示（即使在根目录，也可能还有"返回"可走，如面包屑跳回根后）
+                    if (state.parent != null || state.backStackDepth > 0) {
+                        IconButton(onClick = vm::navigateBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回上一页")
                         }
                     }
                 },
@@ -187,11 +189,33 @@ fun BrowserScreen(
                 )
                 state.entries.isEmpty() -> EmptyView("此目录为空")
                 else -> {
+                    // rememberLazyListState 内部用 rememberSaveable：进阅读页再返回时
+                    // 位置由 Saveable 恢复，因此"数据版本没变"时不能强行回顶
                     val listState = rememberLazyListState()
-                    // 换页数据真正到达后再回列表顶部：请求期内仍显示旧页内容，
-                    // 提前滚动会让旧列表无意义地跳顶
-                    LaunchedEffect(state.entries) {
-                        listState.scrollToItem(0)
+                    // 持续把滚动位置上报给 ViewModel（非 Compose 状态，避免每帧重组），
+                    // 离开目录时用它快照，"返回上一页"时才能恢复原位
+                    LaunchedEffect(listState) {
+                        snapshotFlow {
+                            listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset
+                        }.collect { (index, offset) -> vm.updateScroll(index, offset) }
+                    }
+                    // 数据版本变化 = 新一页/新目录数据真正到达：有待恢复位置就恢复
+                    // （返回上一页），否则回到顶部。版本已处理过（如从阅读页返回重建
+                    // 组合，effect 重新执行）时不滚动，保留 Saveable 恢复的位置。
+                    LaunchedEffect(state.dataVersion) {
+                        val restore = vm.pendingScrollAction(state.dataVersion)
+                        if (restore != null) {
+                            // 内容可能在离开后变化：越界位置收敛到末项，避免 scrollToItem 异常
+                            val maxIndex = (
+                                state.entries.size +
+                                    if (state.canOpenCurrentAsGallery) 1 else 0
+                                ) - 1
+                            val index = restore.index.coerceIn(0, maxIndex.coerceAtLeast(0))
+                            val offset = if (index == restore.index) restore.offset else 0
+                            listState.scrollToItem(index, offset.coerceAtLeast(0))
+                        } else {
+                            listState.scrollToItem(0)
+                        }
                     }
                     Column(modifier = Modifier.fillMaxSize()) {
                         LazyColumn(
