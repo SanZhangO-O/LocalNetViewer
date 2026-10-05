@@ -92,14 +92,13 @@ fun ReaderScreen(
     )
     val state by vm.state.collectAsStateWithLifecycle()
 
-    // 系统返回键（设计 6.3）：先关弹层 → 再退沉浸（出工具栏）→ 最后才离开阅读页。
-    // 没有这个处理时，沉浸态下按返回会直接退出阅读页、连工具栏都看不到。
+    // 系统返回键：先关弹层（目录/设置/搜索是模态，按返回先关掉）→ 直接离开阅读页。
+    // 沉浸态不拦返回：浏览内容时按返回应直接退出，工具栏用点击屏幕中央呼出。
     BackHandler(enabled = true) {
         when {
             state.tocOpen -> vm.closeToc()
             state.settingsOpen -> vm.closeSettings()
             state.searchOpen -> vm.closeSearch()
-            !state.overlayVisible -> vm.showOverlay()
             else -> onBack()
         }
     }

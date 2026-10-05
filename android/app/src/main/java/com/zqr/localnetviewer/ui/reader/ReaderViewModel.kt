@@ -585,10 +585,6 @@ class ReaderViewModel(
         _state.update { it.copy(overlayVisible = !it.overlayVisible) }
     }
 
-    fun showOverlay() {
-        _state.update { it.copy(overlayVisible = true) }
-    }
-
     fun openToc() {
         _state.update { it.copy(tocOpen = true) }
     }
