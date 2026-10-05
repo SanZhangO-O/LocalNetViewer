@@ -215,6 +215,7 @@ GalleryService::GalleryInfoResult GalleryService::register_folder(
     }
 
     std::string book_id = stable_hash("gallery:" + v, 16);
+    std::vector<std::string> pruned_ids;
     {
         std::unique_lock lk(mu_);
         Entry e;
@@ -230,7 +231,23 @@ GalleryService::GalleryInfoResult GalleryService::register_folder(
         e.page_count = static_cast<int>(images.size());
         e.updated_at = now_epoch();
         registry_[book_id] = std::move(e);
+        // 注册表上限（与 Python gallery.MAX_REGISTRY 一致）：每次 open-folder 都可能
+        // 新增一条，不设限则 galleries.json 随浏览过的目录数无限增长、整文件重写
+        // 耗时 O(n) 上涨。按最近更新时间淘汰；被淘汰 id 的 rev 记忆在锁外作废。
+        constexpr size_t kMaxRegistry = 5000;
+        if (registry_.size() > kMaxRegistry) {
+            std::vector<std::pair<double, std::string>> order;
+            order.reserve(registry_.size());
+            for (auto& [bid, ent] : registry_) order.push_back({ent.updated_at, bid});
+            std::sort(order.begin(), order.end());
+            size_t overflow = registry_.size() - kMaxRegistry;
+            for (size_t i = 0; i < overflow; i++) {
+                registry_.erase(order[i].second);
+                pruned_ids.push_back(order[i].second);
+            }
+        }
     }
+    for (auto& bid : pruned_ids) invalidate_rev_memo(bid);
     save_registry();
     // 本次注册用了自己的实时计数：作废该书可能残留的旧 rev 记忆
     invalidate_rev_memo(book_id);
@@ -501,50 +518,74 @@ LayoutBuildResult LayoutsService::build(const BookRef& ref, BookAdapter& adapter
         return make_result(e.pagemap, layout_id, doc.get(), false);
     }
 
-    // 固定版式 / 条漫：页集合每次实时枚举（不缓存页内容）
-    PageMap pm;
-    pm.book_id = ref.book_id;
+    // 固定版式 / 条漫：页集合每次实时枚举（不缓存页内容，设计 4.6）。
+    // 枚举本身可能是重活（strip 要探测每张图原始尺寸，CBR 要列目录），与 flow
+    // 同等对待：同一 (book_id, layout_id) 加锁避免并发重复枚举 + run_with_timeout
+    // 超时保护（超时 → PARSE_FAILED）。worker 必须自持配置/引用并自行打开适配器：
+    // 超时返回后调用方会立刻销毁传入的 adapter，捕获引用会让后台线程悬垂。
+    auto layout_lock = layout_locks_.acquire("layout:" + ref.book_id + ":" + layout_id);
+    const double parse_timeout = cfg_.limits.parse_timeout_s;
+    AppConfig cfg_copy = cfg_;
+    BookRef ref_copy = ref;
+    LayoutProfile prof_copy = prof;
+    PageMap pm = run_with_timeout(
+        parse_gate(),
+        [cfg = std::move(cfg_copy), bref = std::move(ref_copy), prof_w = prof_copy,
+         fonts = fonts_]() {
+            PageMap out;
+            out.book_id = bref.book_id;
+            out.mode = prof_w.mode;
+            out.created_at = 0.0;  // 与 Python 一致（见上）
+            auto own = [&] {
+                auto heavy = heavy_gate().acquire();  // 适配器构造可能是重活
+                AdapterEnv env;
+                env.fonts = fonts.get();
+                return create_adapter(cfg, bref, env);
+            }();
+            BookAdapter& ad = *own;
+            if (prof_w.mode == "strip") {
+                auto slices = ad.strip_pages(prof_w.avail_height(), prof_w.strip_overlap_px);
+                for (size_t i = 0; i < slices.size(); i++) {
+                    const StripPage& sp = slices[i];
+                    PageRecord rec;
+                    rec.page = static_cast<int>(i) + 1;
+                    rec.anchor[0] = 0;
+                    rec.anchor[1] = sp.image_index;
+                    rec.anchor[2] = static_cast<int>(sp.y0);
+                    rec.chapter_index = 0;
+                    rec.image_index = sp.image_index;
+                    rec.y0 = static_cast<double>(sp.y0);
+                    rec.height = static_cast<double>(sp.height);
+                    out.pages.push_back(std::move(rec));
+                }
+                if (!slices.empty()) {
+                    const StripPage& last = slices.back();
+                    out.end_anchor[0] = 0;
+                    out.end_anchor[1] = last.image_index;
+                    out.end_anchor[2] = static_cast<int>(last.y0 + last.height);
+                } else {
+                    out.end_anchor[0] = out.end_anchor[1] = out.end_anchor[2] = 0;
+                }
+            } else {
+                int total = ad.page_count();
+                for (int i = 0; i < std::max(0, total); i++) {
+                    PageRecord rec;
+                    rec.page = i + 1;
+                    rec.anchor[0] = 0;
+                    rec.anchor[1] = i;  // 对齐 Python：第 i+1 页锚点 (0, i, 0)
+                    rec.anchor[2] = 0;
+                    out.pages.push_back(std::move(rec));
+                }
+                out.end_anchor[0] = 0;
+                out.end_anchor[1] = std::max(0, total);
+                out.end_anchor[2] = 0;
+            }
+            out.total_pages = static_cast<int>(out.pages.size());
+            return out;
+        },
+        parse_timeout, "分页", "layout:" + ref.book_id + ":" + layout_id);
     pm.layout_id = layout_id;
-    pm.mode = prof.mode;
-    pm.created_at = 0.0;  // 与 Python 一致（见上）
-    if (prof.mode == "strip") {
-        auto slices = adapter.strip_pages(prof.avail_height(), prof.strip_overlap_px);
-        for (size_t i = 0; i < slices.size(); i++) {
-            const StripPage& sp = slices[i];
-            PageRecord rec;
-            rec.page = static_cast<int>(i) + 1;
-            rec.anchor[0] = 0;
-            rec.anchor[1] = sp.image_index;
-            rec.anchor[2] = static_cast<int>(sp.y0);
-            rec.chapter_index = 0;
-            rec.image_index = sp.image_index;
-            rec.y0 = static_cast<double>(sp.y0);
-            rec.height = static_cast<double>(sp.height);
-            pm.pages.push_back(std::move(rec));
-        }
-        if (!slices.empty()) {
-            const StripPage& last = slices.back();
-            pm.end_anchor[0] = 0;
-            pm.end_anchor[1] = last.image_index;
-            pm.end_anchor[2] = static_cast<int>(last.y0 + last.height);
-        } else {
-            pm.end_anchor[0] = pm.end_anchor[1] = pm.end_anchor[2] = 0;
-        }
-    } else {
-        int total = adapter.page_count();
-        for (int i = 0; i < std::max(0, total); i++) {
-            PageRecord rec;
-            rec.page = i + 1;
-            rec.anchor[0] = 0;
-            rec.anchor[1] = i;  // 对齐 Python：第 i+1 页锚点 (0, i, 0)
-            rec.anchor[2] = 0;
-            pm.pages.push_back(std::move(rec));
-        }
-        pm.end_anchor[0] = 0;
-        pm.end_anchor[1] = std::max(0, total);
-        pm.end_anchor[2] = 0;
-    }
-    pm.total_pages = static_cast<int>(pm.pages.size());
+    if (pm.book_id.empty()) pm.book_id = ref.book_id;
     LayoutEntry e{prof, std::move(pm)};
     disk_.put(ref.book_id, e);
     {

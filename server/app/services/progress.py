@@ -41,6 +41,10 @@ class ProgressStore:
         self.config = config
         self.path = config.cache_dir / "progress.json"
         self._lock = threading.RLock()
+        # 落盘串行化：save() 的快照与 os.replace 是分离的，两个并发 save
+        # （多个 PUT 或 flush）可能让旧快照最后落盘、还清掉 dirty，
+        # 于是 flush() 变成 no-op，最后一次 PUT 在重启后丢失
+        self._save_lock = threading.Lock()
         self._data: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
         self._last_save = 0.0
@@ -62,6 +66,11 @@ class ProgressStore:
             self._data = {}
 
     def save(self, *, force: bool = False) -> bool:
+        """串行化入口：同一时刻只允许一次"快照 + 落盘"，见 _save_lock。"""
+        with self._save_lock:
+            return self._save_locked(force=force)
+
+    def _save_locked(self, *, force: bool = False) -> bool:
         """把进度落盘。
 
         ``progress.json`` 是整文件重写，而连续翻页会不停 PUT；因此两次写入之间

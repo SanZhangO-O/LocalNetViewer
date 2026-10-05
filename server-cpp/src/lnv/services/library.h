@@ -1,5 +1,6 @@
 #pragma once
 // 书库服务：扫描、索引、目录列表、book_id 查找（对应 Python services/library.py）
+#include <functional>
 #include <shared_mutex>
 #include "lnv/auth.h"  // AccessScope（按密码访问不同书库，设计 9）
 #include "lnv/config.h"
@@ -65,8 +66,13 @@ public:
     // 书库不在访问范围内 → 抛 BadPath（与"书库不存在"不可区分）
     void ensure_path_allowed(const std::string& vpath, const AccessScope* allowed) const;
 
-    // book_id 查找（含图集注册表里的虚拟书）；不存在 → nullopt
-    std::optional<BookRef> require_book(const std::string& book_id) const;
+    // book_id 查找（含图集注册表里的虚拟书）；不存在 → nullopt。
+    // allow 非空时逐个过滤候选 vpath：索引里同一 book_id 可能有多条路径
+    // （文件移动残留 / 跨书库同指纹副本），主路径不可见时必须继续找可见副本，
+    // 否则公开凭据会遇到"列表看得到、打开 404"；主路径可用时不做全索引扫描。
+    std::optional<BookRef> require_book(
+        const std::string& book_id,
+        const std::function<bool(const std::string&)>& allow = nullptr) const;
 
     // 内容变化监听（对应 Python library.py::add_content_listener）：文件的
     // size/mtime 变化时通知上层丢弃该 book_id 的全部派生缓存（布局/解析/页面图/封面）。

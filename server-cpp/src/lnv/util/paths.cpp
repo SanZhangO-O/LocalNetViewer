@@ -24,6 +24,16 @@ std::string to_lower(std::string s) {
 }
 }  // namespace
 
+bool is_safe_id(const std::string& value) {
+    if (value.empty() || value.size() > 64) return false;
+    for (unsigned char c : value) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 std::string url_unquote(const std::string& s) {
     std::string out;
     out.reserve(s.size());

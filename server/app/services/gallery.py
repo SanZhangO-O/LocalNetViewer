@@ -32,6 +32,11 @@ GALLERY_PREFIX = "gallery:"
 GALLERY_FORMAT = "gallery"
 DEFAULT_SKIP = ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]
 
+# 注册表上限：每次 open-folder 都可能新增一条，无上限时 galleries.json 会随
+# 浏览过的目录数持续增长，且每次注册整文件重写的耗时 O(n) 同步上涨。
+# 与 progress.json 的 5000 条上限同一策略：按最近更新时间淘汰。
+MAX_REGISTRY = 5000
+
 # 目录图片数枚举很贵（recursive 模式要遍历整棵子树），而 /books/{id}、封面与
 # 翻页请求都会调 resolve()。按 book_id 记忆 (目录 mtime, 图片数, revision)，
 # 目录 mtime 未变且距上次校验 < 2s 时复用；register/forget 主动失效。
@@ -71,6 +76,9 @@ class GalleryService:
         self.library = library
         self.path = config.gallery_registry_path
         self._lock = threading.RLock()
+        # 注册/落盘串行化：保证"取快照 + 写盘"期间没有第二个保存者插入，
+        # 最后一次落盘必然包含之前所有注册（book_id 是哈希，覆盖丢条目无法反推）
+        self._save_lock = threading.Lock()
         self._registry: Dict[str, Dict[str, Any]] = {}
         # resolve() 的短时记忆：{book_id: (dir_mtime, image_count, revision, checked_at)}
         self._memo: Dict[str, tuple] = {}
@@ -91,11 +99,13 @@ class GalleryService:
             self._registry = {}
 
     def save_registry(self) -> None:
-        # 同一把锁内取快照并写盘：注册表很小，避免并发 register/forget 时
-        # 写坏 galleries.json（损坏后 load_registry 会清空，所有虚拟书 id 失效）
-        with self._lock:
-            payload = json.dumps(self._registry, ensure_ascii=False, indent=1)
-            tmp = self.path.with_suffix(".tmp")
+        # 快照 + 写盘在 _save_lock 内串行化（不会出现"旧快照后落盘"丢注册），
+        # 但快照后写盘时不持 _lock：resolve()/翻页等热路径不被整文件重写阻塞。
+        # tmp 名带进程 + 时间戳，进程内并发由 _save_lock 保证，跨进程也不互撞。
+        with self._save_lock:
+            with self._lock:
+                payload = json.dumps(self._registry, ensure_ascii=False, indent=1)
+            tmp = self.path.with_suffix(f".tmp{os.getpid()}.{time.time_ns()}")
             try:
                 makedirs_quiet(self.path.parent)
                 tmp.write_text(payload, encoding="utf-8")
@@ -108,6 +118,19 @@ class GalleryService:
 
     def registry_size(self) -> int:
         return len(self._registry)
+
+    def _prune_registry_locked(self) -> None:
+        """注册表超过 MAX_REGISTRY 时按最近更新时间淘汰（调用方需持锁）。"""
+        overflow = len(self._registry) - MAX_REGISTRY
+        if overflow <= 0:
+            return
+        ordered = sorted(
+            self._registry.items(),
+            key=lambda item: float(item[1].get("updated_at", 0.0)),
+        )
+        for key, _ in ordered[:overflow]:
+            self._registry.pop(key, None)
+            self._memo.pop(key, None)
 
     # ------------------------------------------------------------ 注册
     def register(self, vpath: str, recursive: Optional[bool] = None) -> Dict[str, Any]:
@@ -159,6 +182,7 @@ class GalleryService:
             }
             # 注册刚重新枚举过，旧记忆必须作废（recursive 标志可能也变了）
             self._memo.pop(book_id, None)
+            self._prune_registry_locked()
             # 在同一临界区内取副本：否则并发 forget() 会让这里 KeyError
             entry = dict(self._registry[book_id])
         self.save_registry()

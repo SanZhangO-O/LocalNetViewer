@@ -1,5 +1,42 @@
 # 踩坑记录（LESSONS）
 
+## 2026-10-05 C++ 移植漏掉 Python 的缓存键校验，未鉴权即可任意删除 *.json.gz
+- 现象: C++ 版 `GET /books/x/pages/1/meta?layout_id=../../foo`（query 值无任何
+  校验）触发 `LayoutsDiskCache::get` 拼出 `cache/layouts/x/../../foo.json.gz`，
+  解压/身份校验失败后 `remove()` 该路径；带盘符的分量（`D:/x`）经
+  `std::filesystem::operator/` 会整体替换路径。默认配置（有公开书库）未鉴权可达，
+  可删任意可读的 `*.json.gz`（含 Python 版共享的 layouts/parsed 缓存）。
+- 根因: Python v0.4.1 已修（`util/paths.is_safe_id` + `cache/store.py` 全入口校验），
+  C++ 移植时没有对应实现；`layout_id` 是客户端可控输入却只在内存缓存里当字符串用，
+  只有磁盘路径会拼接它。
+- 修复: `util/paths` 新增 `is_safe_id`（`[A-Za-z0-9_-]{1,64}`），
+  `LayoutsDiskCache::get/put`、`ParsedCache::get/put`、`invalidate_book` 前置校验，
+  非法值按未命中处理、绝不构造/删除路径。
+- 防再犯: 移植安全修复时要"按数据类型"扫全部落点（这里：所有把外部输入拼进文件
+  路径的地方），不能只迁移被点名的那个函数；C++/Python 差分审查应把
+  Python 的安全工具函数逐个对照是否存在。
+
+## 2026-10-05 Android 一次 /locate 瞬断 = 永久丢阅读位置
+- 现象: 打开书时网络抖动，`/locate` 失败被 `getOrDefault(1)` 吞掉 → 定位到第 1 页，
+  恢复锚点/比例随即被清空；300ms 后防抖把 page=1 写进本地进度，旧位置永久丢失。
+- 根因: "恢复定位失败"被当成"没有进度"处理；且排版中（totalPages=0、currentPage
+  还是默认 1）按 Home 时 `saveProgressNow` 无守卫，也会把进度覆盖成第 1 页。
+- 修复: locate 失败原样抛出（保留 restoreAnchor，ErrorView 可重试）；
+  `saveProgressNow` 在 `layoutId==null || totalPages<=0` 时直接返回。
+- 防再犯: 所有"失败回退默认值"的 `getOrDefault` 都要问一句"默认值会不会被当成
+  真实数据写回持久层"；进度类状态在"数据未就绪"阶段禁止落盘。
+
+## 2026-10-05 C++ fixed/strip 补超时：worker 不能捕获调用方 adapter
+- 现象（修复过程中）: 给 C++ `/layout` 的 fixed/strip 分支补 `run_with_timeout` 时，
+  若沿用 Python 的写法（lambda 捕获调用方传入的 `BookAdapter&`），超时返回后路由
+  会销毁该 adapter，后台 worker 继续使用即悬垂。
+- 根因: C++ `open_adapter` 返回 `unique_ptr`（调用方独占），Python 的适配器生命周期
+  较宽松；两边的所有权模型不同。
+- 修复: worker 自持 `AppConfig`/`BookRef` 副本并自行 `create_adapter`（与
+  `document_internal` 同款），超时后不依赖调用方栈上对象。
+- 防再犯: 往 `run_with_timeout` 里放捕获时必须逐个确认捕获对象的生命周期能覆盖
+  "超时后台继续跑"；借用引用一律改按值/shared_ptr 或让 worker 自建。
+
 ## 2026-10-05 文件移动后旧索引残留同指纹条目，require_book 永远 404
 - 现象: 客户端能看到书（/files 列表正常、book_id 正确），但打开/封面一律 404
   「书不存在或已被移除」；换密码/重启都无效。日志里 `/books/{id}/meta -> 404 1ms`。

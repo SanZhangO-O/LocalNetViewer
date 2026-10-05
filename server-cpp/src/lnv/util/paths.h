@@ -39,6 +39,13 @@ bool is_symlink_or_junction(const std::filesystem::path& p);
 
 bool is_hidden_name(const std::string& name);
 
+// 缓存键（book_id / layout_id）安全校验：只接受 ``[A-Za-z0-9_-]{1,64}``。
+// 这些 id 会被直接拼进缓存文件路径，非法值（含分隔符/点号/盘符，如
+// ``../../parsed/x``）可以越出缓存目录，而损坏缓存隔离逻辑会对拼出的路径做
+// remove()，等于任意删除。调用方对非法值必须按“未命中/无效”处理，绝不能
+// 构造或删除路径。对齐 Python ``app/util/paths.py::is_safe_id``（DESIGN v0.4.1）。
+bool is_safe_id(const std::string& value);
+
 // ---- 外部工具 / 命令行（Win32）----
 // 只在 PATH 的显式目录里查找 base_name + ".exe"（返回宽路径，找不到为空）。
 // 不能用 SearchPathW(nullptr,...)：其搜索序含 exe 目录/进程 CWD，同名 exe 可被

@@ -6,6 +6,8 @@
 #include <miniz.h>
 #include <process.h>  // _getpid
 
+#include "lnv/util/paths.h"  // is_safe_id（缓存键拼路径前的安全校验）
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -219,6 +221,8 @@ void enforce_dir_quota(const std::filesystem::path& dir, long long max_bytes,
 // ------------------------------------------------------------------ ParsedCache
 
 std::optional<DocumentModel> ParsedCache::get(const std::string& book_id) const {
+    // 非法 id 绝不能构造路径：损坏隔离会 remove() 拼出来的文件（任意删除）
+    if (!is_safe_id(book_id)) return std::nullopt;
     std::filesystem::path path =
         dir_ / (book_id + "." + kParsedCacheVersion + ".json.gz");
     std::string raw;
@@ -248,7 +252,7 @@ std::optional<DocumentModel> ParsedCache::get(const std::string& book_id) const 
 }
 
 void ParsedCache::put(const DocumentModel& doc) {
-    if (doc.book_id.empty()) return;
+    if (doc.book_id.empty() || !is_safe_id(doc.book_id)) return;
     std::filesystem::path path =
         dir_ / (doc.book_id + "." + kParsedCacheVersion + ".json.gz");
     std::string plain = doc.to_dict().dump();  // 紧凑分隔符，非 ASCII 原样输出
@@ -265,6 +269,9 @@ void ParsedCache::put(const DocumentModel& doc) {
 
 std::optional<LayoutEntry> LayoutsDiskCache::get(const std::string& book_id,
                                                  const std::string& layout_id) const {
+    // 客户端可控的 layout_id（以及 book_id）直接拼进路径，必须先校验字符集：
+    // 非法值按未命中处理，下面的 fail() 才不会 remove 到缓存目录之外的文件
+    if (!is_safe_id(book_id) || !is_safe_id(layout_id)) return std::nullopt;
     std::filesystem::path path = dir_ / book_id / (layout_id + ".json.gz");
     std::string raw;
     // 文件读取不加锁（同 ParsedCache::get，审查 M7）
@@ -283,6 +290,9 @@ std::optional<LayoutEntry> LayoutsDiskCache::get(const std::string& book_id,
     } catch (...) {
         return fail();
     }
+    // 合法 JSON 但非对象（null / [] / "x"）也要按损坏处理：nlohmann 的
+    // value() 对非对象会抛 type_error，不隔离的话该 layout 永远 500
+    if (!data.is_object()) return fail();
     // 身份校验：拿到别的书 / 别的 layout 的 PageMap 比没有缓存更糟
     std::string bid = data.value("book_id", std::string());
     std::string lid = data.value("layout_id", std::string());
@@ -303,6 +313,7 @@ void LayoutsDiskCache::put(const std::string& book_id, const LayoutEntry& entry)
     // layout_id 以 pagemap 内记录为准（与 Python 写入 payload["layout_id"] 一致）
     std::string layout_id = entry.pagemap.layout_id;
     if (layout_id.empty()) return;
+    if (!is_safe_id(book_id) || !is_safe_id(layout_id)) return;
     nlohmann::json payload = {
         {"book_id", book_id},
         {"layout_id", layout_id},
@@ -319,6 +330,7 @@ void LayoutsDiskCache::put(const std::string& book_id, const LayoutEntry& entry)
 }
 
 void LayoutsDiskCache::invalidate_book(const std::string& book_id) {
+    if (!is_safe_id(book_id)) return;  // remove_all 前同样不得拼非法路径
     std::error_code ec;
     std::filesystem::remove_all(dir_ / book_id, ec);
 }

@@ -608,8 +608,9 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
             entries.begin() + std::min<size_t>(start + (size_t)lim, entries.size()));
         nlohmann::json libs = nlohmann::json::array();
         for (auto& lc : libraries_info(allowed)) {
+            // path 一律不下发（设计 9：真实文件系统路径不出网；与 /server/info 一致）
             libs.push_back(
-                {{"name", lc.name}, {"book_count", lc.book_count}, {"path", *lc.path}});
+                {{"name", lc.name}, {"book_count", lc.book_count}, {"path", nullptr}});
         }
         return {
             {"path", "/"},
@@ -667,33 +668,89 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
         return static_cast<int>(count);
     };
 
-    std::vector<std::filesystem::directory_entry> entries_raw;
+    const auto& patterns = cfg_.comic.skip_entries;
+    int min_images = std::max(1, cfg_.gallery.min_images_in_folder);
+
+    // ---- 第一阶段：枚举 + 按名字分类（不 stat / 不算指纹 / 不数图片）----
+    // 与 Python list_dir 的两阶段一致：分页不仅裁剪响应体，也裁剪服务器每页成本。
+    // 旧实现对整目录每个条目做 stat / 读 1MB 头算 book_id / 数子目录图片后再切片，
+    // 几万文件的目录翻第 2 页也要重跑一遍全量重活。
+    struct RawEntry {
+        std::string name;
+        std::filesystem::directory_entry ent;
+    };
+    std::vector<RawEntry> dirs_raw, files_raw;
     try {
         std::error_code iec;
         std::filesystem::directory_iterator it(real, iec), end;
         if (iec) throw std::runtime_error("open");
         for (; it != end; it.increment(iec)) {
             if (iec) throw std::runtime_error("read");
-            entries_raw.push_back(*it);
+            std::string name = u8_name(it->path());
+            if (is_hidden_name(name)) continue;
+            std::error_code sec;
+            if (it->is_symlink(sec) || sec) { sec.clear(); continue; }
+            const bool is_dir = it->is_directory(sec);
+            if (sec) { sec.clear(); continue; }
+            if (is_dir) {
+                dirs_raw.push_back({name, *it});
+                continue;
+            }
+            const std::string ext = ext_of(name);
+            if (is_image_ext(ext) && cfg_.gallery.show_image_files) {
+                if (!should_skip_entry(name, patterns))
+                    files_raw.push_back({name, *it});
+                continue;
+            }
+            const char* fmt = known_format_of(ext);
+            if (!fmt) {
+                if (cfg_.library.show_all_files) files_raw.push_back({name, *it});
+                continue;
+            }
+            if (std::find(cfg_.library.include_ext.begin(), cfg_.library.include_ext.end(),
+                          ext) == cfg_.library.include_ext.end() &&
+                !cfg_.library.show_all_files)
+                continue;
+            files_raw.push_back({name, *it});
         }
     } catch (const std::exception&) {
         throw AppError(ErrorCode::BadPath, "目录无法读取: " + v);
     }
 
-    const auto& patterns = cfg_.comic.skip_entries;
-    int min_images = std::max(1, cfg_.gallery.min_images_in_folder);
-    std::vector<nlohmann::json> dirs, files;
+    auto raw_less = [](const RawEntry& a, const RawEntry& b) {
+        return natural_key_less_local(a.name, b.name);
+    };
+    std::sort(dirs_raw.begin(), dirs_raw.end(), raw_less);
+    std::sort(files_raw.begin(), files_raw.end(), raw_less);
+    std::vector<RawEntry> listing;
+    listing.reserve(dirs_raw.size() + files_raw.size());
+    for (auto& d : dirs_raw) listing.push_back(std::move(d));
+    for (auto& f : files_raw) listing.push_back(std::move(f));
 
-    for (const auto& e : entries_raw) {
+    int total = static_cast<int>(listing.size());
+    long long off = std::max<long long>(0, offset);
+    int lim = std::max(1, limit);
+    size_t start = off > (long long)listing.size() ? listing.size() : (size_t)off;
+    size_t end_idx = std::min<size_t>(start + (size_t)lim, listing.size());
+
+    // ---- 第二阶段：只对页内条目做重活（stat / 指纹 / 子目录图片数）----
+    std::vector<nlohmann::json> page;
+    page.reserve(end_idx > start ? end_idx - start : 0);
+    for (size_t idx = start; idx < end_idx; idx++) {
+        const RawEntry& raw_entry = listing[idx];
+        const std::filesystem::directory_entry& e = raw_entry.ent;
         std::error_code ec2;
-        std::string name = u8_name(e.path());
-        if (is_hidden_name(name)) continue;
-        if (e.is_symlink(ec2) || ec2) { ec2.clear(); continue; }
+        std::string name = raw_entry.name;
         bool is_dir = e.is_directory(ec2);
         if (ec2) { ec2.clear(); continue; }
-        long long size = static_cast<long long>(e.file_size(ec2));
-        if (ec2) size = 0;
-        double mtime = path_mtime(e.path());
+        long long size = 0;
+        double mtime = 0.0;
+        if (!is_dir) {
+            std::error_code stat_ec;
+            size = static_cast<long long>(e.file_size(stat_ec));
+            if (stat_ec) continue;  // 恰在列出后消失：跳过（Python 同；total 不变）
+            mtime = path_mtime(e.path());
+        }
         std::string child_vpath = join_vpath(v, {name});
 
         if (is_dir) {
@@ -708,7 +765,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
                 reason = std::string("目录名服务器不支持：") + exc.what();
             }
             bool can_open = cfg_.gallery.folder_as_book && img_count >= min_images && navigable;
-            dirs.push_back({
+            page.push_back({
                 {"name", name},
                 {"type", "dir"},
                 {"path", child_vpath},
@@ -748,7 +805,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
                 norm_vpath = child_vpath;
             }
             std::string book_id = stable_hash("gallery:" + norm_vpath, 16);
-            files.push_back({
+            page.push_back({
                 {"name", name},
                 {"type", "image"},
                 {"path", child_vpath},
@@ -767,7 +824,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
         const char* fmt = known_format_of(ext);
         if (!fmt) {
             if (cfg_.library.show_all_files) {
-                files.push_back({
+                page.push_back({
                     {"name", name},
                     {"type", "file"},
                     {"path", child_vpath},
@@ -844,7 +901,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
         // 对应 Python library.py:536-549 的 registry.openable_reason(fmt)：
         // 恒 true 会让客户端把打不开的书显示成可点，点进去才报 415。
         std::optional<std::string> unopenable = openable_reason(fmt_s);
-        files.push_back({
+        page.push_back({
             {"name", name},
             {"type", "book"},
             {"path", child_vpath},
@@ -858,24 +915,6 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
             {"reason", unopenable ? nlohmann::json(*unopenable) : nlohmann::json(nullptr)},
         });
     }
-
-    std::sort(dirs.begin(), dirs.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
-        return natural_key_less_local(a["name"].get<std::string>(), b["name"].get<std::string>());
-    });
-    std::sort(files.begin(), files.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
-        return natural_key_less_local(a["name"].get<std::string>(), b["name"].get<std::string>());
-    });
-    std::vector<nlohmann::json> entries = std::move(dirs);
-    entries.insert(entries.end(), std::make_move_iterator(files.begin()),
-                   std::make_move_iterator(files.end()));
-
-    int total = static_cast<int>(entries.size());
-    long long off = std::max<long long>(0, offset);
-    int lim = std::max(1, limit);
-    size_t start = off > (long long)entries.size() ? entries.size() : (size_t)off;
-    std::vector<nlohmann::json> page(
-        entries.begin() + start,
-        entries.begin() + std::min<size_t>(start + (size_t)lim, entries.size()));
 
     int gcount = dir_gallery_info(v, real);
     bool can_open_root = cfg_.gallery.folder_as_book && gcount >= min_images;
@@ -975,38 +1014,55 @@ std::optional<BookRef> LibraryService::build_ref_for_vpath(const std::string& vp
     return ref;
 }
 
-std::optional<BookRef> LibraryService::require_book(const std::string& book_id) const {
+std::optional<BookRef> LibraryService::require_book(
+    const std::string& book_id,
+    const std::function<bool(const std::string&)>& allow) const {
     std::string bid = book_id;
     size_t b = bid.find_first_not_of(" \t\r\n");
     if (b == std::string::npos) return std::nullopt;
     size_t e = bid.find_last_not_of(" \t\r\n");
     bid = bid.substr(b, e - b + 1);
 
-    // 主 vpath：id_to_vpath_ 的映射；兜底：索引里同指纹的其余 vpath。
-    // 文件被移动后旧索引仍残留"id → 旧路径"（load_index 同指纹后写者覆盖，
-    // 键序决定旧路径可能胜出），主 vpath 解析失败时同一 book_id 在新路径下
-    // 仍是同一本书（指纹 = size + 文件头 1MB），应当交付而非 404。
-    std::vector<std::string> candidates;
+    auto allowed = [&](const std::string& vp) { return !allow || allow(vp); };
+
+    // 主 vpath 可用时直接交付，不做全索引扫描（大索引下每个翻页请求 O(n)）。
+    std::string primary;
+    bool has_primary = false;
     {
         std::shared_lock lk(mu_);
         auto it = id_to_vpath_.find(bid);
-        if (it != id_to_vpath_.end()) candidates.push_back(it->second);
-        for (const auto& [vp, book] : by_vpath_) {
-            if (book.book_id != bid) continue;
-            if (candidates.size() >= 8) break;  // 防御：异常重复指纹只试前几个
-            if (candidates.empty() || candidates.front() != vp) candidates.push_back(vp);
+        if (it != id_to_vpath_.end()) {
+            primary = it->second;
+            has_primary = true;
         }
     }
-    for (size_t i = 0; i < candidates.size(); ++i) {
-        auto ref = build_ref_for_vpath(candidates[i], bid);
+    if (has_primary && allowed(primary)) {
+        auto ref = build_ref_for_vpath(primary, bid);
+        if (ref) return ref;
+    }
+
+    // 兜底：索引里同指纹的其余路径。文件被移动后旧索引仍残留"id → 旧路径"
+    // （load_index 同指纹后写者覆盖，键序决定旧路径可能胜出），主路径解析失败
+    // 或不在访问范围内时，同一 book_id 在新路径下仍是同一本书（指纹 = size +
+    // 文件头 1MB），应当交付而非 404。
+    std::vector<std::string> fallbacks;
+    {
+        std::shared_lock lk(mu_);
+        for (const auto& [vp, book] : by_vpath_) {
+            if (book.book_id != bid) continue;
+            if (has_primary && vp == primary) continue;
+            if (!allowed(vp)) continue;
+            fallbacks.push_back(vp);
+        }
+    }
+    for (const auto& vp : fallbacks) {
+        auto ref = build_ref_for_vpath(vp, bid);
         if (ref) {
-            if (i != 0) {
-                // 晋升活跃路径：后续请求直接命中，不再走兜底扫描
-                auto& mutable_ids =
-                    const_cast<std::unordered_map<std::string, std::string>&>(id_to_vpath_);
-                std::unique_lock lk(mu_);
-                mutable_ids[bid] = candidates[i];
-            }
+            // 晋升活跃路径：后续请求直接命中，不再走兜底扫描
+            auto& mutable_ids =
+                const_cast<std::unordered_map<std::string, std::string>&>(id_to_vpath_);
+            std::unique_lock lk(mu_);
+            mutable_ids[bid] = vp;
             return ref;
         }
     }

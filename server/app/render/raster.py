@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -81,16 +82,18 @@ def theme_of(name: Optional[str]) -> Theme:
 
 
 def clamp_scale(scale: float, profile: LayoutProfile, max_page_pixels: int) -> float:
+    """把渲染倍率限制在 0.5–2.0，并保证画布像素数不超过 ``max_page_pixels``。
+
+    旧实现在 0.5 处停下：viewport 异常大（如 100000×100000）时，
+    0.5 倍仍是 25 亿像素的画布（RGB ≈ 7.5GB），未鉴权请求即可打爆内存。
+    这里按像素上限直接解出可用倍率（可低于 0.5），画布大小因此有硬上界。
+    """
     s = max(0.5, min(2.0, float(scale or 1.0)))
     if not max_page_pixels:
         return s
-    while s > 0.5:
-        w = profile.viewport.w * s
-        h = profile.viewport.h * s
-        if w * h <= max_page_pixels:
-            break
-        s = round(s - 0.05, 2)
-    return max(0.5, s)
+    pixels = max(1, int(profile.viewport.w) * int(profile.viewport.h))
+    max_scale = math.sqrt(float(max_page_pixels) / float(pixels))
+    return max(1e-3, min(s, max_scale))
 
 
 def is_photo_page(items: Sequence[Item], content_area: float, avail_w: float = 0.0) -> bool:

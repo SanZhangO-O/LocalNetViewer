@@ -131,7 +131,9 @@ async def book_asset(
     # 先校验书籍可见性：否则其他书库的 book_id 会命中 304 分支泄露资源存在性
     ref = await ctx.require_book_async(book_id, scope)
     safe = safe_asset_path(path)
-    asset_etag = f'"{book_id}:asset:{stable_hash(safe)}"'
+    # ETag / URL 带上内容修订号：等长就地编辑（book_id 不变、rev 变）后
+    # 内嵌图片的强缓存必须失效，否则 JSON 模式会一直显示旧图
+    asset_etag = f'"{book_id}:{ref.revision}:asset:{stable_hash(safe)}"'
     if _etag_matches(if_none_match, asset_etag):
         return Response(
             status_code=304,

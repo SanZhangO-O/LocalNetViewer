@@ -48,7 +48,8 @@ async def list_files(
             LibraryInfo(
                 name=str(lib.get("name", "")),
                 book_count=int(lib.get("book_count", 0)),
-                path=lib.get("path"),
+                # 真实文件系统路径不下发（设计 9；与 /server/info 一致）
+                path=None,
             )
             for lib in data["libraries"]
         ]

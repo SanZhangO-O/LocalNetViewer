@@ -19,7 +19,7 @@ library:
       # password: ""        # 公开书库：不输入密码也能看到它
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
-  sort: natural             # 目录优先 + 数字感知自然排序
+  sort: natural             # 目录优先 + 数字感知自然排序（当前仅支持 natural）
   # 扫描模式（Python 与 C++ 服务器共用；两者行为一致）：
   #   lazy  —— 不做启动全量扫描；用户列出哪个目录，才扫描该目录（默认）
   #   eager —— 启动时全量扫描一次（并启用目录变化监听）

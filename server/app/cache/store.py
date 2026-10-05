@@ -83,6 +83,11 @@ class LayoutStore:
             # 损坏缓存（含 UnicodeDecodeError）直接丢弃
             self._quarantine(path)
             return None
+        # 合法 JSON 但非对象（null / [] / "x"）也要按损坏隔离：直接在它上面
+        # 调 .get() 会抛 AttributeError → 该 layout 永远 500 且不会自愈
+        if not isinstance(data, dict):
+            self._quarantine(path)
+            return None
         # 校验身份：拿到别的书/别的 layout 的 PageMap 比没有缓存更糟
         if str(data.get("book_id") or "") not in ("", book_id):
             self._quarantine(path)

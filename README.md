@@ -3,7 +3,7 @@
 局域网电子书阅读系统：**PC 上的 Python 服务器负责书库管理、格式解析、分页与页面渲染；
 Android 客户端通过 IP 连接服务器，浏览文件并"逐页"阅读电子书与漫画，书籍不整本下载。**
 
-完整设计见 [DESIGN.md](DESIGN.md)（v0.3）。
+完整设计见 [DESIGN.md](DESIGN.md)（v0.6）。
 
 ```
 LocalNetViewer/

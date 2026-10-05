@@ -33,9 +33,10 @@ double clamp_scale(double scale, const LayoutProfile& profile, long long max_pag
 ImageBytes text_cover(const std::string& title, const std::optional<std::string>& author,
                       int width, FontManager* fonts);
 
-// JSON 模式页（§4.7 build_page_json）
+// JSON 模式页（§4.7 build_page_json）；revision 非空时 asset URL 带 &rev=
+// （内容变化后 URL 变化，客户端强缓存自然失效，与 Python jsonout.asset_url 一致）
 nlohmann::json build_page_json(const DocumentModel& doc, const PageMap& pm, int page,
                                const LayoutProfile& profile, FontManager* fonts,
-                               const std::string& book_id);
+                               const std::string& book_id, const std::string& revision = "");
 
 }  // namespace lnv

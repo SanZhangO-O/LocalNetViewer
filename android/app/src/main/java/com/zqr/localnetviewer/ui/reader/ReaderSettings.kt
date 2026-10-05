@@ -61,8 +61,13 @@ enum class ReadingDirection(val id: String, val label: String) {
  * 打开一本书时（工具栏默认可见）第一行正文会被顶栏盖住 —— 底栏早就预留了 48dp，
  * 顶栏漏了。始终预留的代价是沉浸态下上下各留一条主题背景，换来的是
  * "显隐工具栏不触发重新分页"（设计 4.6 的明确意图）。
+ *
+ * 底栏高度必须按**实际实现**预留：ReaderOverlay 的底栏是
+ * 8 + 页码行(≈20) + Material3 Slider(最小交互尺寸 48) + 8 ≈ 84dp，
+ * 旧的 48dp 会让最后一行正文被底栏盖住（与 v0.3 顶栏 64dp 同类修复）。
+ * 导航栏 inset 由 margin 的 max(marginV, insets.bottom) 另行覆盖，不重复计算。
  */
-const val OVERLAY_BOTTOM_DP = 48
+const val OVERLAY_BOTTOM_DP = 88
 const val OVERLAY_TOP_DP = 64
 
 /**

@@ -28,7 +28,6 @@ from .services.progress import ProgressStore
 from .services.search import SearchService
 from .services.watcher import LibraryWatcher
 from .util import imaging
-from .util.paths import PathError
 from .api.errors import AppError
 
 logger = logging.getLogger("localnetviewer")
@@ -120,20 +119,12 @@ class AppContext:
             await asyncio.to_thread(_quiet_close, adapter)
 
     # ------------------------------------------------------------ 书籍
-    def _scope_allows(self, ref: BookRef, scope: Optional[AccessScope]) -> bool:
-        """书籍所在书库是否在凭据允许范围内（书库名为空 / 非法视为不允许）。"""
-        if scope is None:
-            return True
-        try:
-            name = self.library.root_name_of(ref.vpath)
-        except PathError:
-            return False
-        return scope.allows_root(name)
-
     def require_book(self, book_id: str, scope: Optional[AccessScope] = None) -> BookRef:
-        ref = self.library.book_by_id(book_id)
-        # 不在访问范围内的书与不存在同样报 404：不能靠 book_id 访问其他书库的内容
-        if ref is None or not self._scope_allows(ref, scope):
+        # 范围过滤下沉到 book_by_id：同一 book_id 在索引里可能有多条路径
+        # （移动残留 / 跨书库同指纹副本），必须跳过不可见路径继续找可见副本，
+        # 否则公开凭据会遇到"列表看得到、打开 404"。
+        ref = self.library.book_by_id(book_id, scope)
+        if ref is None:
             raise AppError(
                 ErrorCode.BOOK_NOT_FOUND, "书不存在或已被移除", {"book_id": book_id}
             )

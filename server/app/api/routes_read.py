@@ -211,7 +211,7 @@ async def get_page(
     format: str = Query(default="png", description="png(默认) | json"),
     theme: str = Query(default="white"),
     scale: float = Query(default=1.0, ge=0.5, le=2.0),
-    fit: str = Query(default="viewport", description="viewport | original（固定版式）"),
+    fit: Optional[str] = Query(default=None, description="viewport | original（缺省用配置 comic.default_fit）"),
     quality: Optional[int] = Query(default=None, ge=1, le=100),
     pair: int = Query(default=0, ge=0, le=1),
     rtl: int = Query(default=0, ge=0, le=1),
@@ -224,7 +224,8 @@ async def get_page(
     fmt = (format or "png").lower()
     if fmt not in VALID_FORMATS:
         raise AppError(ErrorCode.BAD_REQUEST, f"format 只支持 {'/'.join(VALID_FORMATS)}", {"format": format})
-    fit_mode = (fit or "viewport").lower()
+    default_fit = str(getattr(ctx.config.comic, "default_fit", "") or "viewport")
+    fit_mode = (fit or default_fit).lower()
     if fit_mode not in VALID_FITS:
         raise AppError(ErrorCode.BAD_REQUEST, f"fit 只支持 {'/'.join(VALID_FITS)}", {"fit": fit})
 
@@ -290,6 +291,8 @@ async def get_page(
                     entry.profile,
                     ctx.fonts,
                     ref.book_id,
+                    True,
+                    ref.revision,
                 )
             except ParseTimeoutError as exc:
                 _mark_orphan(exc, adapter)
@@ -344,20 +347,33 @@ def _is_fixed_mode(entry) -> bool:
 
 @router.get("/books/{book_id}/pages/{page}/meta", response_model=PageMetaResponse)
 async def page_meta(
+    response: Response,
     book_id: str,
     page: int,
     layout_id: str = Query(...),
+    if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
     scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> PageMetaResponse:
     """页元数据（锚点、章节名、页码）；客户端翻页停稳后请求一次（防抖）。"""
+    # 先校验书籍可见性：layout_id 是几何哈希、与书籍无关，先查 layout 会让
+    # 不可见书库的 book_id 变成一个"layout/page 是否存在"的探测口
+    # （越界页返回 404 + total_pages），与"不可见 = 不存在"的要求冲突。
+    ref = await ctx.require_book_async(book_id, scope)
     entry = await ctx.require_layout_async(book_id, layout_id)
     _check_page(entry, page)
     record = entry.pagemap.record(page)
     assert record is not None
-    # 先校验书籍可见性再返回首行文本 / 长宽比：layout_id 与书籍无关（几何哈希），
-    # 不校验的话其他书库的 book_id 也能读到正文首行
-    ref = await ctx.require_book_async(book_id, scope)
+    # 页元数据同样带 ETag + immutable（设计 5.4）：锚点只随 layout_id/rev/页号变化，
+    # 未变化时客户端可凭 If-None-Match 拿到 304，不必每页重传。
+    base_etag = ctx.page_etag(
+        layout_id, ref.revision, page, fixed=entry.pagemap.mode != "flow"
+    )
+    etag = base_etag[:-1] + ':meta"'
+    headers = {"ETag": etag, "Cache-Control": PAGE_CACHE_CONTROL}
+    if _etag_matches(if_none_match, etag):
+        return Response(status_code=304, headers=headers)  # type: ignore[return-value]
+    response.headers.update(headers)
     aspect: Optional[float] = None
     if entry.pagemap.mode in ("fixed", "strip"):
         # 条漫页是"切片"，页号 != 源图序号，必须用记录的源图索引取长宽比
@@ -391,8 +407,9 @@ async def locate(
     ctx=Depends(get_ctx),
 ) -> LocateResponse:
     """锚点 → 页码（重新布局 / 恢复进度用，设计 3.3 / 5.3）。"""
-    entry = await ctx.require_layout_async(book_id, layout_id)
+    # 同 page_meta：先校验书籍可见性，再查 layout（不可见书与不存在不可区分）
     await ctx.require_book_async(book_id, scope)
+    entry = await ctx.require_layout_async(book_id, layout_id)
     data = anchors_mod.locate(entry.pagemap, (chapter, block, char))
     return LocateResponse(**data)
 

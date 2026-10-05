@@ -145,6 +145,9 @@ class ReaderViewModel(
     private val prefetchSlots = Semaphore(PREFETCH_CONCURRENCY)
     private var prefetchJob: Job? = null
 
+    /** 当前搜索结果对应的 layout_id：重排后旧页码失效，需要用锚点重新定位。 */
+    private var searchLayoutId: String? = null
+
     init {
         viewModelScope.launch {
             val settings = settingsStore.current()
@@ -282,9 +285,12 @@ class ReaderViewModel(
                 ?: ratioFor(snapshot.currentPage, snapshot.totalPages)
             val total = max(1, layout.totalPages)
             val target = when {
+                // locate 失败（瞬断/5xx）不能回落到第 1 页：随后 800ms 防抖会把
+                // page=1 写成进度，一次网络抖动就永久丢阅读位置。原样抛给
+                // handleFatal → ErrorView/重试，恢复锚点保留给下一次重排。
                 anchor != null -> runCatchingIo {
                     readerRepository.locate(bookId, layout.layoutId, anchor).page
-                }.getOrDefault(1)
+                }.getOrThrow()
                 fallbackRatio != null && fallbackRatio > 0f -> {
                     (fallbackRatio * layout.totalPages).roundToInt().coerceAtLeast(1)
                 }
@@ -375,12 +381,23 @@ class ReaderViewModel(
             prefetchAround(page)
             scheduleProgressSave(page)
         }
+        // 重排失败（离线等）后 currentSignature 会一直与新设置不匹配；阅读页没有
+        // 可见的重试入口，用户每次翻页时补一次重排尝试，恢复在线后自动收敛
+        val wanted = currentSignature()
+        if (wanted != null && wanted != currentSignature &&
+            relayoutJob?.isActive != true && !recovering
+        ) {
+            scheduleRelayout(300)
+        }
     }
 
     private suspend fun fetchPageMeta(page: Int) {
         val layoutId = _state.value.layoutId ?: return
         try {
             val meta = readerRepository.pageMeta(bookId, page, layoutId, _state.value.revision)
+            // 过期响应防护：等待期间用户可能已经翻页或重排（onPageImageFailed 的
+            // 恢复请求不受 settleJob 取消约束），把 currentPage 拉回旧页会打断阅读
+            if (_state.value.layoutId != layoutId || _state.value.currentPage != page) return
             // 锚点必须和它所属的页一起记录，否则翻页后立刻退出会把"新页码 + 旧锚点"存下来
             anchorPage = meta.page
             _state.update {
@@ -414,7 +431,10 @@ class ReaderViewModel(
         val snapshot = _state.value
         val ratio = ratioFor(snapshot.currentPage, snapshot.totalPages)
         _state.update { it.copy(message = message) }
-        viewModelScope.launch {
+        // 与 scheduleRelayout 共用同一个 relayoutJob：用户改设置/旋转触发的重排
+        // 会取消正在进行的恢复，避免两份不同参数的 /layout 响应互相覆盖
+        relayoutJob?.cancel()
+        relayoutJob = viewModelScope.launch {
             try {
                 rebuildLayout(
                     anchorOverride = sessionAnchor() ?: restoreAnchor,
@@ -536,7 +556,15 @@ class ReaderViewModel(
     fun updateSettings(new: AppSettings) {
         val old = _state.value.settings
         _state.update { it.copy(settings = new) }
-        // 整体覆盖写入：new 是包含全部字段的完整设置（这里不使用变换参数）
+        // 切换双页跨页会改变 spreadStep（Pager 下标 ↔ 页码映射），必须把
+        // currentPage 对齐到新步长的"屏首页"：否则 61|62 关跨页后 index 不变、
+        // 页码变成 31，并把错误页码写进进度；开启时则成倍前跳。
+        // （pairPages 不进几何签名，不会触发重新分页。）
+        val aligned = _state.value.let { it.pageOfIndex(it.indexOfPage(it.currentPage)) }
+        if (aligned != _state.value.currentPage) {
+            _state.update { it.copy(currentPage = aligned) }
+            onPageSettled(aligned, immediate = true)
+        }
         // 落盘失败不影响本次阅读（内存中的设置已生效）
         viewModelScope.launch { runCatchingIo { settingsStore.update { new } } }
         val geometryChanged = old.geometrySignature() != new.geometrySignature()
@@ -629,6 +657,8 @@ class ReaderViewModel(
                 val response = readerRepository.search(bookId, keyword, layoutId)
                 // launch 被取消时这里不会执行；再核对一次关键词，双保险
                 if (_state.value.searchQuery != keyword) return@launch
+                // 记录结果对应的 layout：之后若发生重排，openSearchResult 改用锚点定位
+                searchLayoutId = layoutId
                 _state.update {
                     it.copy(
                         searching = false,
@@ -656,13 +686,31 @@ class ReaderViewModel(
     }
 
     fun openSearchResult(item: SearchResultDto) {
+        val snapshot = _state.value
+        val currentLayout = snapshot.layoutId
         val page = item.page
-        if (page != null && page > 0) {
+        if (page != null && page > 0 && searchLayoutId == currentLayout) {
             jumpToPage(page)
             _state.update { it.copy(searchOpen = false) }
-        } else {
-            _state.update { it.copy(message = "该结果暂无页码，请先加载排版") }
+            return
         }
+        // 搜索后发生过重排：旧 page 属于旧 layout_id，直接跳会落到错误的页。
+        // 结果里带锚点，用当前 layout 重新 /locate 定位。
+        if (currentLayout != null) {
+            _state.update { it.copy(searchOpen = false, message = "排版已更新，正在定位…") }
+            viewModelScope.launch {
+                runCatchingIo {
+                    readerRepository.locate(
+                        bookId,
+                        currentLayout,
+                        AnchorDto(chapter = item.chapterIndex, block = item.block, char = item.char),
+                    ).page
+                }.onSuccess { jumpToPage(it) }
+                    .onFailure { _state.update { s -> s.copy(message = "定位失败：${it.message}") } }
+            }
+            return
+        }
+        _state.update { it.copy(message = "该结果暂无页码，请先加载排版") }
     }
 
     // ------------------------------------------------------------ 进度
@@ -676,8 +724,12 @@ class ReaderViewModel(
 
     /** onStop 时立即落盘（设计 6.5）。 */
     fun saveProgressNow() {
-        val page = _state.value.currentPage
-        viewModelScope.launch { persistProgress(page) }
+        val snapshot = _state.value
+        // 首次排版尚未完成（totalPages=0，currentPage 还是默认 1）时不能落盘：
+        // 在打开大书/图集的过程中按 Home/切后台会把旧进度覆盖成第 1 页。
+        // 重排期间 totalPages 仍是旧值、currentPage 仍然有效，可以正常保存。
+        if (snapshot.layoutId == null || snapshot.totalPages <= 0) return
+        viewModelScope.launch { persistProgress(snapshot.currentPage) }
     }
 
     /**

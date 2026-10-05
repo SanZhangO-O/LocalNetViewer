@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import posixpath
 import tarfile
@@ -781,9 +782,13 @@ class ComicAdapter(FixedAdapter):
         if img.width > target_w:  # 只缩小，不放大（省流量，客户端 ContentScale.Fit 展示）
             img = imaging.fit_width(img, target_w)
         prefer_jpeg = mime != "image/png" or not _has_alpha(img)
-        return imaging.encode_image(
-            img, prefer_jpeg=prefer_jpeg, quality=quality or self.jpeg_quality
-        )
+        q = quality or self.jpeg_quality
+        encoded = imaging.encode_image(img, prefer_jpeg=prefer_jpeg, quality=q)
+        if fit == "original" and self.max_page_bytes and len(encoded[0]) > self.max_page_bytes:
+            # 原图超单页字节上限：提高质量参数不够（PNG/照片重编码后仍可能超），
+            # 必须真正按字节预算缩小（设计 4.2"超出强制缩放"）。
+            encoded = _shrink_to_byte_cap(img, prefer_jpeg, q, self.max_page_bytes)
+        return encoded
 
     def cover(self, width: int = 0) -> Optional[Tuple[bytes, str]]:
         if self.page_count() < 1:
@@ -908,3 +913,25 @@ def _has_alpha(img) -> bool:
         return img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
     except Exception:
         return False
+
+
+def _shrink_to_byte_cap(
+    img, prefer_jpeg: bool, quality: int, cap: int, attempts: int = 4
+) -> Tuple[bytes, str]:
+    """把已编码仍超字节上限的图片逐步缩小重编码，直到落入上限（尽力而为）。
+
+    单次缩放比例按 ``sqrt(cap / size)`` 估算（字节数≈像素数×常数），
+    每次至少缩 1 像素，避免估算偏差导致原地打转；到上限仍打不住就返回
+    最后一版（至少比原图小），不会无限重试。
+    """
+    data, mime = imaging.encode_image(img, prefer_jpeg=prefer_jpeg, quality=quality)
+    for _ in range(max(0, attempts)):
+        if len(data) <= cap:
+            break
+        ratio = min(0.95, math.sqrt(float(cap) / float(len(data))) * 0.95)
+        new_w = max(1, int(img.width * ratio))
+        if new_w >= img.width:
+            new_w = max(1, img.width - 1)
+        img = imaging.fit_width(img, new_w)
+        data, mime = imaging.encode_image(img, prefer_jpeg=prefer_jpeg, quality=quality)
+    return data, mime

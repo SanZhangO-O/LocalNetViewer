@@ -208,9 +208,34 @@ class EpubAdapter(FlowAdapter):
         return posixpath.normpath(posixpath.join(base_dir, href))
 
     # ------------------------------------------------------------ 模型加载
+    def _check_archive_limits(self) -> None:
+        """整包解压上限预检（zip 中央目录的声明值）。
+
+        ebooklib 的 ``read_epub`` 会把 manifest 里每个条目（含图片）整块读入内存；
+        自有的 ``_read_guarded`` 只覆盖手写读取路径，管不到它。压缩包守卫必须
+        在这里补上，否则一个 30MB 的 EPUB 声明 20GB 条目就能把服务器内存打爆
+        （设计 9 / 7.4 的 zip 炸弹防护）。
+        """
+        limits = self.env.config.limits
+        entry_limit = int(limits.max_archive_entry_mb or 0) * 1024 * 1024
+        total_limit = int(limits.max_archive_total_mb or 0) * 1024 * 1024
+        total = 0
+        for info in self._zip.infolist():
+            size = int(info.file_size or 0)
+            if entry_limit and size > entry_limit:
+                raise ParseError(
+                    f"EPUB 条目超过上限（{entry_limit // 1048576}MB）: {info.filename}"
+                )
+            total += size
+            if total_limit and total > total_limit:
+                raise ParseError(
+                    f"EPUB 解压总量超过上限（{total_limit // 1048576}MB）"
+                )
+
     def model(self) -> _EpubModel:
         if self._model is not None:
             return self._model
+        self._check_archive_limits()
         loaded = self._load_with_ebooklib()
         if loaded is None or not loaded.docs:
             loaded = self._load_with_zip()

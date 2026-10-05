@@ -16,8 +16,12 @@ from ..layout.fonts import FontManager
 from ..models.schemas import LayoutProfile
 
 
-def asset_url(book_id: str, asset: str) -> str:
-    return f"/api/v1/books/{book_id}/asset?path={quote(asset, safe='')}"
+def asset_url(book_id: str, asset: str, revision: str = "") -> str:
+    url = f"/api/v1/books/{book_id}/asset?path={quote(asset, safe='')}"
+    if revision:
+        # 带修订号：内容变化（rev 变）后 URL 变化，客户端强缓存自然失效
+        url += f"&rev={quote(str(revision), safe='')}"
+    return url
 
 
 def build_page_json(
@@ -28,6 +32,7 @@ def build_page_json(
     fonts: FontManager,
     book_id: Optional[str] = None,
     include_font: bool = True,
+    revision: str = "",
 ) -> Dict[str, Any]:
     record = pagemap.record(page)
     if record is None:
@@ -79,7 +84,7 @@ def build_page_json(
             blocks.append(
                 {
                     "type": "image",
-                    "asset": asset_url(bid, item.asset),
+                    "asset": asset_url(bid, item.asset, revision),
                     "display_w": round(float(item.display_w), 2),
                     "display_h": round(float(item.display_h), 2),
                     "y": round(float(item.y), 2),

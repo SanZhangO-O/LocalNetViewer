@@ -38,6 +38,7 @@ from ..util.paths import (
     resolve_in_root,
 )
 from ..util.textutil import content_revision
+from .access import AccessScope
 from . import gallery as gallery_mod
 from .access import AccessScope
 
@@ -860,36 +861,57 @@ class LibraryService:
             revision=content_revision(bid, size, mtime),
         )
 
-    def book_by_id(self, book_id: str) -> Optional[BookRef]:
+    def book_by_id(
+        self, book_id: str, allowed: Optional[AccessScope] = None
+    ) -> Optional[BookRef]:
         bid = str(book_id or "").strip()
         if not bid:
             return None
+
+        def visible(vpath: str) -> bool:
+            if allowed is None:
+                return True
+            try:
+                name = self.root_name_of(vpath)
+            except PathError:
+                return False
+            return allowed.allows_root(name)
+
+        # 主路径优先；只有它失效/不可见时才扫描兜底。索引里同一 book_id 可能
+        # 残留多条路径（文件移动后未重扫），而 _by_id 指向的那条未必在当前凭据
+        # 可见书库内：不按范围过滤就会"列表里看得到、打开 404"（两个书库有同一
+        # 本书的副本时必现）。反过来，主路径可用时不做全索引扫描，避免大索引下
+        # 每个翻页请求都 O(n)。
         with self._lock:
             primary = self._by_id.get(bid)
-            # 主 vpath 之外，索引里可能残留同一 book_id 的旧路径（文件被移动后
-            # 未重扫：load_index 同指纹后写者覆盖，键序决定旧路径可能胜出）。
-            # 指纹 = size + 文件头 1MB，同指纹在别的活跃路径下仍是同一本书，
-            # 主路径失效时应交付新路径而非 404。
+        if primary and visible(primary):
+            with self._lock:
+                info = dict(self._books.get(primary, {}))
+            ref = self._ref_from_vpath(primary, bid, info)
+            if ref is not None:
+                return ref
+
+        with self._lock:
             fallbacks = [
                 vp
                 for vp, b in self._books.items()
                 if str(b.get("book_id") or "") == bid and vp != primary
-            ][:8]
-        for i, vpath in enumerate([primary] + fallbacks if primary else fallbacks):
-            if not vpath:
+            ]
+        for vpath in fallbacks:
+            if not visible(vpath):
                 continue
             with self._lock:
                 info = dict(self._books.get(vpath, {}))
             ref = self._ref_from_vpath(vpath, bid, info)
             if ref is not None:
-                if i > 0:
-                    # 晋升活跃路径：后续请求直接命中，不再走兜底扫描
-                    with self._lock:
-                        self._by_id[bid] = vpath
+                # 晋升活跃路径：后续请求直接命中，不再走兜底扫描
+                with self._lock:
+                    self._by_id[bid] = vpath
                 return ref
+
         if self.gallery is not None:
             ref = self.gallery.resolve(bid)
-            if ref is not None:
+            if ref is not None and visible(ref.vpath):
                 return ref
         return None
 

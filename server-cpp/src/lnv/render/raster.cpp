@@ -67,17 +67,17 @@ Theme theme_of(const std::string& theme_name) {
 // ============================================================ scale clamp
 }  // namespace
 
-// §4.7 clamp_scale：clamp 0.5..2.0，超 max_page_pixels 时每次 -0.05
+// §4.7 clamp_scale：clamp 0.5..2.0，并保证画布像素数不超过 max_page_pixels。
+// 旧实现在 0.5 处停下：viewport 异常大（如 100000×100000）时 0.5 倍仍是
+// 25 亿像素画布（RGB ≈ 7.5GB）。按像素上限直接解出可用倍率（可低于 0.5），
+// 与 Python render/raster.py::clamp_scale 一致。
 double clamp_scale(double scale, const LayoutProfile& profile, long long max_page_pixels) {
     double s = std::max(0.5, std::min(2.0, scale > 0.0 ? scale : 1.0));
     if (max_page_pixels <= 0) return s;
-    while (s > 0.5) {
-        const double w = profile.viewport.w * s;
-        const double h = profile.viewport.h * s;
-        if (w * h <= double(max_page_pixels)) break;
-        s = std::round((s - 0.05) * 100.0) / 100.0;
-    }
-    return std::max(0.5, s);
+    const double pixels =
+        std::max(1.0, double(profile.viewport.w) * double(profile.viewport.h));
+    const double max_scale = std::sqrt(double(max_page_pixels) / pixels);
+    return std::max(0.001, std::min(s, max_scale));
 }
 
 namespace {
@@ -550,7 +550,7 @@ std::string url_encode_path(const std::string& s) {
 
 nlohmann::json build_page_json(const DocumentModel& doc, const PageMap& pm, int page,
                                const LayoutProfile& profile, FontManager* fonts,
-                               const std::string& book_id) {
+                               const std::string& book_id, const std::string& revision) {
     const PageRecord* record = pm.record(page);
     if (record == nullptr) throw std::out_of_range("页码越界: " + std::to_string(page));
     // Python jsonout.build_page_json 的 fonts 是必填 FontManager（引擎内部无条件
@@ -617,7 +617,10 @@ nlohmann::json build_page_json(const DocumentModel& doc, const PageMap& pm, int 
                 item.image_block ? item.image_block->asset : std::string();
             nlohmann::json block = nlohmann::json::object();
             block["type"] = "image";
-            block["asset"] = "/api/v1/books/" + bid + "/asset?path=" + url_encode_path(asset);
+            std::string asset_url = "/api/v1/books/" + bid + "/asset?path=" +
+                                    url_encode_path(asset);
+            if (!revision.empty()) asset_url += "&rev=" + url_encode_path(revision);
+            block["asset"] = asset_url;
             block["display_w"] = py_num(item.display_w, 2);
             block["display_h"] = py_num(item.display_h, 2);
             block["y"] = 0;  // 下方统一回填

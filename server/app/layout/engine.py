@@ -281,9 +281,11 @@ class FlowLayoutEngine:
         for ci in range(max(0, ch_start), len(self.doc.chapters)):
             chapter = self.doc.chapters[ci]
             yield ChapterMark(chapter=ci, title=chapter.title or "")
-            for bi, block in enumerate(chapter.blocks):
-                if ci == ch_start and bi < blk_start:
-                    continue
+            # 直接从锚点块起步：旧实现每页都从块 0 enumerate 再 continue 跳过，
+            # 单章长文（几十万块）分页退化成 O(块数 × 页数)（设计 4.6 要求线性扫描）
+            bi_start = max(0, blk_start) if ci == ch_start else 0
+            for bi in range(bi_start, len(chapter.blocks)):
+                block = chapter.blocks[bi]
                 if block.type == BLOCK_IMAGE:
                     item = self._image_item(ci, bi, block)
                     if item is not None:

@@ -66,22 +66,37 @@ void AppContext::shutdown() {
 
 std::optional<BookRef> AppContext::require_book(const std::string& book_id,
                                                 const AccessScope* scope) const {
+    const bool need_scope = scope != nullptr && !scope->all;
+    // 范围过滤下沉到 require_book：索引里同一 book_id 可能有多条路径
+    // （移动残留 / 跨书库同指纹副本），必须跳过不可见路径继续找可见副本，
+    // 否则公开凭据会遇到"列表看得到、打开 404"。
+    std::function<bool(const std::string&)> allow;
+    if (need_scope) {
+        allow = [scope](const std::string& vpath) {
+            return scope->allows(LibraryService::root_name_of(vpath));
+        };
+    }
+    auto not_found = [&]() -> AppError {
+        return AppError(ErrorCode::BookNotFound, "书不存在或已被移除",
+                        nlohmann::json{{"book_id", book_id}});
+    };
     // 图集虚拟书优先（不在 library 索引里，注册表见 cache/galleries.json）
     auto ref = gallery->book_ref(book_id);
-    if (!ref) ref = library->require_book(book_id);
+    if (!ref) ref = library->require_book(book_id, allow);
     // 不在访问范围内的书与不存在同样报 404：不能靠 book_id 访问其他书库的内容
-    if (ref && scope != nullptr && !scope->all &&
-        !scope->allows(LibraryService::root_name_of(ref->vpath))) {
+    if (ref && need_scope && !scope->allows(LibraryService::root_name_of(ref->vpath))) {
         ref.reset();
     }
-    if (!ref) {
-        throw AppError(ErrorCode::BookNotFound, "书不存在或已被移除",
-                       nlohmann::json{{"book_id", book_id}});
-    }
+    if (!ref) throw not_found();
     if (ref->virtual_book) return ref;  // 图集书无指纹校验
     // 指纹校验（size/mtime 变化 → 重算 book_id；变化则由 library 更新索引）
     auto refreshed = library->refresh_book(book_id);
-    if (refreshed) return refreshed;
+    if (refreshed) {
+        if (need_scope &&
+            !scope->allows(LibraryService::root_name_of(refreshed->vpath)))
+            throw not_found();
+        return refreshed;
+    }
     return ref;
 }
 
@@ -203,9 +218,11 @@ std::string AppContext::page_cache_key(const std::string& book_id, const std::st
 
 bool AppContext::etag_matches(const std::string* header_value, const std::string& etag) {
     if (!header_value || header_value->empty()) return false;
-    size_t b = header_value->find_first_not_of(" \t");
-    if (b == std::string::npos) return false;
-    std::string v = *header_value;
+    // 整体 trim 后再判断 "*"；与 Python routes_read.py::_etag_matches 一致
+    size_t vb = header_value->find_first_not_of(" \t");
+    size_t ve = header_value->find_last_not_of(" \t");
+    if (vb == std::string::npos) return false;
+    std::string v = header_value->substr(vb, ve - vb + 1);
     if (v == "*") return true;
     size_t i = 0;
     while (i <= v.size()) {
@@ -217,7 +234,12 @@ bool AppContext::etag_matches(const std::string* header_value, const std::string
         size_t pe = part.find_last_not_of(" \t");
         if (pb == std::string::npos) continue;
         part = part.substr(pb, pe - pb + 1);
-        if (part.rfind("W/", 0) == 0) part = part.substr(2);
+        if (part.rfind("W/", 0) == 0) {
+            part = part.substr(2);
+            // "W/ \"etag\""（W/ 后有空白）也要能匹配（Python candidate[2:].strip()）
+            size_t wb = part.find_first_not_of(" \t");
+            part = wb == std::string::npos ? std::string() : part.substr(wb);
+        }
         if (part == etag) return true;
     }
     return false;

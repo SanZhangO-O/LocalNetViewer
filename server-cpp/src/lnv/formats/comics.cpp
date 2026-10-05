@@ -3,6 +3,7 @@
 #include "lnv/util/imaging.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace lnv {
@@ -55,6 +56,26 @@ static ImageBuf crop_slice(const ImageBuf& src, long long y0, long long height) 
         const auto* s = src.rgba.data() + ((size_t)(top + y) * src.w) * 4;
         auto* d = out.rgba.data() + (size_t)y * out.w * 4;
         std::memcpy(d, s, (size_t)out.w * 4);
+    }
+    return out;
+}
+
+// 编码后仍超单页字节上限时逐步缩小重编码（对应 Python comics._shrink_to_byte_cap）。
+// 单次缩放比例按 sqrt(cap/size) 估算（字节数≈像素数×常数），每次至少缩 1 像素。
+static ImageBytes shrink_to_byte_cap(const ImageBuf& img, bool prefer_jpeg, int quality,
+                                     long long cap, int attempts = 4) {
+    EncodeOpts opts;
+    opts.prefer_jpeg = prefer_jpeg;
+    opts.jpeg_quality = quality;
+    ImageBuf cur = img;
+    ImageBytes out = encode_image(cur, opts);
+    for (int i = 0; i < attempts && (long long)out.bytes.size() > cap; i++) {
+        double ratio = std::sqrt((double)cap / (double)out.bytes.size()) * 0.95;
+        if (ratio > 0.95) ratio = 0.95;
+        int new_w = std::max(1, (int)(cur.w * ratio));
+        if (new_w >= cur.w) new_w = std::max(1, cur.w - 1);
+        cur = fit_width(cur, new_w);
+        out = encode_image(cur, opts);
     }
     return out;
 }
@@ -235,10 +256,18 @@ ImageBytes ComicAdapter::page_bytes(int page, const std::string& fit, int qualit
 
     // 原 mime 非 PNG 或无透明 → JPEG，否则 PNG（保住透明）
     bool prefer_jpeg = mime != "image/png" || !img.has_alpha;
+    const int q = quality > 0 ? quality : jpeg_quality_;
     EncodeOpts opts;
     opts.prefer_jpeg = prefer_jpeg;
-    opts.jpeg_quality = quality > 0 ? quality : jpeg_quality_;
-    return encode_image(img, opts);
+    opts.jpeg_quality = q;
+    ImageBytes out = encode_image(img, opts);
+    if (fit == "original" && max_page_bytes_ > 0 &&
+        (long long)out.bytes.size() > max_page_bytes_) {
+        // 提高质量参数不够（PNG/照片重编码后仍可能超），必须按字节预算真正缩小
+        // （设计 4.2"超出强制缩放"；Python 同款 comics._shrink_to_byte_cap）
+        out = shrink_to_byte_cap(img, prefer_jpeg, q, max_page_bytes_);
+    }
+    return out;
 }
 
 std::optional<ImageBytes> ComicAdapter::cover(int width) {

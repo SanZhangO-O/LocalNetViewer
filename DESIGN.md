@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 版本 | v0.5（多书库访问密码；缺陷修正记录见 13 节） |
+| 版本 | v0.6（审查修复第四轮；缺陷修正记录见 13 节） |
 | 日期 | 2026-10-05 |
 | 状态 | 服务器与客户端均已实现；缺陷修正记录见 13 节 |
 | 范围 | 局域网电子书阅读系统：Python 服务器 + Android 客户端 |
@@ -1401,3 +1401,74 @@ Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）
   显示行为与合并前一致（完整显示）；
 - 回归：`android/app/src/test/.../ReaderFitModeDefaultTest`（默认值、绝不裁边、
   旧值兼容）、`ReaderFitModeMatrixTest`（模式矩阵）。
+
+### v0.6（2026-10-05，三端对抗性审查修复）
+
+对 Python / C++ / Android 三套实现做了一轮新审查（安全 / 功能 / 性能 / 一致性），
+修复下列问题。验证：`py_compile` 通过、`build.ps1` 构建通过、`assembleDebug`
+构建通过（按项目约定未跑测试套件）。
+
+**P0：C++ 缓存路径穿越可任意删除文件**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | C++ 未移植 Python v0.4.1 的 `is_safe_id`：客户端可控的 `layout_id`（`GET /books/x/pages/1/meta?layout_id=../../foo`，query 任意）被直接拼进缓存路径 `cache/layouts/{book_id}/{layout_id}.json.gz`，解析失败即 `remove()`；带盘符的分量还会整体替换路径。默认配置下未鉴权可达，可删除任意可读的 `*.json.gz` | `util/paths` 新增 `is_safe_id`（`[A-Za-z0-9_-]{1,64}`）；`LayoutsDiskCache::get/put`、`ParsedCache::get/put`、`invalidate_book` 全部前置校验，非法值按未命中处理，绝不构造/删除路径 |
+
+**P1：Python 服务器**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 2 | 跨书库同指纹副本屏蔽可见书：两库有同一本书（size + 头 1MB 相同 ⇒ 同 book_id）时 `_by_id` 指向后扫描的（通常私密库）路径，公开凭据列表能看到、打开 404；且 `book_by_id` 每次请求做全索引兜底扫描、截断 `[:8]`（多次移动后仍会 404） | `book_by_id(book_id, allowed)` 范围感知：主路径可用且可见时直接交付（热路径不再 O(n) 扫描），否则按序找可见兜底并晋升，去掉 `[:8]`；`context.require_book` 把 scope 传下去。C++ `LibraryService::require_book` 同步支持 `allow` 过滤 |
+| 3 | EPUB zip 炸弹防护被绕过：`ebooklib.read_epub` 会把 manifest 每个条目整块读入内存，自有 `_read_guarded` 只覆盖手写读取路径 | `epub.py::_check_archive_limits`：打开模型前按 zip 中央目录预检单条目（`max_archive_entry_mb`）与总量（`max_archive_total_mb`），超限直接 PARSE_FAILED |
+| 4 | `max_page_pixels` 形同虚设：Viewport 无上限、`clamp_scale` 最低 0.5，`100000×100000` 视口仍分配约 7.5GB 画布 | 两实现 `clamp_scale` 改为按 `sqrt(max_pixels / (w×h))` 解可用倍率（可低于 0.5），画布像素数有硬上界 |
+| 5 | 分页退化为 O(块数 × 页数)：`iter_items` 每页从章首第 0 块 `enumerate` 再 `continue` 跳过 | 从锚点块直接 `range` 起步（单章长文不再在跳过的块上耗时间） |
+| 6 | `fit=original` 超 `max_page_bytes` 只提高 JPEG 质量、保持原宽，编码后不复查（PNG 大图仍超限） | `comics._shrink_to_byte_cap`（C++ `shrink_to_byte_cap`）：按 `sqrt(cap/size)` 逐次缩小重编码直到落入上限 |
+
+**P1：C++ 服务器**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 7 | fixed/strip 的 `/layout` 无 `KeyedLocks`、无 `run_with_timeout`（flow 有，Python 两模式都有）：大图集/CBR 枚举可无限占用请求线程、并发重复枚举 | 加同款锁 + 超时；worker 自持 `cfg/ref` 并自行打开适配器（调用方超时返回后会销毁传入 adapter，捕获引用会悬垂） |
+| 8 | `/pages/{n}` 先构造适配器再查页缓存：CBR 命中缓存的翻页也会跑 `unrar` 列目录，可把 200 拖成 503/422 | flow 与 fixed 都改为缓存未命中才构造适配器 |
+| 9 | `/files` 分页是"全目录做完重活再切片"：几万文件的目录翻第 2 页也全量 stat + 读 1MB 头算指纹 + 数子目录图片 | 改两阶段（与 Python 同款）：第一阶段只按名字分类/自然排序/切片，第二阶段才对页内条目做重活；顺带修复"列出后消失的文件显示成 0 字节条目" |
+
+**P1：Android 客户端**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 10 | 打开书时 `/locate` 一次瞬断 → `getOrDefault(1)` 定位到第 1 页并清空恢复锚点，随后把 page=1 写成进度：一次抖动永久丢位置 | locate 失败原样抛出（ErrorView + 重试），恢复锚点保留到成功定位 |
+| 11 | 首次排版未完成（totalPages=0）时按 Home 会把旧进度覆盖成第 1 页 | `saveProgressNow` 无 layoutId / totalPages≤0 时不落盘 |
+| 12 | 切换双页跨页时 Pager 下标不变而步长变化：61\|62 关跨页后跳到第 31 页并写错进度，开启时成倍前跳 | `updateSettings` 用新步长把 `currentPage` 对齐到屏首页并即时取页元数据 |
+| 13 | 底栏实际高度约 84dp（页码行 + Material3 Slider 最小 48dp + padding），服务器只预留 48dp：最后一行正文被底栏盖住 | `OVERLAY_BOTTOM_DP` 48 → 88 |
+
+**P2（本轮修复）**
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 14 | meta/locate 先查 layout 后鉴权：不可见书库的 book_id 可借越界页响应探测 `total_pages` | 两实现先 `require_book` 再查 layout（与 `/pages` 一致） |
+| 15 | `/files?path=/` 的 `libraries` 带真实文件系统路径（`/server/info` 已剔除） | 两实现都不再下发 `path` |
+| 16 | 缓存文件是合法非对象 JSON（`null`/`[]`）时 `.get()/value()` 抛异常 → 该 layout 永远 500 且不自愈 | 两实现按损坏隔离（Python 校验 `isinstance(dict)`，C++ `is_object()`） |
+| 17 | `comic.default_fit` 配置解析后无实现（默认硬编码 viewport） | 两实现缺省 `fit` 取配置值（显式参数优先） |
+| 18 | `/asset` URL/ETag 不含 `rev`：等长编辑后 JSON 模式内嵌图片强缓存一年不更新 | ETag 加 `{book_id}:{rev}:asset:...`；`jsonout` asset URL 带 `&rev=`（C++ 同步） |
+| 19 | 页元数据无 ETag/Cache-Control（设计 5.4 要求同页面缓存策略） | 两实现返回 ETag（页面图片 ETag 追加 `:meta`）+ immutable，支持 If-None-Match → 304 |
+| 20 | 图集注册表无上限、注册时持锁整文件重写 | 两实现按最近更新淘汰（上限 5000）；Python 用独立 `_save_lock` 串行化"快照+落盘"（写盘不持 `_lock`，不丢注册） |
+| 21 | `progress.json` 并发保存可让旧快照后落盘并清 dirty，`flush()` 丢最后一次写入 | `ProgressStore.save` 用 `_save_lock` 串行化"快照 + os.replace" |
+| 22 | C++ `etag_matches` 未 trim 整体值/`W/` 后空白：`" * "`、`W/ "x"` 语义与 Python 不一致 | 补齐 trim（与 Python `_etag_matches` 一致） |
+| 23 | Android 页元数据的过期响应可把 Pager 拉回旧页；重排恢复与用户重排可并发；重排失败无重试入口；搜索结果不随重排失效 | `fetchPageMeta` 校验 layoutId/currentPage 后再应用；`recoverLayout` 复用 `relayoutJob`（可被新重排取消）；翻页时若签名不匹配补一次重排；搜索结果页码失效时改用锚点 `/locate` 定位 |
+
+**v0.6 验证方式**
+
+```bat
+cd server && .venv\Scripts\python -m py_compile app\...        :: 改动文件语法通过
+cd ..\server-cpp && powershell -ExecutionPolicy Bypass -File build.ps1   :: 构建通过
+cd ..\android && gradlew.bat :app:assembleDebug                            :: 构建通过
+```
+
+**仍然存在（v0.6 未修，均为已知取舍/低危）**：虚拟路径的二次 `unquote`
+（名字含 `%xx` 的真实目录不可达）；EPUB flow 路径的 OPF 前缀资源（重名 basename
+时取不到）与 `data:` URI 内联图片（整本可能 0 页）；C++ 自然排序与 Python 的
+Unicode 等价性（全角数字 / casefold）；C++ `/meta` 的 `size` 取 `ref.size`
+（Python 为 `meta.size or ref.size`，MOBI 下有差异）；C++ 鉴权先于参数校验
+（错误码优先级）；C++ `progress.get_any` 同秒记录的 tie-break；C++ fixed 页
+`aspect` 失败返回 `null`（Python `0.0`）；未知 font_id 的字体文件回退默认字体
+（两实现刻意一致）；`library.sort` 仅支持 `natural` 一种取值。

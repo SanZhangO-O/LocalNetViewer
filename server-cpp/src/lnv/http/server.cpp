@@ -487,7 +487,9 @@ void handle_asset(AppContext& ctx, const httplib::Request& req, httplib::Respons
     auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     const std::string safe = safe_asset_path(raw_path);
-    const std::string etag = "\"" + book_id + ":asset:" + stable_hash(safe, 16) + "\"";
+    // ETag 带内容修订号：等长就地编辑（book_id 不变、rev 变）后强缓存必须失效
+    const std::string etag =
+        "\"" + book_id + ":" + ref->rev + ":asset:" + stable_hash(safe, 16) + "\"";
     res.set_header("ETag", etag);
     res.set_header("Cache-Control", "public, max-age=31536000, immutable");
     if (ctx.etag_matches(inm_ptr(req), etag)) { res.status = 304; return; }
@@ -591,8 +593,13 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
     std::string format_raw =
         pv_str(v, qparam(req, "format"), {"query", "format"}, "png", false, 0);
     if (format_raw.empty()) format_raw = "png";
-    std::string fit_raw = pv_str(v, qparam(req, "fit"), {"query", "fit"}, "viewport", false, 0);
-    if (fit_raw.empty()) fit_raw = "viewport";
+    // fit 缺省值取配置 comic.default_fit（设计 4.2："default_fit: original" 必须
+    // 真的改变默认取页方式，旧实现硬编码 viewport 让该配置项形同虚设）
+    const std::string fit_default =
+        ctx.cfg.comic.default_fit.empty() ? std::string("viewport") : ctx.cfg.comic.default_fit;
+    std::string fit_raw =
+        pv_str(v, qparam(req, "fit"), {"query", "fit"}, fit_default, false, 0);
+    if (fit_raw.empty()) fit_raw = fit_default;
     const std::string format = lower_ascii(format_raw);
     const std::string fit = lower_ascii(fit_raw);
     if (format != "png" && format != "json")
@@ -629,11 +636,12 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
 
     // ---------------- flow ----------------
     if (!fixed) {
-        auto adapter = ctx.open_adapter(*ref);
         if (format == "json") {
             // JSON 模式仅 flow；不占页面图片缓存
+            auto adapter = ctx.open_adapter(*ref);
             auto doc = ctx.layouts->document(*ref, *adapter);
-            json j = build_page_json(doc, pm, page, entry.profile, ctx.fonts.get(), book_id);
+            json j = build_page_json(doc, pm, page, entry.profile, ctx.fonts.get(), book_id,
+                                     ref->rev);
             res.set_content(j.dump(), "application/json");
             return;
         }
@@ -644,6 +652,9 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
             mime = hit->substr(0, nl);
             bytes = hit->substr(nl + 1);
         } else {
+            // 缓存未命中才构造适配器：命中时构造会白跑一次容器打开
+            // （CBR 列目录等重活），可能把已缓存的翻页拖成 503/错误
+            auto adapter = ctx.open_adapter(*ref);
             auto doc = ctx.layouts->document(*ref, *adapter);
             RenderDeps deps;
             deps.fonts = ctx.fonts.get();
@@ -676,7 +687,6 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
                        "固定版式（PDF/漫画/图集）不支持 format=json，请使用 format=png",
                        json::object({{"mode", pm.mode}}));
 
-    auto adapter = ctx.open_adapter(*ref);
     // 渲染用配置质量；etag/key 中 quality 缺省为 nullopt
     const int render_q = quality.value_or(ctx.cfg.comic.jpeg_quality);
     // Python render/raster.py::fixed_page_bytes：scale 先折算进 viewport_w
@@ -698,6 +708,8 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
             auto nl = hit->find('\n');
             return {hit->substr(nl + 1), hit->substr(0, nl)};
         }
+        // 缓存未命中才构造适配器（同 flow 分支）：命中时构造会白跑一次容器打开
+        auto adapter = ctx.open_adapter(*ref);
         ImageBytes img;
         if (pm.mode == "strip") {
             // StripPage 从 pagemap record 构造：image_index / y0 / height
@@ -755,16 +767,28 @@ void handle_page_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
         pv_str(v, qparam(req, "layout_id"), {"query", "layout_id"}, "", /*required=*/true, 0);
     v.done();
 
+    // 先校验书籍可见性：layout_id 是几何哈希、与书籍无关，先查 layout 会让
+    // 不可见书库的 book_id 变成"layout/page 是否存在"的探测口（越界页会返回
+    // 404 + total_pages），与"不可见 = 不存在"的要求冲突。
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
+    if (!ref) throw book_not_found(book_id);
+
     auto entry = require_entry(ctx, book_id, layout_id);
     const PageMap& pm = entry.pagemap;
     const int page = check_page(pm, page_ll);
     const PageRecord* rec = pm.record(page);
 
-    // 顺序同 Python：先 layout/页码，再校验书籍可见性（layout_id 与书籍无关，
-    // 不校验的话其他书库的 book_id 也能读到正文首行），最后取 aspect。
-    const AccessScope scope = scope_of(ctx, req);
-    auto ref = ctx.require_book(book_id, &scope);
-    if (!ref) throw book_not_found(book_id);
+    // 页元数据也带 ETag + immutable（设计 5.4）：内容只随 layout_id/rev/页号变化，
+    // 客户端可用 If-None-Match 拿 304。在页面图片 ETag 基础上追加 ":meta" 区分资源。
+    const bool meta_fixed = pm.mode != "flow";
+    const std::string base_etag =
+        ctx.page_etag(layout_id, ref->rev, page, "white", 1.0, "viewport", std::nullopt,
+                      false, false, meta_fixed);
+    const std::string meta_etag = base_etag.substr(0, base_etag.size() - 1) + ":meta\"";
+    res.set_header("ETag", meta_etag);
+    res.set_header("Cache-Control", "private, max-age=31536000, immutable");
+    if (ctx.etag_matches(inm_ptr(req), meta_etag)) { res.status = 304; return; }
 
     // aspect 仅 fixed/strip；strip 用 image_index + 1（页号 ≠ 源图序号）；异常 → null
     json aspect = nullptr;
@@ -792,7 +816,7 @@ void handle_page_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
 }
 
 // GET /api/v1/books/{id}/locate（routes_read.py + layout/anchors.py §4.5）
-// 顺序同 Python：先查 layout（LAYOUT_NOT_FOUND 优先），再校验书籍存在且在访问范围内。
+// 顺序同 Python：先校验书籍存在且在访问范围内，再查 layout。
 void handle_locate(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string book_id = req.matches[1];
     Validator v;
@@ -804,9 +828,9 @@ void handle_locate(AppContext& ctx, const httplib::Request& req, httplib::Respon
     const long long ch = pv_int(v, qparam(req, "char"), {"query", "char"}, 0, int_ge(0));
     v.done();
 
-    auto entry = require_entry(ctx, book_id, layout_id);
     const AccessScope scope = scope_of(ctx, req);
     if (!ctx.require_book(book_id, &scope)) throw book_not_found(book_id);
+    auto entry = require_entry(ctx, book_id, layout_id);
     // 锚点用 long long：巨大值在 Python 里是"永远在文档之后"→ 定位到末页且 clamped=true。
     // 夹到 INT_MAX 后语义完全一致（真实锚点远小于 INT_MAX），而直接窄化会变成 0/负数
     // 从而定位到首页（审查 H4）。
