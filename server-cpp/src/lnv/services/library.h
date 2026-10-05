@@ -90,6 +90,10 @@ public:
 private:
     // 落盘主体（调用方必须已持有 save_mu_）
     void save_index_locked();
+    // 按索引 vpath 构建引用：解析真实路径 + 指纹校验（失效 → nullopt）。
+    // require_book 的候选路径逐个尝试用；主 vpath 失效（文件被移动）时兜底。
+    std::optional<BookRef> build_ref_for_vpath(const std::string& vpath,
+                                               const std::string& book_id) const;
 
     const AppConfig& cfg_;
     mutable std::shared_mutex mu_;

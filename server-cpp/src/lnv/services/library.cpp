@@ -896,20 +896,11 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
 
 // ------------------------------------------------------------------ book_id / 引用
 
-std::optional<BookRef> LibraryService::require_book(const std::string& book_id) const {
-    std::string bid = book_id;
-    size_t b = bid.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return std::nullopt;
-    size_t e = bid.find_last_not_of(" \t\r\n");
-    bid = bid.substr(b, e - b + 1);
-
-    std::string vpath;
+std::optional<BookRef> LibraryService::build_ref_for_vpath(const std::string& vpath,
+                                                           const std::string& bid) const {
     LibraryBook info;
     {
         std::shared_lock lk(mu_);
-        auto it = id_to_vpath_.find(bid);
-        if (it == id_to_vpath_.end()) return std::nullopt;
-        vpath = it->second;
         auto bit = by_vpath_.find(vpath);
         if (bit != by_vpath_.end()) info = bit->second;
     }
@@ -982,6 +973,44 @@ std::optional<BookRef> LibraryService::require_book(const std::string& book_id) 
     ref.mtime = info.mtime;
     ref.virtual_book = false;
     return ref;
+}
+
+std::optional<BookRef> LibraryService::require_book(const std::string& book_id) const {
+    std::string bid = book_id;
+    size_t b = bid.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return std::nullopt;
+    size_t e = bid.find_last_not_of(" \t\r\n");
+    bid = bid.substr(b, e - b + 1);
+
+    // 主 vpath：id_to_vpath_ 的映射；兜底：索引里同指纹的其余 vpath。
+    // 文件被移动后旧索引仍残留"id → 旧路径"（load_index 同指纹后写者覆盖，
+    // 键序决定旧路径可能胜出），主 vpath 解析失败时同一 book_id 在新路径下
+    // 仍是同一本书（指纹 = size + 文件头 1MB），应当交付而非 404。
+    std::vector<std::string> candidates;
+    {
+        std::shared_lock lk(mu_);
+        auto it = id_to_vpath_.find(bid);
+        if (it != id_to_vpath_.end()) candidates.push_back(it->second);
+        for (const auto& [vp, book] : by_vpath_) {
+            if (book.book_id != bid) continue;
+            if (candidates.size() >= 8) break;  // 防御：异常重复指纹只试前几个
+            if (candidates.empty() || candidates.front() != vp) candidates.push_back(vp);
+        }
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        auto ref = build_ref_for_vpath(candidates[i], bid);
+        if (ref) {
+            if (i != 0) {
+                // 晋升活跃路径：后续请求直接命中，不再走兜底扫描
+                auto& mutable_ids =
+                    const_cast<std::unordered_map<std::string, std::string>&>(id_to_vpath_);
+                std::unique_lock lk(mu_);
+                mutable_ids[bid] = candidates[i];
+            }
+            return ref;
+        }
+    }
+    return std::nullopt;
 }
 
 void LibraryService::add_content_listener(std::function<void(const std::string&)> cb) {

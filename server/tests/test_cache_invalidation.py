@@ -206,3 +206,37 @@ def test_end_to_end_layout_cache_hit_flips_after_edit(config, tmp_books: Path):
         assert refreshed.json()["cache_hit"] is False, (
             "内容变化后仍报缓存命中 —— 失效没有接线"
         )
+
+
+def test_book_by_id_falls_back_to_moved_vpath(tmp_books: Path, config):
+    """文件移动后旧索引残留同指纹条目：id→旧路径失效时兜底到新路径。
+
+    现场（LESSONS.md 2026-10-05）：文件从 /lib/old/book.txt 移到 /lib/sub/book.txt，
+    lazy 模式不重扫，index.json 同时残留两条同 book_id 条目；load_index 的
+    id→vpath 同指纹后写者覆盖可能让失效旧路径胜出 → 列表可见、打开永远 404。
+    """
+    from app.context import AppContext
+
+    (tmp_books / "sub").mkdir(parents=True, exist_ok=True)
+    (tmp_books / "sub" / "book.txt").write_text(
+        "第一章 移动\n" + "正文内容。" * 100, encoding="utf-8"
+    )
+
+    ctx = AppContext(config)
+    ctx.library.scan_blocking()
+    lib = ctx.library
+    live_vpath = vpath_of("sub/book.txt")
+    entry = lib._books.get(live_vpath)
+    assert entry and entry.get("book_id"), "测试前提失效：书未被扫描进索引"
+    bid = str(entry["book_id"])
+
+    # 注入"移动后残留"的索引状态：旧路径同指纹条目 + id 指向旧路径
+    dead_vpath = vpath_of("old/book.txt")
+    lib._books[dead_vpath] = dict(entry)
+    lib._by_id[bid] = dead_vpath
+
+    ref = lib.book_by_id(bid)
+    assert ref is not None, "同指纹兜底失效：移动过的书打不开了"
+    assert ref.vpath == live_vpath
+    # 命中兜底后把 id 晋升回活跃路径
+    assert lib._by_id[bid] == live_vpath

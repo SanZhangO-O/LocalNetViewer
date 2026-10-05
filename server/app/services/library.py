@@ -804,66 +804,89 @@ class LibraryService:
         return book_id
 
     # ------------------------------------------------------------ 书籍引用
+    def _ref_from_vpath(self, vpath: str, bid: str, info: Dict[str, Any]) -> Optional[BookRef]:
+        """按索引 vpath 构建书籍引用：解析真实路径 + 指纹校验（失效 → None）。"""
+        real = self.resolve_real(vpath)
+        if real is None or not real.is_file():
+            return None
+        fmt = str(info.get("format") or registry.format_of(vpath) or "")
+        # 索引里记录的 book_id 已经不是请求的这个 → 这个 id 是被替换掉的旧指纹。
+        # 不能继续按 vpath 提供文件：那等于用旧 id 交付新内容，而且 size/mtime
+        # 都已刷新，后面的"变化检测"再也发现不了。
+        if info and str(info.get("book_id") or "") not in ("", bid):
+            return None
+        if info:
+            # 文件可能被"就地替换"：book_id 是内容指纹，尺寸/时间变了就必须重算，
+            # 否则会拿旧 PageMap 去渲染新内容（页码/锚点全错）
+            try:
+                st = real.stat()
+            except OSError:
+                return None
+            if (
+                int(info.get("size", -1)) != int(st.st_size)
+                or abs(float(info.get("mtime", 0.0)) - float(st.st_mtime)) > 1e-6
+            ):
+                refreshed = self._book_id_for(
+                    vpath, real, int(st.st_size), float(st.st_mtime), fmt
+                )
+                # 内容变化通知已由 _book_id_for 在锁外统一发出（旧 id 一次），
+                # 这里只决定旧 id 是否还能继续交付
+                # book_id 只覆盖"大小 + 文件头 1MB"，1MB 之后的等长编辑
+                # （TXT 勘误的常见形态）算出来的指纹和旧的一样。此时若只更新
+                # size/mtime 就继续用旧缓存，会永远读到旧分页与旧页面图。
+                # 所以：只要检测到文件变化就丢弃该 book_id 的全部派生缓存。
+                if refreshed != bid:
+                    # 内容指纹真的变了：旧 id 已失效，客户端需重新扫描
+                    return None
+                info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
+        else:
+            # 防御：_by_id 有记录但 _books 无详情（索引不一致）时补一次 stat
+            try:
+                st = real.stat()
+            except OSError:
+                st = None
+            if st is not None:
+                info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
+        size = int(info.get("size", 0))
+        mtime = float(info.get("mtime", 0.0))
+        return BookRef(
+            book_id=bid,
+            vpath=vpath,
+            path=real,
+            format=fmt,
+            size=size,
+            mtime=mtime,
+            virtual=False,
+            revision=content_revision(bid, size, mtime),
+        )
+
     def book_by_id(self, book_id: str) -> Optional[BookRef]:
         bid = str(book_id or "").strip()
         if not bid:
             return None
         with self._lock:
-            vpath = self._by_id.get(bid)
-            info = dict(self._books.get(vpath, {})) if vpath else {}
-        if vpath:
-            real = self.resolve_real(vpath)
-            if real is not None and real.is_file():
-                fmt = str(info.get("format") or registry.format_of(vpath) or "")
-                # 索引里记录的 book_id 已经不是请求的这个 → 这个 id 是被替换掉的旧指纹。
-                # 不能继续按 vpath 提供文件：那等于用旧 id 交付新内容，而且 size/mtime
-                # 都已刷新，后面的"变化检测"再也发现不了。
-                if info and str(info.get("book_id") or "") not in ("", bid):
-                    return None
-                if info:
-                    # 文件可能被"就地替换"：book_id 是内容指纹，尺寸/时间变了就必须重算，
-                    # 否则会拿旧 PageMap 去渲染新内容（页码/锚点全错）
-                    try:
-                        st = real.stat()
-                    except OSError:
-                        return None
-                    if (
-                        int(info.get("size", -1)) != int(st.st_size)
-                        or abs(float(info.get("mtime", 0.0)) - float(st.st_mtime)) > 1e-6
-                    ):
-                        refreshed = self._book_id_for(
-                            vpath, real, int(st.st_size), float(st.st_mtime), fmt
-                        )
-                        # 内容变化通知已由 _book_id_for 在锁外统一发出（旧 id 一次），
-                        # 这里只决定旧 id 是否还能继续交付
-                        # book_id 只覆盖"大小 + 文件头 1MB"，1MB 之后的等长编辑
-                        # （TXT 勘误的常见形态）算出来的指纹和旧的一样。此时若只更新
-                        # size/mtime 就继续用旧缓存，会永远读到旧分页与旧页面图。
-                        # 所以：只要检测到文件变化就丢弃该 book_id 的全部派生缓存。
-                        if refreshed != bid:
-                            # 内容指纹真的变了：旧 id 已失效，客户端需重新扫描
-                            return None
-                        info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
-                else:
-                    # 防御：_by_id 有记录但 _books 无详情（索引不一致）时补一次 stat
-                    try:
-                        st = real.stat()
-                    except OSError:
-                        st = None
-                    if st is not None:
-                        info = {"size": int(st.st_size), "mtime": float(st.st_mtime)}
-                size = int(info.get("size", 0))
-                mtime = float(info.get("mtime", 0.0))
-                return BookRef(
-                    book_id=bid,
-                    vpath=vpath,
-                    path=real,
-                    format=fmt,
-                    size=size,
-                    mtime=mtime,
-                    virtual=False,
-                    revision=content_revision(bid, size, mtime),
-                )
+            primary = self._by_id.get(bid)
+            # 主 vpath 之外，索引里可能残留同一 book_id 的旧路径（文件被移动后
+            # 未重扫：load_index 同指纹后写者覆盖，键序决定旧路径可能胜出）。
+            # 指纹 = size + 文件头 1MB，同指纹在别的活跃路径下仍是同一本书，
+            # 主路径失效时应交付新路径而非 404。
+            fallbacks = [
+                vp
+                for vp, b in self._books.items()
+                if str(b.get("book_id") or "") == bid and vp != primary
+            ][:8]
+        for i, vpath in enumerate([primary] + fallbacks if primary else fallbacks):
+            if not vpath:
+                continue
+            with self._lock:
+                info = dict(self._books.get(vpath, {}))
+            ref = self._ref_from_vpath(vpath, bid, info)
+            if ref is not None:
+                if i > 0:
+                    # 晋升活跃路径：后续请求直接命中，不再走兜底扫描
+                    with self._lock:
+                        self._by_id[bid] = vpath
+                return ref
         if self.gallery is not None:
             ref = self.gallery.resolve(bid)
             if ref is not None:
