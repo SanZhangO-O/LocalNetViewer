@@ -6,7 +6,9 @@
 - ``book_id = sha1(文件大小 + 文件头 1MB)[:16]``：书籍移动 / 改名后进度不丢；
 - 索引落盘 ``cache/index.json``，按 mtime/size 跳过未变文件的指纹重算；
 - 扫描在后台线程执行：未就绪时 ``/files`` 返回已索引部分并携带 ``scanning: true``；
-- 目录图片数（图集入口用）在扫描时计算并按目录 mtime 缓存。
+- 目录图片数（图集入口用）在扫描时计算并按目录 mtime 缓存；
+- ``/files`` 分页：枚举/排序是轻量活，stat / 指纹 / 子目录图片数只对**当前页**条目做，
+  大目录翻页的成本与页大小而非目录大小成正比。
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..config import IMAGE_EXT, AppConfig
 from ..formats import registry
@@ -506,6 +508,18 @@ class LibraryService:
 
     # ------------------------------------------------------------ 目录列表
     def list_dir(self, vpath: str, limit: int = 1000, offset: int = 0) -> Dict[str, Any]:
+        """目录列表（分页）。
+
+        分成两个阶段，让分页不仅裁剪响应体，也裁剪服务器的每页成本：
+
+        - 第一阶段（轻量）：只 scandir 一次，按**名字**分类 + 自然排序 + 切页。
+          不 stat、不算 book_id 指纹（每文件要读 1MB）、不数子目录图片；
+        - 第二阶段（重活）：只对**当前页**的条目 stat / 指纹 / 数图片。
+
+        旧实现把重活做在全目录上再切片，目录里有几万个文件时翻到第 2 页
+        也要把整个目录重新扫一遍（未索引文件逐个读头算指纹），分页形同虚设。
+        未列入当前页的文件指纹由后台扫描 / watcher 负责补齐（见模块 docstring）。
+        """
         v = normalize_vpath(vpath, allow_empty=True)
         if v == "/":
             return self._list_roots(limit, offset)
@@ -519,15 +533,21 @@ class LibraryService:
         if not real.is_dir():
             raise PathError(f"不是目录: {v}")
 
-        dirs: List[Dict[str, Any]] = []
-        files: List[Dict[str, Any]] = []
+        # ---- 第一阶段：枚举 + 分类（只看名字）+ 排序
         patterns = list(self.config.comic.skip_entries)
+        image_exts = set(IMAGE_EXT)
+        show_images = bool(self.config.gallery.show_image_files)
+        show_all = bool(self.config.library.show_all_files)
+        include_ext = self.config.library.include_ext
 
         try:
             scandir_entries = list(os.scandir(real))
         except OSError as exc:
             raise PathError(f"目录无法读取: {v} ({exc})") from exc
 
+        dirs: List[Tuple[str, str]] = []  # (name, 真实路径)
+        # kind: "image"（单图）/ "book"（电子书）/ "file"（show_all_files 的其它文件）
+        files: List[Tuple[str, str, str]] = []
         for entry in scandir_entries:
             name = entry.name
             if name.startswith("."):
@@ -536,12 +556,41 @@ class LibraryService:
                 if entry.is_symlink():
                     continue
                 is_dir = entry.is_dir()
-                st = entry.stat()
             except OSError:
                 continue
-            child_vpath = join_vpath(v, name)
             if is_dir:
-                info = self.dir_gallery_info(child_vpath, Path(entry.path))
+                dirs.append((name, entry.path))
+                continue
+            ext = ext_of(name)
+            if ext in image_exts and show_images:
+                if not should_skip_entry(name, patterns):
+                    files.append((name, entry.path, "image"))
+                continue
+            fmt = registry.format_of(name)
+            if fmt is None:
+                if show_all:
+                    files.append((name, entry.path, "file"))
+                continue
+            if ext not in include_ext and not show_all:
+                continue
+            files.append((name, entry.path, "book"))
+
+        dirs.sort(key=lambda e: natural_key(e[0]))
+        files.sort(key=lambda e: natural_key(e[0]))
+        listing: List[Tuple[str, str, str]] = [
+            (name, path, "dir") for name, path in dirs
+        ] + files
+
+        total = len(listing)
+        start = max(0, int(offset))
+        page = listing[start : start + max(1, int(limit))]
+
+        # ---- 第二阶段：只对页内条目做重活（stat / 指纹 / 子目录图片数）
+        entries: List[Dict[str, Any]] = []
+        for name, child_real, kind in page:
+            child_vpath = join_vpath(v, name)
+            if kind == "dir":
+                info = self.dir_gallery_info(child_vpath, Path(child_real))
                 # 名字本身无法表示成虚拟路径（含 ':' 等）时明确置灰，
                 # 而不是让用户点进去才拿到一个 400
                 navigable = True
@@ -551,7 +600,7 @@ class LibraryService:
                 except PathError as exc:
                     navigable = False
                     reason = f"目录名服务器不支持：{exc}"
-                dirs.append(
+                entries.append(
                     {
                         "name": name,
                         "type": "dir",
@@ -566,66 +615,64 @@ class LibraryService:
                 )
                 continue
 
-            ext = ext_of(name)
-            if ext in set(IMAGE_EXT) and self.config.gallery.show_image_files:
-                if not should_skip_entry(name, patterns):
-                    min_images = max(1, int(self.config.gallery.min_images_in_folder))
-                    # 单张图片按"单页图集"打开，但服务器要求图片数 ≥ min_images_in_folder，
-                    # 所以只有该阈值为 1 时才能真的打开（否则列表不能谎报可打开）
-                    can_open = bool(self.config.gallery.folder_as_book) and min_images <= 1
-                    if not self.config.gallery.folder_as_book:
-                        reason = "图集功能已关闭"
-                    elif not can_open:
-                        reason = f"单张图片需要 gallery.min_images_in_folder ≤ 1（当前 {min_images}）"
-                    else:
-                        reason = None
-                    files.append(
-                        {
-                            "name": name,
-                            "type": "image",
-                            "path": child_vpath,
-                            "format": "gallery",
-                            "book_id": gallery_mod.gallery_book_id(child_vpath),
-                            "size": int(st.st_size),
-                            "mtime": iso_time(st.st_mtime),
-                            "gallery": {
-                                "image_count": 1,
-                                "can_open_as_book": can_open,
-                            },
-                            "openable": can_open,
-                            "reason": reason,
-                        }
-                    )
+            try:
+                st = os.stat(child_real)
+            except OSError:
+                # 文件恰在列出后消失：该条跳过（本页可能短于 limit），不影响 total
                 continue
 
-            fmt = registry.format_of(name)
-            if fmt is None:
-                if self.config.library.show_all_files:
-                    files.append(
-                        {
-                            "name": name,
-                            "type": "file",
-                            "path": child_vpath,
-                            "size": int(st.st_size),
-                            "mtime": iso_time(st.st_mtime),
-                            "openable": False,
-                            "reason": "非电子书格式",
-                        }
-                    )
-                continue
-            if (
-                ext not in self.config.library.include_ext
-                and not self.config.library.show_all_files
-            ):
+            if kind == "image":
+                min_images = max(1, int(self.config.gallery.min_images_in_folder))
+                # 单张图片按"单页图集"打开，但服务器要求图片数 ≥ min_images_in_folder，
+                # 所以只有该阈值为 1 时才能真的打开（否则列表不能谎报可打开）
+                can_open = bool(self.config.gallery.folder_as_book) and min_images <= 1
+                if not self.config.gallery.folder_as_book:
+                    reason = "图集功能已关闭"
+                elif not can_open:
+                    reason = f"单张图片需要 gallery.min_images_in_folder ≤ 1（当前 {min_images}）"
+                else:
+                    reason = None
+                entries.append(
+                    {
+                        "name": name,
+                        "type": "image",
+                        "path": child_vpath,
+                        "format": "gallery",
+                        "book_id": gallery_mod.gallery_book_id(child_vpath),
+                        "size": int(st.st_size),
+                        "mtime": iso_time(st.st_mtime),
+                        "gallery": {
+                            "image_count": 1,
+                            "can_open_as_book": can_open,
+                        },
+                        "openable": can_open,
+                        "reason": reason,
+                    }
+                )
                 continue
 
+            if kind == "file":
+                entries.append(
+                    {
+                        "name": name,
+                        "type": "file",
+                        "path": child_vpath,
+                        "size": int(st.st_size),
+                        "mtime": iso_time(st.st_mtime),
+                        "openable": False,
+                        "reason": "非电子书格式",
+                    }
+                )
+                continue
+
+            fmt = registry.format_of(name) or ""
             book_id = self._book_id_for(
-                child_vpath, Path(entry.path), st.st_size, st.st_mtime, fmt
+                child_vpath, Path(child_real), st.st_size, st.st_mtime, fmt
             )
             # 封面 URL 带内容修订号：内容变化后 URL 变化，客户端强缓存自然失效
             rev = content_revision(book_id, int(st.st_size), float(st.st_mtime))
             reason = registry.openable_reason(fmt)
-            files.append(
+            entries.append(
                 {
                     "name": name,
                     "type": "book",
@@ -640,12 +687,6 @@ class LibraryService:
                 }
             )
 
-        dirs.sort(key=lambda e: natural_key(e["name"]))
-        files.sort(key=lambda e: natural_key(e["name"]))
-        entries = dirs + files
-
-        total = len(entries)
-        page = entries[max(0, offset) : max(0, offset) + max(1, limit)]
         gallery_info = self.dir_gallery_info(v, real)
         return {
             "path": v,
@@ -655,7 +696,7 @@ class LibraryService:
                 "image_count": gallery_info.image_count,
                 "can_open_as_book": gallery_info.can_open(self.config),
             },
-            "entries": page,
+            "entries": entries,
             "total": total,
             "limit": int(limit),
             "offset": int(offset),

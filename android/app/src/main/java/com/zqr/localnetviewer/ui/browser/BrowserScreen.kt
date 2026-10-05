@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -41,6 +42,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
@@ -168,43 +170,64 @@ fun BrowserScreen(
                     secondaryLabel = "断开连接",
                 )
                 state.entries.isEmpty() -> EmptyView("此目录为空")
-                else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    if (state.canOpenCurrentAsGallery) {
-                        item(key = "current-gallery") {
-                            GalleryEntryCard(
-                                title = "查看本文件夹图片（${state.gallery?.imageCount ?: 0} 张）",
-                                subtitle = "不打开文件，直接把当前文件夹作为图集阅读",
-                                enabled = !state.opening,
-                                onClick = { vm.openFolderAsGallery(state.path) },
-                            )
+                else -> {
+                    val listState = rememberLazyListState()
+                    // 分页滚动加载：接近列表末尾时自动取下一页（服务端 offset 分页）。
+                    // 大目录可能有几万个条目，靠手动点"加载更多"要点几百次；
+                    // derivedStateOf 只在"进入/离开末尾附近"时才触发重组与重试。
+                    val nearEnd by remember {
+                        derivedStateOf {
+                            val info = listState.layoutInfo
+                            val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+                            info.totalItemsCount > 0 && last >= info.totalItemsCount - 4
                         }
                     }
-                    // key 带 index 前缀：服务器在分页边界/重命名竞态下可能返回重复
-                    // path，LazyColumn 的重复 key 会直接抛 IllegalArgumentException
-                    // （与 SearchSheet 同样的防护）
-                    itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
-                        EntryRow(
-                            entry = entry,
-                            coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
-                            onClick = { vm.onEntryClick(entry) },
-                            onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
-                            opening = state.opening,
-                        )
-                        HorizontalDivider()
+                    LaunchedEffect(nearEnd, state.hasMore, state.loadingMore) {
+                        if (nearEnd && state.hasMore && !state.loadingMore) {
+                            vm.loadMore()
+                        }
                     }
-                    if (state.hasMore) {
-                        item(key = "load-more") {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { vm.loadMore() }
-                                    .padding(16.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                if (state.loadingMore) {
-                                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                                } else {
-                                    Text("加载更多（${state.entries.size}/${state.total}）")
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        state = listState,
+                    ) {
+                        if (state.canOpenCurrentAsGallery) {
+                            item(key = "current-gallery") {
+                                GalleryEntryCard(
+                                    title = "查看本文件夹图片（${state.gallery?.imageCount ?: 0} 张）",
+                                    subtitle = "不打开文件，直接把当前文件夹作为图集阅读",
+                                    enabled = !state.opening,
+                                    onClick = { vm.openFolderAsGallery(state.path) },
+                                )
+                            }
+                        }
+                        // key 带 index 前缀：服务器在分页边界/重命名竞态下可能返回重复
+                        // path，LazyColumn 的重复 key 会直接抛 IllegalArgumentException
+                        // （与 SearchSheet 同样的防护）
+                        itemsIndexed(state.entries, key = { i, entry -> "${entry.path}#$i" }) { _, entry ->
+                            EntryRow(
+                                entry = entry,
+                                coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
+                                onClick = { vm.onEntryClick(entry) },
+                                onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
+                                opening = state.opening,
+                            )
+                            HorizontalDivider()
+                        }
+                        if (state.hasMore) {
+                            item(key = "load-more") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { vm.loadMore() }
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    if (state.loadingMore) {
+                                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                                    } else {
+                                        Text("加载更多（${state.entries.size}/${state.total}）")
+                                    }
                                 }
                             }
                         }
