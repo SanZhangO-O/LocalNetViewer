@@ -1267,3 +1267,27 @@ OkHttp 磁盘缓存移除后无残留引用。
 | 8 | 封面 URL 两个构造器漂移：服务端 URL 只有 `rev`，本地 URL 只有 `w`，`width` 被静默丢弃 | 使用服务端 `cover_url` 时补 `&w=`；语义与回退路径一致 |
 | 9 | 死代码 | C++ 移除不可达的 `compute_file_rev` 回退与未使用的 `HeavyGate::active/slots`；Android `meta.revision` 改为布局响应缺省时的回退值 |
 
+
+### v0.4.2（2026-10-04，真实书籍 MOBI 闭环验证修复）
+
+用真实书库（40MB 的 joint-KF8 MOBI）走 HTTP 全链路验证 MOBI 支持，首开即
+`PARSE_FAILED`，且手动命令行转换正常 —— 只有真实运行才暴露：
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | 转换临时文件命名 `{book_id}.epub.tmp` 直接传给 `ebook-convert`，而 Calibre 按输出文件**扩展名**选择输出插件 → `ValueError: No plugin to handle output format: tmp`，任何 MOBI/AZW3 都无法转换（两实现同病） | Python `formats/mobi.py` / C++ `mobi.cpp`：临时名改为 `{book_id}.{rev}.epub.tmp.epub`（保持 `.epub` 结尾，原子 replace 语义与失效清理前缀匹配均不变）；PORT_SPEC 4.3 同步契约；回归测试 `server/tests/test_mobi_convert.py`（无需安装 Calibre，假 subprocess.run 模拟其按扩展名拒绝的行为） |
+
+验证：真实 HTTP 全链路（meta → layout → 渲染 1/中间/末页 → 锚点往返 → 封面）对
+`F:\book\仁医\仁医01.mobi` 全部通过；转换产物命中 `cache/converted/` 缓存。
+
+### v0.4.3（2026-10-04，真实书籍 MOBI 漫画阅读体验修复）
+
+漫画 KF8 MOBI（仁医01，187 页）转换后仍走流式 EPUB 排版：每页一张图被塞进
+带边距的版心，图片缩小、四周全是空边，"黑边太大、不适应屏幕"（真实用户反馈）。
+
+| # | 缺陷 | 修正 |
+|---|---|---|
+| 1 | 漫画型 MOBI 没有进入固定版式漫画管线 | `formats/mobi.py`：转换后扫描 spine（块模型与 flow 一致），图片页 ≥8 且平均每页正文 ≤64 字符 → 判定漫画，`open_mobi_adapter` 分流到 `MobiComicAdapter(FixedAdapter)`，页 = spine 图片顺序，完整复用漫画管线（fit=viewport/original、双页跨页、条漫、封面）；文本型 MOBI 行为不变。检测结果进程内缓存（转换产物路径 + mtime/size，LRU 32 条）。PORT_SPEC 4.3 已注明 C++ 移植待办；回归测试 `server/tests/test_mobi_comic.py`（含误判防护：插图小说/残书不分流） |
+
+验证：仁医01.mobi 真实 HTTP 全链路 —— meta 返回 `mode=fixed`、`page_count=187`；
+`fit=viewport` 渲染整页漫画铺满视口宽度；双页拼接、封面、锚点（页定位）全部通过。

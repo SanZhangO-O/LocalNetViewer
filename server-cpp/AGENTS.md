@@ -1,5 +1,8 @@
 # server-cpp 修改规则
 
+- 调 Calibre `ebook-convert` 时输出路径必须以 `.epub` 结尾（按扩展名选输出插件，
+  `.tmp` 结尾会 `No plugin to handle output format: tmp`）；契约与回归见
+  `server/tests/test_mobi_convert.py`、DESIGN.md 13 v0.4.2。
 - Windows PowerShell 5.1 脚本中原生子进程退出码一律用 `$LASTEXITCODE`（直接 `&` 调用），
   不要用 `Start-Process -PassThru` 的 `ExitCode`（-NoNewWindow+重定向时为 null，
   会把成功误判为失败）；原生命令 stderr 合并要在 cmd 层做 `2>&1`，不要用 PS 的 `2>&1`。

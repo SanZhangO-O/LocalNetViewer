@@ -189,7 +189,9 @@ void MobiAdapter::convert(const BookRef& ref, const std::filesystem::path& targe
             "需安装 Calibre");
     double timeout = std::max(60.0, cfg_.limits.parse_timeout_s * kConvertTimeoutFactor);
     std::filesystem::path tmp = target;
-    tmp += ".tmp";  // {book_id}.epub.tmp → 原子 rename
+    // 临时名必须仍以 .epub 结尾：ebook-convert 按输出文件的扩展名选择输出插件，
+    // 传 ".tmp" 会直接失败（No plugin to handle output format: tmp）
+    tmp += ".tmp.epub";  // {book_id}.epub.tmp.epub → 原子 rename
     unlink_quiet(tmp);
     std::filesystem::path err_file = tmp;
     err_file += ".err";

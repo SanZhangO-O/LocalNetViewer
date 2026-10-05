@@ -427,7 +427,7 @@ book_id = sha1( ascii(str(int(file_size))) + 文件头前 1 MiB 原始字节 ).h
 
 **PDF**（formats/pdf.py）：pypdfium2（PDFium）。fixed。`page_native_size` = 页面 pt × 2.0（`DEFAULT_RENDER_PT_TO_PX`，约 144dpi）。`fit=original`：scale = 2.0 × clamp(0.5..2.0, render_scale)；`fit=viewport`：scale = viewport_w × clamp(scale) / w_pt。`_clamp_scale`：w_pt×scale × h_pt×scale > `render.max_page_pixels` 时 scale ×= sqrt(max_pixels/pixels)。渲染 → PIL RGB → JPEG（quality 参数，prefer_jpeg 恒 true）。封面：第 1 页 viewport w=480 q82。pair：两页各按 viewport 宽渲染后 hstack；末页落单。metadata Title/Author。
 
-**MOBI/AZW3**（formats/mobi.py）：探测 `ebook-convert`（PATH）；缺失 → 415 reason "需安装 Calibre"。转换到 `cache/converted/{book_id}.epub`（先写 `.tmp` 再原子 replace；每本书一把进程内锁；子进程超时 = parse_timeout_s × 4，最少 60s；exit≠0 或产物空 → PARSE_FAILED，stderr 尾 500 字节入 message）。此后完全走 EPUB 路径，meta/document 的 `format` 字段改回原格式（mobi/azw3）。
+**MOBI/AZW3**（formats/mobi.py）：探测 `ebook-convert`（PATH）；缺失 → 415 reason "需安装 Calibre"。转换到 `cache/converted/{book_id}.epub`（先写 `.tmp.epub` 再原子 replace——临时名必须保持 `.epub` 扩展名，ebook-convert 按输出扩展名选输出插件；每本书一把进程内锁；子进程超时 = parse_timeout_s × 4，最少 60s；exit≠0 或产物空 → PARSE_FAILED，stderr 尾 500 字节入 message）。此后完全走 EPUB 路径，meta/document 的 `format` 字段改回原格式（mobi/azw3）。**漫画分流（仅 Python 已实现，C++ 待移植）**：转换后扫描 spine（块模型与 flow 一致），若图片页 ≥8 且平均每页正文 ≤64 字符，则按**固定版式漫画**打开（`mode=fixed`，页 = spine 图片顺序，复用漫画管线的 fit/双页/条漫/封面），否则维持流式 EPUB；检测结果进程内缓存（键 = 转换产物路径 + mtime/size，上限 32 条）。回归：`server/tests/test_mobi_comic.py`。
 
 ### 4.4 分页/布局引擎（layout/engine.py、services/layouts.py）
 

@@ -23,7 +23,7 @@ from .base import (
 from .comics import ComicAdapter, rar_backend_tool
 from .epub import EpubAdapter
 from .fb2 import Fb2Adapter
-from .mobi import MobiAdapter, calibre_available
+from .mobi import MobiAdapter, calibre_available, open_mobi_adapter
 from .pdf import PdfAdapter
 from .txt import TxtAdapter
 
@@ -183,6 +183,10 @@ def create_adapter(env: AdapterEnv, ref: BookRef, *, recursive: bool = False) ->
     cls = adapter_class_for(ref)
     if cls is ComicAdapter:
         return ComicAdapter(env, ref, recursive=recursive)
+    if cls is MobiAdapter:
+        # MOBI/AZW3：漫画型（图片为主）转 EPUB 后按固定版式漫画打开，
+        # 文本型仍走流式 EPUB —— 分流要看转换产物，由工厂内部决定
+        return open_mobi_adapter(env, ref)
     return cls(env, ref)
 
 
