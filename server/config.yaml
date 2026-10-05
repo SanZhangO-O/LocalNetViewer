@@ -14,9 +14,9 @@ library:
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序
-  # 扫描模式（仅 C++ 服务器 server-cpp 使用，Python 版忽略此键）：
+  # 扫描模式（Python 与 C++ 服务器共用；两者行为一致）：
   #   lazy  —— 不做启动全量扫描；用户列出哪个目录，才扫描该目录（默认）
-  #   eager —— 启动时全量扫描一次
+  #   eager —— 启动时全量扫描一次（并启用目录变化监听）
   scan_mode: lazy
   # 目录变化监听（设计 4.8）：变化后自动增量重扫。需可选依赖 watchfiles
   # （pip install -e ".[watch]"），未安装时自动降级为仅启动扫描

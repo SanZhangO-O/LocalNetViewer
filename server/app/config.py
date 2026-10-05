@@ -58,9 +58,12 @@ class LibraryCfg(BaseModel):
     include_ext: List[str] = Field(default_factory=lambda: list(DEFAULT_INCLUDE_EXT))
     show_all_files: bool = False
     sort: Literal["natural", "name"] = "natural"
+    # 扫描模式：lazy=不做启动全量扫描，用户列出哪个目录就只扫描/指纹该目录；
+    # eager=启动时全量扫描一次（旧行为）。默认 lazy（设计 4.8）。
+    scan_mode: Literal["lazy", "eager"] = "lazy"
     # 目录变化监听（设计 4.8）：OS 原生通知，事件在防抖窗口内合并为一次增量重扫。
     # 需可选依赖 watchfiles（pip install -e ".[watch]"）；未安装或目录不可监听时
-    # 自动降级为"仅启动扫描"，不影响服务。
+    # 自动降级为"仅启动扫描"，不影响服务。lazy 模式下不启用（无全量索引可增量重扫）。
     watch: bool = True
     watch_debounce_s: float = Field(default=2.0, ge=0.1, le=60.0)
     # 书级编码覆盖：虚拟路径 / 文件名 / 纯文件名 → 编码名

@@ -22,7 +22,7 @@ struct LibraryCfg {
     std::vector<std::string> include_ext;   // 小写、带点
     bool show_all_files = false;
     std::string sort = "natural";           // natural | name
-    // 扫描模式（C++ 扩展；Python 无此键）：
+    // 扫描模式（Python 与 C++ 共用 server/config.yaml 的同名键）：
     //   lazy  —— 不做启动全量扫描；用户列出哪个目录就只扫描/指纹该目录（默认）
     //   eager —— 启动时同步全量扫描一次，并（--no-scan 时）后台补扫
     std::string scan_mode = "lazy";         // lazy | eager

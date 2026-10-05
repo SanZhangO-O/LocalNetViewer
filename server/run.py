@@ -163,10 +163,13 @@ def main(argv=None) -> int:
     # background_scan 必须与 --no-scan 一致：create_app(background_scan=False)
     # 会同时关掉 lifespan 里的后台扫描，于是 --no-scan 变成"永远不扫描"，
     # 而它的帮助文本承诺的是"索引在后台补齐"。
-    app = create_app(cfg, background_scan=bool(args.no_scan))
+    # lazy 模式（library.scan_mode=lazy，默认）不做任何全量扫描：索引由 /files
+    # 列出目录时按需增量补齐，故 background_scan 恒为 False。
+    lazy_scan = cfg.library.scan_mode == "lazy"
+    app = create_app(cfg, background_scan=(not lazy_scan) and bool(args.no_scan))
     ctx = app.state.ctx
 
-    if not args.no_scan:
+    if not lazy_scan and not args.no_scan:
         # 启动前同步扫描一次，让启动信息里的书籍数准确（增量，第二次启动很快）
         try:
             ctx.library.scan_blocking()

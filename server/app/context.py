@@ -240,7 +240,10 @@ class AppContext:
         else:
             lines.append("书库: 未配置（请编辑 config.yaml 的 library.roots）")
         watch = self.watcher.status()
-        if not watch["enabled"]:
+        if cfg.library.scan_mode == "lazy":
+            lines.append("书库扫描: lazy（按访问的目录按需扫描，不做启动全量扫描）")
+            lines.append("书库监控: 关（lazy 模式下无需目录监听）")
+        elif not watch["enabled"]:
             lines.append("书库监控: 关（library.watch=false）")
         elif watch["available"]:
             # 横幅在 lifespan 启动监听线程之前打印，这里只反映配置意图

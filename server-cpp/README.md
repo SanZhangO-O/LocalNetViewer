@@ -83,10 +83,11 @@ cd server
   503、等待超过 `limits.parse_timeout_s` 报 422 `PARSE_FAILED{reason:timeout}`）。
   与 Python 一样，超时不会强杀任务：后台继续跑完、槽位随之释放；超时后的重试会
   命中同任务去重（同 Python）。`/document`（页/搜索入口）同样按书去重。
-- `library.scan_mode`（C++ 扩展，Python 版忽略）默认 `lazy`：**不做启动全量扫描**，
+- `library.scan_mode`（Python 与 C++ 服务器共用）默认 `lazy`：**不做启动全量扫描**，
   只在 `/files` 列出某个目录时扫描/指纹**该目录**（可理解为"用户看到哪个目录才扫哪个"）。
   共享 `index.json` 中已有的条目仍会在启动时加载并复用，因此书库大/在网络盘上时启动
-  不再卡在遍历上。设为 `eager` 恢复旧行为（启动同步全量扫描一次，`--no-scan` 时后台补扫）。
+  不再卡在遍历上。设为 `eager` 恢复旧行为（启动同步全量扫描一次，`--no-scan` 时后台补扫；
+  并启用目录变化监听）。lazy 下目录变化监听关闭，变化在下次列出该目录时自然发现。
   注意 lazy 下 `/server/info` 的 `book_count` 只统计"历史索引 + 已浏览目录"中的书。
 - 书库扫描与递归计数会跳过符号链接与 NTFS junction（按 reparse tag 识别，深度
   上限 256），避免 junction 成环导致无限递归/栈溢出；CPython `os.walk` 实际会

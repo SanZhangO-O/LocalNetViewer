@@ -257,7 +257,7 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 | `show_all_files` | `false` | 列出非电子书（`type:"file"`，`openable:false`，reason "非电子书格式"） |
 | `sort` | `"natural"` | 仅声明；实际列表排序硬编码 natural |
 | `encoding_overrides` | `{}` | 虚拟路径/文件名/后缀 → 编码名（TXT 书级覆盖；匹配顺序：vpath 精确 → 文件名精确 → endswith 遍历） |
-| `scan_mode` | `"lazy"` | **C++ 扩展键（Python 版忽略）**：`lazy`=不做启动全量扫描，`/files` 列出某目录时才扫描该目录；`eager`=启动同步全量扫描（旧行为）。非法值启动即报错 |
+| `scan_mode` | `"lazy"` | 扫描模式：`lazy`=不做启动全量扫描，`/files` 列出某目录时才扫描/指纹该目录，且关闭目录变化监听；`eager`=启动同步全量扫描（旧行为，并启用目录监听）。非法值启动即报错（Python `Literal` / C++ 校验） |
 
 **gallery**
 | 键 | 默认 | 语义 |
@@ -310,9 +310,9 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 ### 2.2 启动流程与 CLI（run.py）
 
 - CLI：`--config`（默认 `server/config.yaml`）、`--host`（覆盖 cfg）、`--port`（覆盖 cfg）、`--no-scan`（跳过启动同步扫描；注意 Python 实现 `create_app(background_scan=bool(args.no_scan))` 使 `--no-scan` 同时关掉后台扫描——移植时保留该行为或在文档中标注差异）、`--reload`（开发用，忽略 --config）、`--log-level`（critical/error/warning/info/debug/trace）。
-- 启动顺序：加载配置（失败 exit 2）→ 建 AppContext（ensure_dirs：cache、cache/parsed、cache/layouts、fonts_dir；`Image.MAX_IMAGE_PIXELS = limits.max_source_pixels`）→ 读 `cache/index.json` → **`library.scan_mode=="eager"` 且非 `--no-scan` 时**同步全量扫描一次（增量：size+mtime+format 未变则复用索引中的 book_id）→ 打印横幅（书库统计、字体、令牌状态、全部网卡地址、防火墙提示）→ uvicorn 单进程（workers=1）启动。
+- 启动顺序：加载配置（失败 exit 2）→ 建 AppContext（ensure_dirs：cache、cache/parsed、cache/layouts、fonts_dir；`Image.MAX_IMAGE_PIXELS = limits.max_source_pixels`）→ 读 `cache/index.json` → **`library.scan_mode=="eager"` 且非 `--no-scan` 时**同步全量扫描一次（增量：size+mtime+format 未变则复用索引中的 book_id；`--no-scan` 时改为后台补扫）→ 打印横幅（书库统计、字体、令牌状态、全部网卡地址、防火墙提示）→ uvicorn 单进程（workers=1）启动。
 
-  C++ 移植差异：`library.scan_mode` 默认 `"lazy"`，此时**不做任何全量扫描**（也不启动后台扫描）；索引只由 `/files` 按目录扫描增量补齐；`eager` 才与 Python 一致（`--no-scan` 时后台补扫）。
+  `library.scan_mode` 默认 `"lazy"`：此时**不做任何全量扫描**（Python/C++ 一致），也不启用目录变化监听；索引只由 `/files` 按目录扫描增量补齐。`eager` 才与旧行为一致。
 - 横幅安全告警：host 非回环且未配令牌时打印醒目警告。
 - 关停：cancel 扫描 → wait_idle(10s) → save_index → progress flush。
 - 访问日志中间件：`METHOD path -> status 耗时ms`。

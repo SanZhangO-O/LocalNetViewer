@@ -66,13 +66,21 @@ def create_app(
         asyncio.get_running_loop().set_default_executor(
             ThreadPoolExecutor(max_workers=max(8, os.cpu_count() or 4))
         )
+        # lazy 模式（library.scan_mode=lazy，默认）不做任何全量扫描：索引由 /files
+        # 按目录增量补齐，因此不启动后台扫描任务。
+        effective_scan = background_scan and cfg.library.scan_mode != "lazy"
         scan_task = (
             asyncio.create_task(ctx.library.scan_async(), name="library-scan")
-            if background_scan
+            if effective_scan
             else None
         )
-        # 书库目录变化监听（设计 4.8 / 可选依赖 watchfiles）：启动失败只降级记日志
-        ctx.watcher.start()
+        # 书库目录变化监听（设计 4.8 / 可选依赖 watchfiles）：启动失败只降级记日志。
+        # lazy 模式下禁用——watchfiles 的每次变化都会触发一次全量重扫，与会按需
+        # 扫描的语义冲突（目录变化由下次列出该目录时自然发现）。
+        if cfg.library.scan_mode == "lazy":
+            logger.info("书库监控未启用：library.scan_mode=lazy（按需扫描）")
+        else:
+            ctx.watcher.start()
         logger.info(
             "启动完成：%s（%d 个书库根，索引中 %d 本）",
             cfg.config_path or "(默认配置)",
