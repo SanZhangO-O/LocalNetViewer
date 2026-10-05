@@ -45,7 +45,7 @@ data class AppSettings(
     val fontFamily: String = "auto",
     /** ltr（美漫/港漫）| rtl（日漫） */
     val readingDirection: String = "ltr",
-    /** screen（铺满屏幕，默认）| page（整页）| width（适应宽度）| height（适应高度） */
+    /** screen（铺满屏幕，等比完整显示，默认）| width（适应宽度）| height（适应高度）；旧值 page 并入 screen */
     val fitMode: String = "screen",
     /** 固定版式取原图（fit=original，保真但流量大） */
     val originalQuality: Boolean = false,

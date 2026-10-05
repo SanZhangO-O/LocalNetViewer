@@ -193,10 +193,11 @@ fun SettingsSheet(
 
                 if (!state.strip) {
                     Text("适应模式", style = MaterialTheme.typography.labelLarge)
+                    val currentFit = FitMode.of(settings.fitMode)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FitMode.entries.forEach { mode ->
                             FilterChip(
-                                selected = settings.fitMode == mode.id,
+                                selected = currentFit == mode,
                                 onClick = { onSettingsChange(settings.copy(fitMode = mode.id)) },
                                 label = { Text(mode.label) },
                             )

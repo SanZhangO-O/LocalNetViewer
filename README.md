@@ -88,7 +88,7 @@ gradlew.bat assembleDebug
 | 格式 | 说明 |
 |---|---|
 | TXT | 编码检测（BOM → charset-normalizer → GB18030）+ 章节切分，可配置书级编码覆盖 |
-| EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，铺满屏幕 |
+| EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，等比完整显示、尽量铺满屏幕 |
 | PDF | pypdfium2 直渲（固定版式） |
 | CBZ/CBR/CB7/CBT、图片文件夹 | 图片即页，自然排序；CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr` |
 | FB2 | XML → 块模型 |

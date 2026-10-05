@@ -4,7 +4,6 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.IntSize
 import com.zqr.localnetviewer.data.prefs.AppSettings
 import com.zqr.localnetviewer.ui.common.InsetsPx
-import com.zqr.localnetviewer.ui.reader.FillScreenScale
 import com.zqr.localnetviewer.ui.reader.FitMode
 import com.zqr.localnetviewer.ui.reader.InnerScrollAxis
 import com.zqr.localnetviewer.ui.reader.contentScaleFor
@@ -29,12 +28,13 @@ class ReaderFitModeMatrixTest {
     private fun settings(fit: String) = AppSettings.DEFAULT.copy(fitMode = fit)
 
     @Test
-    fun `固定版式四种模式的显示策略`() {
+    fun `固定版式各模式的显示策略（含旧值 page）`() {
         val expected = mapOf(
-            "screen" to (FillScreenScale to InnerScrollAxis.NONE),
-            "page" to (ContentScale.Fit to InnerScrollAxis.NONE),
+            "screen" to (ContentScale.Fit to InnerScrollAxis.NONE),
             "width" to (ContentScale.FillWidth to InnerScrollAxis.VERTICAL),
             "height" to (ContentScale.FillHeight to InnerScrollAxis.HORIZONTAL),
+            // 旧版存的 "page"（整页）：语义并入铺满屏幕，同为等比完整显示
+            "page" to (ContentScale.Fit to InnerScrollAxis.NONE),
         )
         expected.forEach { (id, pair) ->
             val s = settings(id)
@@ -66,8 +66,8 @@ class ReaderFitModeMatrixTest {
         FitMode.entries.forEach { assertEquals(it, FitMode.of(it.id)) }
         assertEquals(FitMode.SCREEN, FitMode.of(""))
         assertEquals(FitMode.SCREEN, FitMode.of("nonsense"))
-        // 老版本存的是 "page"：必须继续解析成整页，而不是被兜底改掉
-        assertEquals(FitMode.PAGE, FitMode.of("page"))
+        // 老版本存的是 "page"（整页）：已并入铺满屏幕，必须继续解析为完整显示
+        assertEquals(FitMode.SCREEN, FitMode.of("page"))
     }
 
     @Test

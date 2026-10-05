@@ -1,8 +1,6 @@
 package com.zqr.localnetviewer.ui.reader
 
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.layout.ScaleFactor
 import androidx.compose.ui.unit.IntSize
 import com.zqr.localnetviewer.data.net.dto.FontSpecDto
 import com.zqr.localnetviewer.data.net.dto.ImageSpecDto
@@ -13,7 +11,6 @@ import com.zqr.localnetviewer.data.net.dto.ViewportDto
 import com.zqr.localnetviewer.data.prefs.AppSettings
 import com.zqr.localnetviewer.ui.common.InsetsPx
 import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** 主题配色与服务器端预设一一对应（设计 4.7）。 */
@@ -32,13 +29,14 @@ enum class ReaderTheme(val id: String, val background: Long, val foreground: Lon
 /**
  * 固定版式适应模式（只改客户端显示策略，不触发重新分页，设计 6.4）。
  *
- * SCREEN 是默认：宽高比与视口接近时等比放大铺满（裁边 ≤[FILL_SCREEN_MAX_CROP]），
- * 比例差距大时退化为完整显示（保持原比例，不裁掉大半画面，见 [FillScreenScale]）；
- * PAGE 始终完整显示整页；WIDTH / HEIGHT 单向等比撑满 + 页内滚动。
+ * SCREEN 是默认：等比缩放**完整显示**整页（`Fit`），先保证图片内容不被裁切，
+ * 再尽量占满屏幕；比例与视口不符时只留黑边，绝不裁边。WIDTH / HEIGHT 单向等比
+ * 撑满 + 页内滚动。
+ *
+ * 旧版本存过 PAGE（"整页"）：语义与现在的 SCREEN 相同，解析时并入 SCREEN。
  */
 enum class FitMode(val id: String, val label: String) {
     SCREEN("screen", "铺满屏幕"),
-    PAGE("page", "整页"),
     WIDTH("width", "适应宽度"),
     HEIGHT("height", "适应高度");
 
@@ -46,39 +44,6 @@ enum class FitMode(val id: String, val label: String) {
         fun of(id: String): FitMode = entries.firstOrNull { it.id == id } ?: SCREEN
     }
 }
-
-/**
- * "铺满屏幕"的显示策略（保持原比例）。
- *
- * 图片与视口宽高比接近（等比覆盖的裁边不超过 [FILL_SCREEN_MAX_CROP]）时放大覆盖
- * 整块屏幕（`Crop` 语义）；比例差距大时退化为完整显示（`Fit` 语义）——直接
- * `ContentScale.Crop` 会在视口与图片比例差距大时裁掉大半画面（例如竖屏手机看
- * 横向跨页、横屏看单页都只能看到画面中心的一小部分，真实反馈）。
- */
-val FillScreenScale: ContentScale = object : ContentScale {
-    override fun computeScaleFactor(srcSize: Size, dstSize: Size): ScaleFactor {
-        if (srcSize.width <= 0f || srcSize.height <= 0f ||
-            dstSize.width <= 0f || dstSize.height <= 0f
-        ) {
-            // 尺寸未知（加载中）：先 1:1，测量完成后会再次计算
-            return ScaleFactor(1f, 1f)
-        }
-        val cover = max(dstSize.width / srcSize.width, dstSize.height / srcSize.height)
-        val fit = min(dstSize.width / srcSize.width, dstSize.height / srcSize.height)
-        val visibleWidth = min(srcSize.width, dstSize.width / cover)
-        val visibleHeight = min(srcSize.height, dstSize.height / cover)
-        val cropX = 1f - visibleWidth / srcSize.width
-        val cropY = 1f - visibleHeight / srcSize.height
-        return if (cropX <= FILL_SCREEN_MAX_CROP && cropY <= FILL_SCREEN_MAX_CROP) {
-            ScaleFactor(cover, cover)
-        } else {
-            ScaleFactor(fit, fit)
-        }
-    }
-}
-
-/** 覆盖裁边上限（任一方向）；超过即退化为完整显示，防止裁掉大半画面。 */
-private const val FILL_SCREEN_MAX_CROP = 0.08f
 
 enum class ReadingDirection(val id: String, val label: String) {
     LTR("ltr", "左→右"),
@@ -171,12 +136,15 @@ fun profileSignature(
     effectiveMode(settings, bookMode),
 ).joinToString("|")
 
-/** 页面显示策略：固定版式按适应模式，文本书整页 Fit。 */
+/**
+ * 页面显示策略：固定版式按适应模式，文本书整页 Fit。
+ *
+ * "铺满屏幕"即 `Fit`：完整显示优先（不裁内容、不变形），再尽量占满屏幕。
+ */
 fun contentScaleFor(settings: AppSettings, isFixed: Boolean): ContentScale {
     if (!isFixed) return ContentScale.Fit
     return when (FitMode.of(settings.fitMode)) {
-        FitMode.SCREEN -> FillScreenScale
-        FitMode.PAGE -> ContentScale.Fit
+        FitMode.SCREEN -> ContentScale.Fit
         FitMode.WIDTH -> ContentScale.FillWidth
         FitMode.HEIGHT -> ContentScale.FillHeight
     }
@@ -195,7 +163,6 @@ fun innerScrollFor(settings: AppSettings, isFixed: Boolean): InnerScrollAxis {
     if (!isFixed) return InnerScrollAxis.NONE
     return when (FitMode.of(settings.fitMode)) {
         FitMode.SCREEN -> InnerScrollAxis.NONE
-        FitMode.PAGE -> InnerScrollAxis.NONE
         FitMode.WIDTH -> InnerScrollAxis.VERTICAL
         FitMode.HEIGHT -> InnerScrollAxis.HORIZONTAL
     }
