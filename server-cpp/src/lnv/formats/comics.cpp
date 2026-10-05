@@ -74,10 +74,10 @@ ComicAdapter::ComicAdapter(const AppConfig& cfg, const BookRef& ref)
     if (std::filesystem::is_directory(ref.path, ec)) {
         // 目录容器：recursive 必须透传，否则 page_count（按 recursive 统计）与
         // 实际可取的页数不一致 —— 客户端拿到的 total_pages 会小于声称的页数
-        container_ = open_dir(ref.path, recursive);
+        container_ = open_dir(ref.path, recursive, cfg_.comic.skip_entries);
     } else if (std::filesystem::is_regular_file(ref.path, ec) && is_image_ext(ext)) {
         // 单张图片 = 单页图集：以父目录为根，仅此文件
-        container_ = open_dir(ref.path.parent_path());
+        container_ = open_dir(ref.path.parent_path(), false, cfg_.comic.skip_entries);
         single_ = path_u8_impl(ref.path.filename());
     } else if (ext == ".cbz" || ext == ".zip") {
         container_ = open_zip(ref.path);
@@ -144,7 +144,8 @@ void ComicAdapter::build_names() {
     }
     if (max_total > 0 && total > max_total)
         throw ParseError(archive_total_limit_error(total));
-    if (!preserve_order_) {
+    // 目录容器的条目已自然排序（list_dir_image_names），避免每请求对上万张图重排
+    if (!preserve_order_ && !container_->entries_presorted()) {
         std::sort(out.begin(), out.end(), natural_key_less);  // 自然排序页序（§4.9）
     }
     names_ = std::move(out);

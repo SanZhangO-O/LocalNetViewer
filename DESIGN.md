@@ -924,6 +924,9 @@ android/app/src/main/java/com/zqr/localnetviewer/
 - 页面渲染线程池化；单书同 layout 分页加锁防重复计算。
 - 漫画：JPEG 用 `Image.draft()` 按比例快速解码后再缩放；原图模式零 CPU 直通；条漫切片按需裁剪、不整体放大。
 - 大文件/大图：`limits` 配置统一设限（书籍大小、单页字节、源图像素、解析超时），越限快速失败或降级。
+- 文件夹图集（可能含上万张图片）：目录图片枚举按 `(目录, recursive, skip 规则)` + 目录
+  mtime + 2s TTL 缓存，且只凭目录项判定类型、不逐文件 `stat`；图集 rev 计数与漫画
+  取页共用同一份结果，`/meta`、`/layout` 与**每个**取页请求不再重扫目录。
 
 ---
 
@@ -1191,7 +1194,9 @@ OkHttp 磁盘缓存移除后无残留引用。
 - **条漫每片解码整张长图**：切片取页需要完整解码源图，超长图（数万像素）单片耗时与内存都高。
   需要"按需解码窗口"才能根治，V1 靠 `max_source_pixels` 兜底。
 - **漫画/条漫的页面尺寸探测每次 `/layout` 全量读图**：只读文件头能拿到尺寸，但仍需从容器
-  读出至少一段字节；200 页 CBR 的首次 layout 仍是秒级。
+  读出至少一段字节；200 页 CBR 的首次 layout 仍是秒级。源图数超过
+  `comic.strip_max_source_images`（默认 1000）时条漫回退 `fixed`，上万张图的大图集
+  不再触发全量读图（见 v0.5.2）。
 - **字符串仍硬编码在 Kotlin 里**（`strings.xml` 只有 `app_name`）：本轮未做 i18n 外提。
 - **`progress_sync` 客户端未接线**：服务器已实现 per-device LWW，客户端仍只用本地进度。
 - **`--reload` 模式忽略 `--config`**：开发模式用默认 `config.yaml`。
@@ -1347,3 +1352,38 @@ EPUB 仍一律走流式排版（图被塞进带边距的版心、四周空边）
 回归：`server/tests/test_epub_comic.py`（检测、预筛、缓存失效、工厂分流、文本书
 保持 flow）、`server-cpp/tests/test_formats.py`（图片型 EPUB → `mode=fixed` 且
 页数 = 图片数；正文 EPUB → `mode=flow`）。
+
+### v0.5.2（2026-10-05，大图集性能：目录枚举缓存 + 去掉逐文件 stat）
+
+需求：**一个图集可能含上万张图片**。原实现每次打开适配器都重扫整棵目录
+（`FolderComicContainer._scan` / C++ `DirContainer`），并且对**每张图**单独
+`getsize` / `file_size`；而 `/books/{id}/meta`、`/layout`、每个取页请求（含客户端
+±2 页预取）都会重新构造适配器，于是十万次级文件系统调用叠加在每次翻页上。同时
+`GalleryService.resolve` 的 rev 计数又独立枚举一次。
+
+两实现同步优化：
+
+- Python `formats/comics.list_folder_images` / C++ `container.list_dir_image_names`：
+  统一目录图片枚举（自然排序、跳过隐藏/符号链接/skip 规则），结果按
+  `(目录, recursive, skip 规则)` + 目录 mtime + 2s TTL 缓存；只凭目录项（`DirEntry` /
+  `directory_entry`）判定类型，**不逐文件 stat**；目录 mtime 变化立即失效，
+  recursive 子目录增删由 TTL 兜底（与既有 gallery rev 记忆同一取舍）。
+- Python `FolderComicContainer` / C++ `DirContainer` 改用该枚举；`size_of` 改为按需
+  stat（此前构造时把全部条目尺寸存字典）。C++ 目录条目已自然排序，`ComicAdapter`
+  跳过一次无谓的 O(N log N) 重排。
+- Python `gallery.list_images` / C++ `GalleryService::list_images` 复用同一份枚举：
+  rev 计数与取页不再各自重扫目录。
+
+**只传"当前 + 即将看到"的页**：固定版式（fixed）本就是按页取图（客户端当前页 +
+Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）**必须在 `/layout`
+阶段逐张探测源图高度才能切片，图集上万张时会退化成数万次读图（实测 1.5 万张约
+18.5s，客户端等到超时，表现为"打不开"）。现在新增配置
+`comic.strip_max_source_images`（默认 1000，0 = 不限）：请求 `mode=strip` 且源图数
+超过上限时自动回退 `mode=fixed`（一图一页），`/layout` 只枚举页集、不读图片，
+设备端只请求当前页与预取页。两实现使用同一阈值与语义。
+
+契约不变（HTTP 响应、rev 公式、页序一致）；回归：
+`server/tests/test_containers.py::test_folder_container_does_not_stat_every_file`、
+`::test_folder_listing_cache_refreshes_on_mtime_change`、
+`server/tests/test_api.py::test_strip_falls_back_to_fixed_for_large_gallery`、
+`::test_strip_kept_when_under_cap`。

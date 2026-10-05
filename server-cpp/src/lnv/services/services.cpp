@@ -340,62 +340,17 @@ std::optional<BookRef> GalleryService::book_ref(const std::string& book_id) cons
 
 std::vector<std::filesystem::path> GalleryService::list_images(
     const std::filesystem::path& dir, bool recursive) const {
-    // 对应 Python gallery.list_images：跳过隐藏与 skip_entries glob、
-    // 符号链接不计；返回绝对路径，按相对路径自然排序。
-    std::vector<std::pair<std::string, std::filesystem::path>> found;
-    const auto& patterns = cfg_.comic.skip_entries;
+    // 与目录容器走同一条枚举路径（open_dir → DirContainer → list_dir_image_names）：
+    // 图集 rev 计数与适配器取页共用一份带缓存的目录枚举，不再各自重扫目录，也不
+    // 逐文件 stat（对应 Python gallery.list_images → comics.list_folder_images）。
+    // 返回绝对路径（供 register 计数/标题与 book_ref 计数）。
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) return {};
-
-    auto consider = [&](const std::string& rel, const std::filesystem::path& abs) {
-        if (should_skip_entry(rel, patterns)) return;
-        if (!is_image_ext(ext_of(rel))) return;
-        found.emplace_back(rel, abs);
-    };
-
-    if (recursive) {
-        for (std::filesystem::recursive_directory_iterator it(dir, ec), end; it != end;
-             it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            std::error_code ec2;
-            const std::string name = u8_name(it->path());
-            if (it->is_directory(ec2) && !ec2) {
-                // junction 只可能出现在目录（MSVC 的 is_symlink 不识别它），漏判会在
-                // 递归目录里成环（library 扫描同款防护）
-                // Python os.walk 会把隐藏目录与符号链接目录从 dirnames 里剪掉：
-                // 不剪枝会整棵遍历 .git 等目录（即使文件最终被过滤，符号链接目录
-                // 的遍历语义也与 Python 不同）
-                if (it->is_symlink(ec2) || is_symlink_or_junction(it->path()) ||
-                    is_hidden_name(name))
-                    it.disable_recursion_pending();
-                continue;
-            }
-            if (it->is_symlink(ec2) || !it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
-            if (is_hidden_name(name)) continue;
-            // rel 路径（UTF-8，'/' 分隔）
-            std::string rel = it->path().lexically_relative(dir).generic_string();
-            consider(rel, it->path());
-        }
-    } else {
-        for (std::filesystem::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
-            if (ec) break;
-            std::error_code ec2;
-            if (it->is_symlink(ec2) || ec2) { ec2.clear(); continue; }
-            if (!it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
-            std::string name = u8_name(it->path());
-            if (is_hidden_name(name)) continue;
-            consider(name, it->path());
-        }
-    }
-
-    // 自然排序（按 rel 文本；非递归时 rel = 文件名）：2.jpg < 10.jpg
-    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) {
-        return natural_less_u32(utf8_to_u32(a.first), utf8_to_u32(b.first));
-    });
-
+    auto container = open_dir(dir, recursive, cfg_.comic.skip_entries);
+    const auto& entries = container->entries();
     std::vector<std::filesystem::path> out;
-    out.reserve(found.size());
-    for (auto& f : found) out.push_back(f.second);
+    out.reserve(entries.size());
+    for (const auto& e : entries) out.push_back(dir / std::filesystem::u8path(e.name));
     return out;
 }
 
@@ -406,7 +361,7 @@ std::vector<std::filesystem::path> GalleryService::list_images(
 // - fixed 适配器请求 flow → fixed；请求 strip 仅漫画/图集能力支持，否则 → fixed
 //   （不是 415：固定版式对 strip 的语义是退回 fixed）。
 // strip_overlap_px 仅在修正后仍是 strip 时补配置默认值。
-static LayoutProfile effective_profile(const AppConfig& cfg, const BookAdapter& adapter,
+static LayoutProfile effective_profile(const AppConfig& cfg, BookAdapter& adapter,
                                        const LayoutProfile& profile) {
     LayoutProfile p = profile;
     if (adapter.mode == "flow") {
@@ -415,6 +370,18 @@ static LayoutProfile effective_profile(const AppConfig& cfg, const BookAdapter& 
     }
     if (p.mode == "flow") p.mode = "fixed";
     if (p.mode == "strip" && !adapter.supports_strip()) p.mode = "fixed";
+    if (p.mode == "strip" && cfg.comic.strip_max_source_images > 0) {
+        // strip 要按视口高度切片，必须逐张探测源图高度。图集上万张时 /layout 会
+        // 变成数万次读图（客户端等到超时）。超过上限回退 fixed：一图一页，只枚举
+        // 页集，设备端按需取"当前页 + 预取页"。对齐 Python layouts.effective_profile。
+        int count = 0;
+        try {
+            count = adapter.page_count();
+        } catch (...) {
+            count = 0;
+        }
+        if (count > cfg.comic.strip_max_source_images) p.mode = "fixed";
+    }
     if (p.mode == "strip" && p.strip_overlap_px == 0 && cfg.comic.strip_overlap_px > 0) {
         p.strip_overlap_px = cfg.comic.strip_overlap_px;
     }

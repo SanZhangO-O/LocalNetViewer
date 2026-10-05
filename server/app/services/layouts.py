@@ -71,7 +71,21 @@ def effective_profile(config, adapter: BookAdapter, profile: LayoutProfile) -> L
             update["mode"] = "fixed"
         elif profile.mode == "flow":
             update["mode"] = "fixed"
-        if (update.get("mode", profile.mode) == "strip") and not profile.strip_overlap_px:
+        mode = update.get("mode", profile.mode)
+        if mode == "strip":
+            # 条漫要按视口高度切片，必须逐张探测源图高度。图集可能有上万张图，
+            # 全量探测会让 /layout 变成数万次读图（客户端等到超时、看起来"打不开"）。
+            # 超过上限直接回退 fixed：一图一页，只枚举页集，设备端按需取页。
+            cap = int(getattr(config.comic, "strip_max_source_images", 0) or 0)
+            if cap > 0:
+                try:
+                    count = int(adapter.page_count())
+                except Exception:
+                    count = 0
+                if count > cap:
+                    update["mode"] = "fixed"
+                    mode = "fixed"
+        if mode == "strip" and not profile.strip_overlap_px:
             cfg_overlap = int(getattr(config.comic, "strip_overlap_px", 0) or 0)
             if cfg_overlap:
                 update["strip_overlap_px"] = cfg_overlap

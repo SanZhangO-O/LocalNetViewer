@@ -18,8 +18,10 @@ import os
 import posixpath
 import tarfile
 import threading
+import time
 import zipfile
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -127,6 +129,101 @@ def is_unsafe_entry_name(norm: str) -> bool:
 
 def _sort_names(names: Sequence[str]) -> List[str]:
     return sorted(names, key=natural_key)
+
+
+# ------------------------------------------------------------------ 目录图片枚举缓存
+# 图集（文件夹虚拟书）可能含上万张图片。枚举本身不贵，但 /meta、/layout 与**每个**
+# 取页请求都会重新打开适配器：若不缓存，每次都重扫整棵目录并逐文件 stat，代价随
+# 图片数线性放大，翻页与预取会明显卡顿。这里按 (目录, recursive, skip 规则) 缓存
+# 自然排序后的相对名列表：
+# - 只凭 DirEntry 判定类型，不对每个文件单独 stat；
+# - 目录 mtime 未变且距上次扫描 < 2s 时复用；mtime 一变（增删/改名）立即重算；
+# - recursive 模式下目录 mtime 不反映子目录增删，由 TTL 兜底（与 gallery rev 记忆
+#   同一取舍，见 gallery.GALLERY_MEMO_TTL_S）。
+FOLDER_LISTING_TTL_S = 2.0
+_FOLDER_LISTING_CACHE_LIMIT = 64
+_FOLDER_LISTING_LOCK = threading.Lock()
+_FOLDER_LISTING: "OrderedDict[tuple, tuple]" = OrderedDict()
+
+
+def _scan_folder_images(root: Path, recursive: bool, patterns: Sequence[str]) -> List[str]:
+    """枚举目录下的图片（相对路径，自然排序）；跳过隐藏、符号链接与 skip 规则。
+
+    用 ``os.scandir`` 递归而不是 ``os.walk``：``DirEntry`` 的类型判定走目录项
+    缓存，避免对每个文件多做一次 ``os.path.islink`` / ``is_file`` 的 stat ——
+    上万张图时这是每请求的主要开销。
+    """
+    out: List[str] = []
+    base = Path(root)
+    if recursive:
+        stack = [base]
+        while stack:
+            current = stack.pop()
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if not entry.name.startswith("."):
+                            stack.append(Path(entry.path))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                except OSError:
+                    continue
+                rel = os.path.relpath(entry.path, base).replace("\\", "/")
+                if should_skip_entry(rel, patterns) or not is_image_name(rel):
+                    continue
+                out.append(rel)
+    else:
+        try:
+            entries = list(os.scandir(base))
+        except OSError:
+            return out
+        for entry in entries:
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            if should_skip_entry(entry.name, patterns) or not is_image_name(entry.name):
+                continue
+            out.append(entry.name)
+    return _sort_names(out)
+
+
+def list_folder_images(
+    root: Path, recursive: bool = False, patterns: Sequence[str] = ()
+) -> List[str]:
+    """带缓存的目录图片枚举（返回副本，调用方可安全持有/修改）。"""
+    base = Path(root)
+    pats = tuple(patterns or ())
+    key = (str(base), bool(recursive), pats)
+    try:
+        mtime = float(os.stat(base).st_mtime)
+    except OSError:
+        mtime = 0.0
+    now = time.monotonic()
+    with _FOLDER_LISTING_LOCK:
+        hit = _FOLDER_LISTING.get(key)
+        if (
+            hit is not None
+            and abs(float(hit[0]) - mtime) < 1e-6
+            and (now - float(hit[1])) < FOLDER_LISTING_TTL_S
+        ):
+            _FOLDER_LISTING.move_to_end(key)
+            return list(hit[2])
+    names = _scan_folder_images(base, bool(recursive), pats)
+    with _FOLDER_LISTING_LOCK:
+        _FOLDER_LISTING[key] = (mtime, now, names)
+        _FOLDER_LISTING.move_to_end(key)
+        while len(_FOLDER_LISTING) > _FOLDER_LISTING_CACHE_LIMIT:
+            _FOLDER_LISTING.popitem(last=False)
+    return list(names)
 
 
 # ------------------------------------------------------------------ 容器
@@ -504,7 +601,6 @@ class FolderComicContainer(ComicContainer):
             self._single = None
             self.recursive = recursive
         self._names = self._scan()
-        self._sizes = {n: self._safe_size(n) for n in self._names}
 
     def _safe_size(self, name: str) -> int:
         """扫描与 stat 之间文件可能被删除/改名，这里不能让 OSError 冒出来。"""
@@ -514,49 +610,22 @@ class FolderComicContainer(ComicContainer):
             return 0
 
     def _scan(self) -> List[str]:
-        out: List[str] = []
         if self._single is not None:
             if not should_skip_entry(self._single, self.patterns) and is_image_name(self._single):
                 return [self._single]
-            return out
-        if not self.root.is_dir():
-            return out
-        if self.recursive:
-            for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-                rel_dir = os.path.relpath(dirpath, self.root)
-                for fn in filenames:
-                    full = os.path.join(dirpath, fn)
-                    # 符号链接不计入页集合：read() 会因越界而拒绝，否则页数虚高且必然加载失败
-                    if os.path.islink(full):
-                        continue
-                    rel = fn if rel_dir in (".", "") else f"{rel_dir}/{fn}"
-                    rel = rel.replace("\\", "/")
-                    if should_skip_entry(rel, self.patterns) or not is_image_name(rel):
-                        continue
-                    out.append(rel)
-        else:
-            try:
-                entries = list(os.scandir(self.root))
-            except OSError as exc:
-                raise ParseError(f"目录无法读取: {exc}") from exc
-            for entry in entries:
-                try:
-                    if entry.is_symlink() or not entry.is_file():
-                        continue
-                except OSError:
-                    continue
-                if should_skip_entry(entry.name, self.patterns) or not is_image_name(entry.name):
-                    continue
-                out.append(entry.name)
-        return _sort_names(out)
+            return []
+        # 共享缓存：resolve() 的图片计数与这里取页共用同一份枚举结果，避免同一
+        # 目录被反复重扫（图集可能有上万张图）。
+        return list_folder_images(self.root, self.recursive, self.patterns)
 
     @property
     def names(self) -> List[str]:
         return self._names
 
     def size_of(self, name: str) -> int:
-        return self._sizes.get(posixpath.normpath(name), 0)
+        # 目录容器不在构造时对每张图 stat（上万张图会让每次打开都卡在文件系统上）。
+        # 只有显式索取某条目的尺寸时才 stat 一次。
+        return self._safe_size(posixpath.normpath(name))
 
     def read(self, name: str) -> bytes:
         key = posixpath.normpath(name)

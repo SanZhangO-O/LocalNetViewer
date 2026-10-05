@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import types
 import zipfile
@@ -18,6 +19,7 @@ from app.formats.comics import (
     SevenZipComicContainer,
     TarComicContainer,
     ZipComicContainer,
+    list_folder_images,
     open_container,
     rar_backend_tool,
 )
@@ -302,6 +304,49 @@ def test_folder_container_recursive(env, tmp_path: Path):
     finally:
         flat.close()
         deep.close()
+
+
+def test_folder_container_does_not_stat_every_file(env, tmp_path: Path, monkeypatch):
+    """图集可能有上万张图：构造容器不得对每张图 stat（否则每请求都卡文件系统）。
+
+    回归：``FolderComicContainer`` 曾在构造时把全部条目 ``getsize`` 存进字典。
+    """
+    root = tmp_path / "gallery"
+    root.mkdir()
+    for i in range(5):
+        (root / f"{i}.png").write_bytes(png_bytes(4, 4))
+
+    calls = {"n": 0}
+    real_getsize = os.path.getsize
+
+    def counting_getsize(path):
+        calls["n"] += 1
+        return real_getsize(path)
+
+    monkeypatch.setattr(os.path, "getsize", counting_getsize)
+
+    container = FolderComicContainer(env, root)
+    try:
+        assert len(container.names) == 5
+        assert calls["n"] == 0  # 构造阶段零 stat
+        assert container.size_of("0.png") > 0
+        assert calls["n"] == 1  # 仅显式索取尺寸时才 stat 一次
+    finally:
+        container.close()
+
+
+def test_folder_listing_cache_refreshes_on_mtime_change(tmp_path: Path):
+    """目录 mtime 变化（增删图片）必须立即刷新缓存，不等 TTL 过期。"""
+    root = tmp_path / "gallery"
+    root.mkdir()
+    (root / "a.png").write_bytes(png_bytes(4, 4))
+    assert list_folder_images(root, False, []) == ["a.png"]
+
+    (root / "b.png").write_bytes(png_bytes(4, 4))
+    # 显式把目录 mtime 往前推，避免某些文件系统的时间戳精度导致 mtime 不变
+    before = os.stat(root).st_mtime
+    os.utime(root, (before + 5, before + 5))
+    assert list_folder_images(root, False, []) == ["a.png", "b.png"]
 
 
 def test_sevenzip_missing_dependency_is_unsupported(env, tmp_path: Path, monkeypatch):

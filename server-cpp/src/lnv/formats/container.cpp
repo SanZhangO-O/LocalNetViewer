@@ -8,10 +8,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <map>
 #include <fstream>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <optional>
+#include <vector>
 
 #include <windows.h>
 #include <miniz.h>
@@ -379,54 +383,137 @@ private:
     std::string out_buf_;  // 复用缓冲（单适配器单线程约定）
 };
 
+// ============================================================ 目录图片枚举缓存
+// 图集（文件夹虚拟书）可能含上万张图片。枚举本身不贵，但 /meta、/layout 与**每个**
+// 取页请求都会重新打开适配器：不缓存就会每次重扫整棵目录并逐文件 stat，代价随图片数
+// 线性放大。这里按 (目录, recursive, skip 规则) 缓存自然排序后的相对名列表：
+// - 不逐文件 stat（只凭目录项判定类型）；
+// - 目录 mtime 未变且在 2s TTL 内复用；mtime 一变立即重算；
+// - recursive 模式下目录 mtime 不反映子目录增删，由 TTL 兜底（与 gallery rev 记忆
+//   同一取舍，kGalleryMemoTtlMs）。
+namespace {
+
+struct DirListCacheEntry {
+    bool have_mtime = false;
+    std::filesystem::file_time_type mtime{};
+    std::chrono::steady_clock::time_point checked_at{};
+    std::vector<std::string> names;
+};
+
+std::mutex g_dir_list_mutex;
+std::map<std::string, DirListCacheEntry> g_dir_list_cache;
+constexpr long long kDirListTtlMs = 2000;
+constexpr size_t kDirListCacheLimit = 64;
+
+std::string dir_list_key(const std::filesystem::path& root, bool recursive,
+                         const std::vector<std::string>& skip_globs) {
+    std::string k = path_to_utf8(root);
+    k.push_back('\x1f');
+    k.push_back(recursive ? '1' : '0');
+    for (const auto& g : skip_globs) {
+        k.push_back('\x1e');
+        k += g;
+    }
+    return k;
+}
+
+}  // namespace
+
+std::vector<std::string> list_dir_image_names(const std::filesystem::path& root, bool recursive,
+                                              const std::vector<std::string>& skip_globs) {
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return {};
+    const std::string key = dir_list_key(root, recursive, skip_globs);
+    std::error_code mec;
+    auto mtime = std::filesystem::last_write_time(root, mec);
+    const bool have_mtime = !mec;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(g_dir_list_mutex);
+        auto it = g_dir_list_cache.find(key);
+        if (it != g_dir_list_cache.end() && it->second.have_mtime == have_mtime &&
+            (!have_mtime || it->second.mtime == mtime) &&
+            (now - it->second.checked_at) < std::chrono::milliseconds(kDirListTtlMs)) {
+            return it->second.names;
+        }
+    }
+    std::vector<std::string> out;
+    auto consider = [&](const std::string& name) {
+        if (should_skip_entry(name, skip_globs)) return;
+        if (!is_image_ext(ext_of(name))) return;
+        if (is_unsafe_entry_name(name)) return;
+        out.push_back(name);
+    };
+    if (!recursive) {
+        for (auto it = std::filesystem::directory_iterator(root, ec);
+             it != std::filesystem::directory_iterator(); it.increment(ec)) {
+            if (ec) break;
+            std::error_code ec2;
+            if (it->is_symlink(ec2) || ec2) { ec2.clear(); continue; }
+            if (!it->is_regular_file(ec2) || ec2) { ec2.clear(); continue; }
+            consider(path_to_utf8(it->path().filename()));
+        }
+    } else {
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 root, std::filesystem::directory_options::skip_permission_denied, ec);
+             it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            std::error_code ec2;
+            if (it->is_directory(ec2) && !ec2) {
+                // junction 不被 is_symlink 识别（MSVC），漏判会随递归成环栈溢出；
+                // 隐藏目录剪枝（对齐 Python os.walk 的 dirnames 过滤）
+                if (it->is_symlink(ec2) || is_symlink_or_junction(it->path()) ||
+                    is_hidden_name(path_to_utf8(it->path().filename())))
+                    it.disable_recursion_pending();
+                continue;
+            }
+            if (it->is_symlink(ec2) || !it->is_regular_file(ec2) || ec2) {
+                ec2.clear();
+                continue;
+            }
+            auto rel = std::filesystem::relative(it->path(), root, ec2);
+            if (ec2) continue;
+            consider(path_to_utf8(rel.generic_wstring()));
+        }
+    }
+    std::sort(out.begin(), out.end(), natural_key_less);
+    {
+        std::lock_guard<std::mutex> lk(g_dir_list_mutex);
+        DirListCacheEntry e;
+        e.have_mtime = have_mtime;
+        e.mtime = mtime;
+        e.checked_at = now;
+        e.names = out;
+        g_dir_list_cache[key] = std::move(e);
+        if (g_dir_list_cache.size() > kDirListCacheLimit) {
+            auto oldest = g_dir_list_cache.begin();
+            for (auto it = g_dir_list_cache.begin(); it != g_dir_list_cache.end(); ++it)
+                if (it->second.checked_at < oldest->second.checked_at) oldest = it;
+            g_dir_list_cache.erase(oldest);
+        }
+    }
+    return out;
+}
+
 // ============================================================ 目录容器
 
 class DirContainer : public Container {
 public:
-    explicit DirContainer(const std::filesystem::path& path, bool recursive = false)
+    explicit DirContainer(const std::filesystem::path& path, bool recursive = false,
+                          const std::vector<std::string>& skip_globs = {})
         : root_(path) {
         std::error_code ec;
         if (!std::filesystem::is_directory(root_, ec)) throw ParseError("不是目录: " + root_.string());
-        // 非递归：只列顶层；递归（gallery.recursive / open-folder recursive=true）：
-        // 按 os.walk 语义下钻，条目名为相对路径（'/' 分隔）。
-        // 符号链接一律跳过：Python comics.py:531/545 用 entry.is_symlink() 排除，
-        // 而 is_regular_file 会跟随链接 → 图集页数比列表里报的多一张重复图。
-        auto add = [&](const std::filesystem::path& p, const std::string& name) {
-            std::error_code ec2;
-            if (std::filesystem::is_symlink(p, ec2)) return;
-            if (!std::filesystem::is_regular_file(p, ec2) || ec2) return;
-            if (is_unsafe_entry_name(name)) return;
-            auto sz = (unsigned long long)std::filesystem::file_size(p, ec2);
-            if (ec2) sz = 0;
-            entries_.push_back({name, sz, sz, 0.0});
-        };
-        if (!recursive) {
-            for (auto it = std::filesystem::directory_iterator(root_, ec);
-                 it != std::filesystem::directory_iterator(); it.increment(ec)) {
-                if (ec) break;
-                add(it->path(), path_to_utf8(it->path().filename()));
-            }
-        } else {
-            for (auto it = std::filesystem::recursive_directory_iterator(
-                     root_, std::filesystem::directory_options::skip_permission_denied, ec);
-                 it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-                if (ec) { ec.clear(); continue; }
-                std::error_code ec2;
-                // junction 不被 is_symlink 识别（MSVC），漏判会随递归成环栈溢出
-                if (it->is_directory(ec2) &&
-                    (std::filesystem::is_symlink(it->path(), ec2) ||
-                     is_symlink_or_junction(it->path()))) {
-                    it.disable_recursion_pending();
-                    continue;
-                }
-                auto rel = std::filesystem::relative(it->path(), root_, ec2);
-                if (ec2) continue;
-                add(it->path(), path_to_utf8(rel.generic_wstring()));
-            }
-        }
+        // 枚举与缓存由 list_dir_image_names 提供：目录 mtime 未变时复用上次结果，
+        // 且不对每个文件单独 stat（符号链接一律跳过，与 Python entry.is_symlink() 一致）。
+        const auto names = list_dir_image_names(root_, recursive, skip_globs);
+        entries_.reserve(names.size());
+        for (const auto& n : names) entries_.push_back({n, 0, 0, 0.0});
     }
 
     const std::vector<ContainerEntry>& entries() const override { return entries_; }
+    // 条目已由 list_dir_image_names 自然排序，build_names 无需重排（上万张图很贵）
+    bool entries_presorted() const override { return true; }
 
     std::string read(const std::string& name, long long entry_max_bytes) override {
         std::error_code ec1, ec2;
@@ -1087,8 +1174,9 @@ std::unique_ptr<Container> open_zip(const std::filesystem::path& path) {
     return std::make_unique<ZipContainer>(path);
 }
 
-std::unique_ptr<Container> open_dir(const std::filesystem::path& path, bool recursive) {
-    return std::make_unique<DirContainer>(path, recursive);
+std::unique_ptr<Container> open_dir(const std::filesystem::path& path, bool recursive,
+                                    const std::vector<std::string>& skip_globs) {
+    return std::make_unique<DirContainer>(path, recursive, skip_globs);
 }
 
 std::unique_ptr<Container> open_tar(const std::filesystem::path& path) {

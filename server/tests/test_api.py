@@ -493,6 +493,41 @@ def test_open_folder_unknown_path(api):
     assert resp.json()["code"] == "BAD_PATH"
 
 
+def test_strip_falls_back_to_fixed_for_large_gallery(make_config):
+    """条漫要逐张探测源图高度：源图数超过上限时回退 fixed，避免 /layout 全量读图。"""
+    from app.models.schemas import LayoutProfile
+    from app.services.layouts import effective_profile
+
+    class FakeAdapter:
+        mode = "fixed"
+        supports_strip = True
+
+        def page_count(self):
+            return 1200
+
+    cfg = make_config()
+    cfg.comic.strip_max_source_images = 100
+    profile = LayoutProfile(**_profile(mode="strip"))
+    assert effective_profile(cfg, FakeAdapter(), profile).mode == "fixed"
+
+
+def test_strip_kept_when_under_cap(make_config):
+    from app.models.schemas import LayoutProfile
+    from app.services.layouts import effective_profile
+
+    class FakeAdapter:
+        mode = "fixed"
+        supports_strip = True
+
+        def page_count(self):
+            return 50
+
+    cfg = make_config()
+    cfg.comic.strip_max_source_images = 100
+    profile = LayoutProfile(**_profile(mode="strip"))
+    assert effective_profile(cfg, FakeAdapter(), profile).mode == "strip"
+
+
 def test_open_folder_too_few_images(api, tmp_books: Path, make_config):
     """图片数不足时必须明确 415，而不是注册一本打不开的书。"""
     from fastapi.testclient import TestClient

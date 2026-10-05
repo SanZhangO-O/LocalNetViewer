@@ -48,6 +48,9 @@ struct ComicCfg {
     int jpeg_quality = 85;
     double strip_min_aspect = 1.5;
     int strip_overlap_px = 0;
+    // strip 需逐张探测源图高度，源图数超过该值回退 fixed（0 = 不限）。对齐 Python
+    // config.py ComicCfg.strip_max_source_images：图集上万张时避免 /layout 全量读图。
+    int strip_max_source_images = 1000;
 };
 
 struct RenderCfg {

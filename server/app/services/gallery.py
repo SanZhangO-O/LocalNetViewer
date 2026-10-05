@@ -20,11 +20,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ..config import IMAGE_EXT
-from ..util.natural import natural_key
 from ..util.paths import PathError, ext_of, makedirs_quiet, normalize_vpath, stem_of
 from ..util.textutil import content_revision
 from ..formats.base import BookRef, UnsupportedFormatError
-from ..formats.comics import should_skip_entry
+from ..formats.comics import list_folder_images
 
 if TYPE_CHECKING:  # pragma: no cover
     from .library import LibraryService
@@ -53,44 +52,13 @@ def list_images(
     recursive: bool = False,
     patterns: Optional[List[str]] = None,
 ) -> List[str]:
-    """枚举目录下的图片（相对路径，自然排序）；跳过隐藏与 skip_entries。"""
+    """枚举目录下的图片（相对路径，自然排序）；跳过隐藏与 skip_entries。
+
+    实际枚举与缓存由 ``formats.comics.list_folder_images`` 提供：注册、目录计数
+    与漫画容器的取页共用同一份结果，图集含上万张图时不会每个请求都重扫目录。
+    """
     pats = list(patterns or DEFAULT_SKIP)
-    out: List[str] = []
-    root = Path(root)
-    if not root.is_dir():
-        return out
-    if recursive:
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not d.startswith(".") and not os.path.islink(os.path.join(dirpath, d))
-            ]
-            rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
-            for fn in filenames:
-                rel = fn if rel_dir in (".", "") else f"{rel_dir}/{fn}"
-                if should_skip_entry(rel, pats) or not _is_image(rel):
-                    continue
-                # 与 FolderComicContainer._scan 保持一致：符号链接文件不计入页集合，
-                # 否则列表显示 N 张、实际分页只有 N-1 张（read() 会拒绝越界软链）
-                if os.path.islink(os.path.join(dirpath, fn)):
-                    continue
-                out.append(rel)
-    else:
-        try:
-            entries = list(os.scandir(root))
-        except OSError:
-            return out
-        for entry in entries:
-            try:
-                if entry.is_symlink() or not entry.is_file():
-                    continue
-            except OSError:
-                continue
-            if should_skip_entry(entry.name, pats) or not _is_image(entry.name):
-                continue
-            out.append(entry.name)
-    return sorted(out, key=natural_key)
+    return list_folder_images(Path(root), recursive, pats)
 
 
 def count_images(root: Path, recursive: bool = False, patterns: Optional[List[str]] = None) -> int:

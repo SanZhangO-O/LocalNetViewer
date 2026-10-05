@@ -116,6 +116,11 @@ class ComicCfg(BaseModel):
     jpeg_quality: int = Field(default=85, ge=1, le=100)
     strip_min_aspect: float = Field(default=1.5, gt=0)
     strip_overlap_px: int = Field(default=0, ge=0)
+    # 条漫（strip）切片需要探测每一张源图的原始高度：图集含上万张图时，单次
+    # /layout 会变成数万次读图（实测 1.5 万张约 18s），客户端会等到超时。
+    # 源图数超过该值时自动回退为 fixed（一图一页）—— 只枚举页集、不读图片，
+    # 设备端只请求"当前页 + 预取页"。0 = 不限制（始终允许 strip）。
+    strip_max_source_images: int = Field(default=1000, ge=0)
 
 
 class RenderCfg(BaseModel):

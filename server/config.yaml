@@ -46,6 +46,8 @@ comic:
   jpeg_quality: 85          # 缩放重编码质量
   strip_min_aspect: 1.5     # 高/宽 超过该值的长图可启用条漫 strip 模式
   strip_overlap_px: 0       # 条漫切片时的重叠像素（0 = 不重叠）
+  strip_max_source_images: 1000  # 源图数超过该值时条漫自动回退 fixed（一图一页），
+                                 # 避免上万张图时 /layout 逐张读图；0 = 不限制
 
 render:
   fonts_dir: assets/fonts

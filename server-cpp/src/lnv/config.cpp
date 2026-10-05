@@ -327,6 +327,8 @@ AppConfig load_config(const std::optional<std::string>& path) {
             if (c["jpeg_quality"]) cfg.comic.jpeg_quality = c["jpeg_quality"].as<int>();
             if (c["strip_min_aspect"]) cfg.comic.strip_min_aspect = c["strip_min_aspect"].as<double>();
             if (c["strip_overlap_px"]) cfg.comic.strip_overlap_px = c["strip_overlap_px"].as<int>();
+            if (c["strip_max_source_images"])
+                cfg.comic.strip_max_source_images = c["strip_max_source_images"].as<int>();
         }
         if (data["render"]) {
             auto r = data["render"];
@@ -376,6 +378,7 @@ AppConfig load_config(const std::optional<std::string>& path) {
           "comic.jpeg_quality 1..100");
     check(cfg.comic.strip_min_aspect > 0.0, "comic.strip_min_aspect > 0");
     check(cfg.comic.strip_overlap_px >= 0, "comic.strip_overlap_px >= 0");
+    check(cfg.comic.strip_max_source_images >= 0, "comic.strip_max_source_images >= 0");
     check(cfg.render.max_page_pixels >= 10000, "render.max_page_pixels >= 10000");
     check(cfg.cache.parsed_max_mb >= 0, "cache.parsed_max_mb >= 0");
     check(cfg.cache.page_lru_bytes >= 0, "cache.page_lru_bytes >= 0");

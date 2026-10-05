@@ -19,3 +19,30 @@
   `F:\book\[Kmoe]...epub`（缺子目录段）直接暴露旧路径。
 - 防再犯: `id → vpath` 只是缓存加速，**不得作为书存在的唯一依据**；按 id 查书
   失败时必须考虑"同指纹已移动"的情形。已由真实索引回归验证覆盖。
+
+## 2026-10-05 C++ 新函数写进 container.cpp 匿名命名空间，声明在头文件却链接失败
+- 现象: 在 `container.h` 声明、`container.cpp` 定义的 `lnv::list_dir_image_names`
+  编译通过，链接 `lnvserver.exe` 报 `LNK2019 无法解析的外部符号`（services.cpp 引用）。
+- 根因: `container.cpp` 从第 287 行起用一个大型匿名命名空间包住所有容器实现，
+  到 1169 行才闭合；新函数定义落在这个匿名命名空间内 → 内部链接，头文件声明
+  的 `lnv::` 外部符号并不存在。工厂函数（`open_dir` 等）之所以正常，是因为它们
+  定义在 1169 行之后。
+- 修复: 不导出该内部函数——让 `GalleryService::list_images` 走公开的
+  `open_dir(dir, recursive, skip_entries)` + `Container::entries()` 取名称；
+  目录枚举缓存留在 `DirContainer` 内部共享。
+- 防再犯: 在 `container.cpp` 内新增需被其他 TU 调用的函数时，定义必须放在匿名
+  命名空间之外（工厂段之后），或直接复用公开工厂 API；不要只看编译通过就认为
+  链接会通过。
+
+## 2026-10-05 删掉"当时以为无用"的 import 导致 /books/open-folder 全 500（图集打不开）
+- 现象: 优化图集枚举时把 `server/app/services/gallery.py` 的 `import os` 删掉（以为只
+  有被删除的 `os.walk`/`os.scandir` 用它），结果任何 `POST /books/open-folder` 都 500：
+  `NameError: name 'os' is not defined`（`save_registry` 里还有 `os.replace`）。
+  客户端表现为"图集打不开"。
+- 根因: `py_compile` / 导入检查只验证语法，**不验证名字在运行期是否存在**；
+  `os.replace` 藏在 `save_registry` 里，删 import 时没被静态检查发现。
+- 修复: 恢复 `import os`。用进程内 TestClient 跑 1.5 万张图的 open-folder/meta/layout
+  复现并确认 200、耗时 < 0.3s。
+- 防再犯: 删除 import 前先全局检索该**模块名下所有属性**的用法（`os.`、`os.replace`…），
+  不能只看被删代码块；改完用一次真实调用（哪怕 `python -c` 建临时书库跑 open-folder）
+  验证，而不是只依赖 `py_compile`。
