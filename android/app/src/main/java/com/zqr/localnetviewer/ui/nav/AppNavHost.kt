@@ -1,14 +1,22 @@
 package com.zqr.localnetviewer.ui.nav
 
 import android.net.Uri
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.zqr.localnetviewer.App
+import com.zqr.localnetviewer.data.prefs.AppSettings
 import com.zqr.localnetviewer.ui.browser.BrowserScreen
 import com.zqr.localnetviewer.ui.connect.ConnectScreen
 import com.zqr.localnetviewer.ui.reader.ReaderScreen
@@ -28,7 +36,22 @@ object Routes {
 fun AppNavHost() {
     val navController = rememberNavController()
     val app = App.from(LocalContext.current)
-    NavHost(navController = navController, startDestination = Routes.CONNECT) {
+    // 页面间过渡跟随界面预设（设计 6.3）：Navigation 默认是 700ms 交叉淡入淡出，
+    // 不接入预设的话，墨水屏（默认预设）上每次连接/打开书/返回都会触发多次灰阶
+    // 全刷与残影。eink 预设直接落位（单次刷新）；lcd/custom 开动画时保留原默认渐变。
+    // DataStore 就绪前用 DEFAULT（eink）兜底，冷启动第一跳也不会有动画。
+    val settings by app.settingsStore.settingsFlow.collectAsStateWithLifecycle(
+        initialValue = AppSettings.DEFAULT
+    )
+    val animate = settings.animateTransitions
+    NavHost(
+        navController = navController,
+        startDestination = Routes.CONNECT,
+        enterTransition = { if (animate) fadeIn(tween(700)) else EnterTransition.None },
+        exitTransition = { if (animate) fadeOut(tween(700)) else ExitTransition.None },
+        popEnterTransition = { if (animate) fadeIn(tween(700)) else EnterTransition.None },
+        popExitTransition = { if (animate) fadeOut(tween(700)) else ExitTransition.None },
+    ) {
         composable(Routes.CONNECT) {
             ConnectScreen(
                 onConnected = {

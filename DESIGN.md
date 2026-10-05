@@ -760,6 +760,9 @@ android/app/src/main/java/com/zqr/localnetviewer/
   - 字号（`size_px`）、行距、左右/上下边距、段落间距；
   - 主题（white / paper / sepia / green / dark）；
   - 字体（来自 `/render/fonts`，P2）；
+  - 界面预设（**eink 墨水屏，默认** / lcd 常规屏 / custom 自定义）：控制全部界面过渡
+    （页面间导航、跳页滚动、工具栏显隐）——动画在墨水屏上表现为多次灰阶全刷与残影，
+    eink 预设一律直接落位；lcd 保留渐变动画；custom 按开关。
   - 任意项变化 → 重建 layout（3.3 流程），位置不失。
 - 漫画控制（M3）：阅读方向（右→左日漫 / 左→右）、适应模式（**铺满屏幕（默认）** / 适应宽度 / 适应高度）、原图 / 流畅模式切换；双页跨页与条漫连续滚动放 M4。
   - **铺满屏幕**：等比缩放**完整显示**整页（`ContentScale.Fit`）——先保证图片内容
@@ -777,6 +780,9 @@ android/app/src/main/java/com/zqr/localnetviewer/
 
 ### 6.4 阅读器实现要点
 
+- **界面过渡跟随预设**：页面间导航（NavHost enter/pop 过渡）、程序化跳页（Pager /
+  LazyList）、工具栏显隐一律按界面预设执行；默认 eink 全部直接落位（单次刷新），
+  只有 lcd / custom（开动画）才做动画过渡。页面图片加载不做淡入（Coil crossfade 关闭）。
 - **页码与章节名**：来自 layout 响应的章节表 + 当前页序号，客户端自行计算（无需逐页请求）；**锚点**来自 `/pages/{n}/meta`（每次翻页停稳后请求一次，防抖 300ms）。
 - **预取**：当前页稳定后，后台预取 `±1、±2` 页；Pager 自身 `beyondViewportPageCount = 1`。
   实现方式：独立 scope + `Semaphore(2)` 限并发（当前页由 Pager 自己的请求发起，不经过预取），
