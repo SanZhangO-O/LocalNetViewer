@@ -83,17 +83,23 @@ int main(int argc, char** argv) {
     if (port && *port) cfg.server.port = *port;
 
     // 2) 上下文（ensure_dirs、缓存、服务对象等）
+    // 扫描模式（library.scan_mode）：lazy（默认）不做任何全量扫描，只由 /files
+    // 列出目录时按需扫描"用户正在看的目录"；eager 保留旧行为。
+    const bool lazy_scan = cfg.library.scan_mode == "lazy";
     // background_scan 必须与 --no-scan 一致（对应 run.py: create_app(cfg,
     // background_scan=bool(args.no_scan))）：--no-scan 的语义是"不阻塞启动、后台补扫"，
     // 传 false 会让它变成"永远不扫描"，新放进书库的书在重启前都看不见。
-    auto ctx = lnv::AppContext::create(std::move(cfg), no_scan);
+    // lazy 模式没有全量扫描，故 background_scan 恒为 false。
+    auto ctx = lnv::AppContext::create(std::move(cfg), /*background_scan=*/!lazy_scan && no_scan);
     if (!ctx) {
         std::fprintf(stderr, "初始化失败\n");
         return 2;
     }
 
-    // 3) 非 --no-scan：启动时同步全量扫描一次；失败仅警告继续
-    if (!no_scan) {
+    // 3) eager + 非 --no-scan：启动时同步全量扫描一次；失败仅警告继续。
+    //    lazy 模式跳过：索引由 /files 的按目录扫描增量补齐（shared index.json 中
+    //    上次运行留下的条目仍会加载并复用）。
+    if (!lazy_scan && !no_scan) {
         try {
             ctx->library->scan_blocking();
         } catch (const std::exception& e) {

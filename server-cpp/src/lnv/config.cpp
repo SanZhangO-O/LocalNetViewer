@@ -191,6 +191,13 @@ LibraryCfg parse_library(const YAML::Node& n) {
             throw ConfigError("library.sort 只支持 natural/name: " + sv);
         c.sort = sv;
     }
+    if (n["scan_mode"]) {
+        // C++ 扩展键（Python 忽略）：仅 lazy/eager，拼错启动即报错（同 sort 的处理）
+        std::string sm = n["scan_mode"].as<std::string>();
+        if (sm != "lazy" && sm != "eager")
+            throw ConfigError("library.scan_mode 只支持 lazy/eager: " + sm);
+        c.scan_mode = sm;
+    }
     if (n["encoding_overrides"] && n["encoding_overrides"].IsMap()) {
         for (const auto& kv : n["encoding_overrides"]) {
             const std::string key = kv.first.as<std::string>();
