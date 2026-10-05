@@ -212,7 +212,7 @@ class GalleryService:
         if real is None or not real.exists():
             return None
         # 图集修订号契约：sha1("<id>:<图片数>:<目录 mtime 秒>")[:12]；
-        # stat 失败时退化为 book_id（跨实现约定）。图片数必须实时枚举：
+        # stat 失败时退化为 book_id。图片数必须实时枚举：
         # 目录 mtime 在 recursive 模式下不会随子目录增删改变，只有计数能兜住。
         # 但枚举很贵且 resolve() 每请求都调：目录 mtime 未变且 2s 内校验过则
         # 复用记忆的 (count, revision)；mtime 一变立即重算，register/forget 失效。

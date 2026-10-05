@@ -133,7 +133,7 @@ class MobiAdapter(FlowAdapter):
     def _converted_path(env: AdapterEnv, ref: BookRef) -> Path:
         out_dir = env.config.cache_dir / "converted"
         makedirs_quiet(out_dir)
-        # 文件名带内容修订号（跨实现契约，与 C++ 一致）：内容变化后新 rev 指向新
+        # 文件名带内容修订号：内容变化后新 rev 指向新
         # 文件，失效时仍在途的旧转换（先写 .tmp 再 replace）永远不会被新 rev 采用，
         # 关闭"失效与转换竞态"导致的旧 EPUB 回灌。无 rev 时退回 book_id。
         rev = str(getattr(ref, "revision", "") or "")

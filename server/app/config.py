@@ -58,8 +58,8 @@ class LibraryRootCfg(BaseModel):
     @field_validator("password", mode="before")
     @classmethod
     def _coerce_password(cls, v: object) -> object:
-        # YAML 未加引号的数字密码（password: 123456）按字符串收下，与 C++ 实现一致；
-        # 显式 null 原样透传，由 str 类型校验按配置错误拒绝（与 C++ 拒绝 null 一致）。
+        # YAML 未加引号的数字密码（password: 123456）按字符串收下；
+        # 显式 null 原样透传，由 str 类型校验按配置错误拒绝。
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             return str(v)
         return v

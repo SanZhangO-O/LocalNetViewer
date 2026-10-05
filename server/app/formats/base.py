@@ -224,7 +224,7 @@ class BookRef:
     size: int = 0
     mtime: float = 0.0
     virtual: bool = False
-    # 内容修订号（sha1(id:size:mtime)[:12]，跨实现契约）：用于 ETag 与缓存键
+    # 内容修订号（sha1(id:size:mtime)[:12]）：用于 ETag 与缓存键
     revision: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
 

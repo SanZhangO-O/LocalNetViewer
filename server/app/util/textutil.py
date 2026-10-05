@@ -20,7 +20,7 @@ def stable_hash(value: object, length: int = 16) -> str:
 
 
 def content_revision(book_id: str, size: int, mtime: float) -> str:
-    """内容修订号（跨实现契约，与 C++ 服务器一致）。
+    """内容修订号。
 
     ``sha1("<book_id>:<size>:<int(mtime)>")[:12]``，mtime 取**地板秒**：
     重启 / 跨进程稳定，供 ``revision`` 字段、页面/封面 ETag 与内存缓存键使用。

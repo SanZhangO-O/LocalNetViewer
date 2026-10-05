@@ -677,7 +677,7 @@ Cache-Control: private, max-age=31536000, immutable
 | 页元数据 | 与对应页面图片的键一致 | 同上 |
 | 封面 | book_id + **rev** + w | `max-age=1天` |
 
-**内容修订号 `revision`**（跨实现契约，Python 与 C++ 服务器一致）：
+**内容修订号 `revision`**：
 `sha1("<book_id>:<size>:<mtime 地板秒>")[:12]`（图集虚拟书：`size` 换图片数、`mtime` 换目录
 stat）。`/layout`、`/meta` 返回该字段；页面/封面 ETag 与服务器内存缓存键都含 rev；页面与
 页元数据 URL 由客户端附加 `&rev=`，封面 URL 由服务器下发时带 `?rev=`。这样"同尺寸就地
@@ -1220,9 +1220,9 @@ OkHttp 磁盘缓存移除后无残留引用。
 
 ### v0.4（2026-10-04，架构审查修复）
 
-对 Python / C++ / Android 三套实现做了一轮架构审查，修复下列问题；新增跨实现
-**内容修订号 `revision`** 契约（见 5.4）。验证：`compileall` 通过、`build.ps1` 构建
-通过、`assembleDebug` 构建通过（按项目约定未跑测试套件）。
+对 Python / Android 两套实现做了一轮架构审查，修复下列问题；新增
+**内容修订号 `revision`** 契约（见 5.4）。验证：`compileall` 通过、`assembleDebug`
+构建通过（按项目约定未跑测试套件）。
 
 **Python 服务器**
 
@@ -1237,23 +1237,6 @@ OkHttp 磁盘缓存移除后无残留引用。
 | 7 | `ParsedCache` 不校验缓存内 book_id | 不匹配即隔离为未命中 |
 | 8 | 磁盘 LRU 按写入时间淘汰，热文件会被冷文件挤掉 | 读命中时 touch mtime |
 | 9 | 死代码 / 竞态 | 删除同步 `open_adapter`、`refresh_backend_status`；`scanning` 改 `threading.Event`；关停时索引写在 IO 线程；`supports_strip()` 取代 `isinstance` |
-
-**C++ 服务器**
-
-| # | 缺陷 | 修正 |
-|---|---|---|
-| 1 | detach 的分页线程可活过 `AppContext`，使用已析构的 `FontManager`（UAF） | `FontManager` 改 `shared_ptr` 并被工作线程按值捕获 |
-| 2 | 两份内存缓存（其一为死状态）、配置不生效 | 删除 `AppContext` 重复缓存；`require_layout`/搜索统一走 `LayoutsService` 的配置化缓存 |
-| 3 | PDFium 进程全局库被 12 线程并发调用 | 全局递归互斥锁串行化所有 `FPDF_*` 调用 |
-| 4 | 重活与轻请求共用请求线程池，慢归档/PDF 饿死其它端点 | 进程级 `HeavyGate`（4 槽、可重入）包住适配器构造、外部容器、PDF 渲染、MOBI 转换 |
-| 5 | strip 语义与 Python 不一致（PDF + strip 变 415） | 镜像 Python：非漫画适配器回落 fixed；能力用虚函数而非类型判断 |
-| 6 | `calibre_available()` 每条目录项都全 PATH 扫描 | 进程内记忆化 |
-| 7 | MOBI 每书锁表无上限 | 改用 `KeyedLocks` |
-| 8 | EPUB 兜底字体建了进程级全局 `FontManager` | 经 `AdapterEnv.fonts` 使用 AppContext 实例 |
-| 9 | 共享缓存文件里的异常数值 `double→int` 是 UB | 范围校验后拒绝（按损坏处理） |
-| 10 | 内容变化通知缺失（与 Python 同类问题） | 扫描/列目录/`require_book` 三路通知并清理派生缓存与转换产物 |
-| 11 | 修订号契约 | 与 Python 逐字节一致（含图集）；ETag/缓存键/cover_url/304 全覆盖 |
-| 12 | "缓存与 Python 互读"无测试 | 新增 `tests/test_cross_impl.py`（互读 + layout_id 相等；缺解释器自动 skip） |
 
 **Android 客户端**
 
@@ -1278,27 +1261,22 @@ OkHttp 磁盘缓存移除后无残留引用。
 |---|---|---|
 | 1 | `server/.gitignore` 的 `cache/` 误伤源码包 `server/app/cache/*.py`（缓存层从未纳入版本控制） | 改为根锚定 `/cache/`；`app/cache/*.py` 需 `git add` 纳入 |
 
-**仍然存在的已知限制（本轮未扩大范围）**：双服务器实现仍是手工镜像契约（现已有互读
-测试兜底，但无代码生成）；C++ 重活仍占用请求线程（`HeavyGate` 只限制占用上限，未做
-独立线程池）；缓存配额清理仍是每次写入 O(n) 目录遍历；Python/C++ 的 JSON 键序与
-`y0` 数值类型差异照旧（可互读，非逐字节相等）。
+**仍然存在的已知限制（本轮未扩大范围）**：缓存配额清理仍是每次写入 O(n) 目录遍历。
 
 ### v0.4.1（2026-10-04，v0.4 改动的对抗性 review 修复）
 
 对 v0.4 的全部改动做了一轮六轨 review（安全 / 性能 / 逻辑 / 发布安全 / 重复 / 死代码），
-修复以下问题；三套实现重新构建通过。
+修复以下问题；Python 与 Android 重新构建通过。
 
 | # | 问题 | 修正 |
 |---|---|---|
 | 1 | **安全**：`LayoutStore.path_for` 把客户端传入的 `layout_id` 直接拼进缓存路径，`_quarantine` 会 unlink → 可经 `../..` 删除任意 `*.json.gz` | `util/paths.is_safe_id`（`[A-Za-z0-9_-]{1,64}`）严格校验 `book_id`/`layout_id`；非法值按未命中处理，绝不构造/删除路径（LayoutStore + ParsedCache 全部入口） |
-| 2 | 图集 rev 每次请求全量枚举目录（Python `count_images` / C++ `list_images`） | 两者都加进程内记忆：目录 mtime 未变且 2s 内复用 `(count, rev)`，mtime 变化立即重算，register/forget 时清除 |
-| 3 | 扫描可能对同一次变化通知两次（等长编辑指纹不变，只看 book_id 的去重失效） | Python `_claim_scan_change` 追加"live 仍处于变化前 size/mtime"条件；C++ 扫描提交前快照 live 索引，已由请求路径处理过的变化跳过 |
-| 4 | MOBI 失效与在途转换竞态：旧的 `{book_id}.epub` 会在失效后被重新发布并采用 | 转换产物按内容修订号命名 `{book_id}.{revision}.epub`（两实现一致），新 rev 天然不命中旧产物；失效时清理该书全部旧 rev 与 `.tmp` |
-| 5 | C++ `HeavyGate` 无限等待，慢重活可占满 12 个请求线程且没有 503 | 有界等待（5s），超时抛 `ServerBusyError`（复用 SERVER_BUSY → 503 语义） |
-| 6 | PDFium 全局锁覆盖了像素转换与 JPEG 编码，所有 PDF 编码被串行化 | 锁只覆盖 FPDF 调用 + 原始位图拷贝；BGRA→RGBA 与编码在锁外执行（`page_bytes`/`pair_bytes`） |
+| 2 | 图集 rev 每次请求全量枚举目录（Python `count_images`） | 加进程内记忆：目录 mtime 未变且 2s 内复用 `(count, rev)`，mtime 变化立即重算，register/forget 时清除 |
+| 3 | 扫描可能对同一次变化通知两次（等长编辑指纹不变，只看 book_id 的去重失效） | Python `_claim_scan_change` 追加"live 仍处于变化前 size/mtime"条件 |
+| 4 | MOBI 失效与在途转换竞态：旧的 `{book_id}.epub` 会在失效后被重新发布并采用 | 转换产物按内容修订号命名 `{book_id}.{revision}.epub`，新 rev 天然不命中旧产物；失效时清理该书全部旧 rev 与 `.tmp` |
 | 7 | Android 退出兜底落盘改为纯异步，进程被立刻杀死可能丢最后位置 | `applicationScope` 异步写 + 退出路径有界 join 300ms（正常毫秒级完成，异常不卡退出） |
 | 8 | 封面 URL 两个构造器漂移：服务端 URL 只有 `rev`，本地 URL 只有 `w`，`width` 被静默丢弃 | 使用服务端 `cover_url` 时补 `&w=`；语义与回退路径一致 |
-| 9 | 死代码 | C++ 移除不可达的 `compute_file_rev` 回退与未使用的 `HeavyGate::active/slots`；Android `meta.revision` 改为布局响应缺省时的回退值 |
+| 9 | 死代码 | Android `meta.revision` 改为布局响应缺省时的回退值 |
 
 
 ### v0.4.2（2026-10-04，真实书籍 MOBI 闭环验证修复）
@@ -1308,7 +1286,7 @@ OkHttp 磁盘缓存移除后无残留引用。
 
 | # | 缺陷 | 修正 |
 |---|---|---|
-| 1 | 转换临时文件命名 `{book_id}.epub.tmp` 直接传给 `ebook-convert`，而 Calibre 按输出文件**扩展名**选择输出插件 → `ValueError: No plugin to handle output format: tmp`，任何 MOBI/AZW3 都无法转换（两实现同病） | Python `formats/mobi.py` / C++ `mobi.cpp`：临时名改为 `{book_id}.{rev}.epub.tmp.epub`（保持 `.epub` 结尾，原子 replace 语义与失效清理前缀匹配均不变）；PORT_SPEC 4.3 同步契约；回归测试 `server/tests/test_mobi_convert.py`（无需安装 Calibre，假 subprocess.run 模拟其按扩展名拒绝的行为） |
+| 1 | 转换临时文件命名 `{book_id}.epub.tmp` 直接传给 `ebook-convert`，而 Calibre 按输出文件**扩展名**选择输出插件 → `ValueError: No plugin to handle output format: tmp`，任何 MOBI/AZW3 都无法转换 | Python `formats/mobi.py`：临时名改为 `{book_id}.{rev}.epub.tmp.epub`（保持 `.epub` 结尾，原子 replace 语义与失效清理前缀匹配均不变）；回归测试 `server/tests/test_mobi_convert.py`（无需安装 Calibre，假 subprocess.run 模拟其按扩展名拒绝的行为） |
 
 验证：真实 HTTP 全链路（meta → layout → 渲染 1/中间/末页 → 锚点往返 → 封面）对
 `F:\book\仁医\仁医01.mobi` 全部通过；转换产物命中 `cache/converted/` 缓存。
@@ -1320,7 +1298,7 @@ OkHttp 磁盘缓存移除后无残留引用。
 
 | # | 缺陷 | 修正 |
 |---|---|---|
-| 1 | 漫画型 MOBI 没有进入固定版式漫画管线 | `formats/mobi.py`：转换后扫描 spine（块模型与 flow 一致），图片页 ≥8 且平均每页正文 ≤64 字符 → 判定漫画，`open_mobi_adapter` 分流到 `MobiComicAdapter(FixedAdapter)`，页 = spine 图片顺序，完整复用漫画管线（fit=viewport/original、双页跨页、条漫、封面）；文本型 MOBI 行为不变。检测结果进程内缓存（转换产物路径 + mtime/size，LRU 32 条）。PORT_SPEC 4.3 已注明 C++ 移植待办；回归测试 `server/tests/test_mobi_comic.py`（含误判防护：插图小说/残书不分流） |
+| 1 | 漫画型 MOBI 没有进入固定版式漫画管线 | `formats/mobi.py`：转换后扫描 spine（块模型与 flow 一致），图片页 ≥8 且平均每页正文 ≤64 字符 → 判定漫画，`open_mobi_adapter` 分流到 `MobiComicAdapter(FixedAdapter)`，页 = spine 图片顺序，完整复用漫画管线（fit=viewport/original、双页跨页、条漫、封面）；文本型 MOBI 行为不变。检测结果进程内缓存（转换产物路径 + mtime/size，LRU 32 条）。回归测试 `server/tests/test_mobi_comic.py`（含误判防护：插图小说/残书不分流） |
 
 验证：仁医01.mobi 真实 HTTP 全链路 —— meta 返回 `mode=fixed`、`page_count=187`；
 `fit=viewport` 渲染整页漫画铺满视口宽度；双页拼接、封面、锚点（页定位）全部通过。
@@ -1338,22 +1316,22 @@ OkHttp 磁盘缓存移除后无残留引用。
   `BOOK_NOT_FOUND`（asset 先校验书籍再判 304）；`/server/info` 未带凭据时返回空列表 +
   `auth_required=true`（客户端据此提示输入密码）。
 
-三套实现同步：Python `services/access.py` + `api/deps.py`；C++ `lnv/auth.*`；
+两套实现同步：Python `services/access.py` + `api/deps.py`；
 Android 连接页密码框与"按地址+密码"的历史记录。回归测试：`server/tests/test_access.py`
 （解析规则 + HTTP 过滤/越权/401/全锁场景）。
 
 ### v0.5.1（2026-10-05，图片型 EPUB 分流：显示图片就铺满屏幕）
 
 需求：**只要是显示图片（漫画），就铺满屏幕**。v0.4.3 只覆盖 MOBI，原生图片型
-EPUB 仍一律走流式排版（图被塞进带边距的版心、四周空边），且 C++ 版没有该分流。
-本次把检测与固定版式适配抽成两实现共用的模块：
+EPUB 仍一律走流式排版（图被塞进带边距的版心、四周空边）。
+本次把检测与固定版式适配抽成专门模块：
 
-- Python `formats/imagebook.py` / C++ `formats/imagebook.{h,cpp}`：按 spine 块模型
+- Python `formats/imagebook.py`：按 spine 块模型
   统计，图片页 ≥8 且平均每页正文 ≤64 字符 → 图片书，按**固定版式漫画**打开
   （每图一页，复用 fit=viewport/original、双页跨页、条漫、封面）；文本型
   EPUB/MOBI 行为不变（`server/tests/test_mobi_comic.py` 语义保持）；
-- 直接 EPUB 的检测在 `/meta` 阶段也会执行：先用廉价预筛（Python 用 zip 未压缩
-  尺寸、C++ 用已读入内存的 spine 字节数）判断"正文总量相对图片数是否大到不值得
+- 直接 EPUB 的检测在 `/meta` 阶段也会执行：先用廉价预筛（zip 未压缩
+  尺寸）判断"正文总量相对图片数是否大到不值得
   做块扫描"，只有候选书才解析 HTML，文本 EPUB 的 meta 速度不受影响；
 - 检测结果进程内缓存（键 = 路径 + mtime/size，LRU 32；MOBI 为转换产物路径 + rev，
   内容变化自然失效）；
@@ -1366,28 +1344,26 @@ EPUB 仍一律走流式排版（图被塞进带边距的版心、四周空边）
   已直接修正设备的残留值；新安装默认 screen）。
 
 回归：`server/tests/test_epub_comic.py`（检测、预筛、缓存失效、工厂分流、文本书
-保持 flow）、`server-cpp/tests/test_formats.py`（图片型 EPUB → `mode=fixed` 且
-页数 = 图片数；正文 EPUB → `mode=flow`）。
+保持 flow）。
 
 ### v0.5.2（2026-10-05，大图集性能：目录枚举缓存 + 去掉逐文件 stat）
 
 需求：**一个图集可能含上万张图片**。原实现每次打开适配器都重扫整棵目录
-（`FolderComicContainer._scan` / C++ `DirContainer`），并且对**每张图**单独
+（`FolderComicContainer._scan`），并且对**每张图**单独
 `getsize` / `file_size`；而 `/books/{id}/meta`、`/layout`、每个取页请求（含客户端
 ±2 页预取）都会重新构造适配器，于是十万次级文件系统调用叠加在每次翻页上。同时
 `GalleryService.resolve` 的 rev 计数又独立枚举一次。
 
-两实现同步优化：
+优化：
 
-- Python `formats/comics.list_folder_images` / C++ `container.list_dir_image_names`：
+- Python `formats/comics.list_folder_images`：
   统一目录图片枚举（自然排序、跳过隐藏/符号链接/skip 规则），结果按
-  `(目录, recursive, skip 规则)` + 目录 mtime + 2s TTL 缓存；只凭目录项（`DirEntry` /
-  `directory_entry`）判定类型，**不逐文件 stat**；目录 mtime 变化立即失效，
+  `(目录, recursive, skip 规则)` + 目录 mtime + 2s TTL 缓存；只凭目录项（`DirEntry`）
+  判定类型，**不逐文件 stat**；目录 mtime 变化立即失效，
   recursive 子目录增删由 TTL 兜底（与既有 gallery rev 记忆同一取舍）。
-- Python `FolderComicContainer` / C++ `DirContainer` 改用该枚举；`size_of` 改为按需
-  stat（此前构造时把全部条目尺寸存字典）。C++ 目录条目已自然排序，`ComicAdapter`
-  跳过一次无谓的 O(N log N) 重排。
-- Python `gallery.list_images` / C++ `GalleryService::list_images` 复用同一份枚举：
+- Python `FolderComicContainer` 改用该枚举；`size_of` 改为按需
+  stat（此前构造时把全部条目尺寸存字典）。
+- Python `gallery.list_images` 复用同一份枚举：
   rev 计数与取页不再各自重扫目录。
 
 **只传"当前 + 即将看到"的页**：固定版式（fixed）本就是按页取图（客户端当前页 +
@@ -1396,7 +1372,7 @@ Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）
 18.5s，客户端等到超时，表现为"打不开"）。现在新增配置
 `comic.strip_max_source_images`（默认 1000，0 = 不限）：请求 `mode=strip` 且源图数
 超过上限时自动回退 `mode=fixed`（一图一页），`/layout` 只枚举页集、不读图片，
-设备端只请求当前页与预取页。两实现使用同一阈值与语义。
+设备端只请求当前页与预取页。
 
 契约不变（HTTP 响应、rev 公式、页序一致）；回归：
 `server/tests/test_containers.py::test_folder_container_does_not_stat_every_file`、
@@ -1418,35 +1394,21 @@ Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）
 - 回归：`android/app/src/test/.../ReaderFitModeDefaultTest`（默认值、绝不裁边、
   旧值兼容）、`ReaderFitModeMatrixTest`（模式矩阵）。
 
-### v0.6（2026-10-05，三端对抗性审查修复）
+### v0.6（2026-10-05，双端对抗性审查修复）
 
-对 Python / C++ / Android 三套实现做了一轮新审查（安全 / 功能 / 性能 / 一致性），
-修复下列问题。验证：`py_compile` 通过、`build.ps1` 构建通过、`assembleDebug`
+对 Python / Android 两套实现做了一轮新审查（安全 / 功能 / 性能 / 一致性），
+修复下列问题。验证：`py_compile` 通过、`assembleDebug`
 构建通过（按项目约定未跑测试套件）。
-
-**P0：C++ 缓存路径穿越可任意删除文件**
-
-| # | 缺陷 | 修正 |
-|---|---|---|
-| 1 | C++ 未移植 Python v0.4.1 的 `is_safe_id`：客户端可控的 `layout_id`（`GET /books/x/pages/1/meta?layout_id=../../foo`，query 任意）被直接拼进缓存路径 `cache/layouts/{book_id}/{layout_id}.json.gz`，解析失败即 `remove()`；带盘符的分量还会整体替换路径。默认配置下未鉴权可达，可删除任意可读的 `*.json.gz` | `util/paths` 新增 `is_safe_id`（`[A-Za-z0-9_-]{1,64}`）；`LayoutsDiskCache::get/put`、`ParsedCache::get/put`、`invalidate_book` 全部前置校验，非法值按未命中处理，绝不构造/删除路径 |
 
 **P1：Python 服务器**
 
 | # | 缺陷 | 修正 |
 |---|---|---|
-| 2 | 跨书库同指纹副本屏蔽可见书：两库有同一本书（size + 头 1MB 相同 ⇒ 同 book_id）时 `_by_id` 指向后扫描的（通常私密库）路径，公开凭据列表能看到、打开 404；且 `book_by_id` 每次请求做全索引兜底扫描、截断 `[:8]`（多次移动后仍会 404） | `book_by_id(book_id, allowed)` 范围感知：主路径可用且可见时直接交付（热路径不再 O(n) 扫描），否则按序找可见兜底并晋升，去掉 `[:8]`；`context.require_book` 把 scope 传下去。C++ `LibraryService::require_book` 同步支持 `allow` 过滤 |
+| 2 | 跨书库同指纹副本屏蔽可见书：两库有同一本书（size + 头 1MB 相同 ⇒ 同 book_id）时 `_by_id` 指向后扫描的（通常私密库）路径，公开凭据列表能看到、打开 404；且 `book_by_id` 每次请求做全索引兜底扫描、截断 `[:8]`（多次移动后仍会 404） | `book_by_id(book_id, allowed)` 范围感知：主路径可用且可见时直接交付（热路径不再 O(n) 扫描），否则按序找可见兜底并晋升，去掉 `[:8]`；`context.require_book` 把 scope 传下去 |
 | 3 | EPUB zip 炸弹防护被绕过：`ebooklib.read_epub` 会把 manifest 每个条目整块读入内存，自有 `_read_guarded` 只覆盖手写读取路径 | `epub.py::_check_archive_limits`：打开模型前按 zip 中央目录预检单条目（`max_archive_entry_mb`）与总量（`max_archive_total_mb`），超限直接 PARSE_FAILED |
-| 4 | `max_page_pixels` 形同虚设：Viewport 无上限、`clamp_scale` 最低 0.5，`100000×100000` 视口仍分配约 7.5GB 画布 | 两实现 `clamp_scale` 改为按 `sqrt(max_pixels / (w×h))` 解可用倍率（可低于 0.5），画布像素数有硬上界 |
+| 4 | `max_page_pixels` 形同虚设：Viewport 无上限、`clamp_scale` 最低 0.5，`100000×100000` 视口仍分配约 7.5GB 画布 | `clamp_scale` 改为按 `sqrt(max_pixels / (w×h))` 解可用倍率（可低于 0.5），画布像素数有硬上界 |
 | 5 | 分页退化为 O(块数 × 页数)：`iter_items` 每页从章首第 0 块 `enumerate` 再 `continue` 跳过 | 从锚点块直接 `range` 起步（单章长文不再在跳过的块上耗时间） |
-| 6 | `fit=original` 超 `max_page_bytes` 只提高 JPEG 质量、保持原宽，编码后不复查（PNG 大图仍超限） | `comics._shrink_to_byte_cap`（C++ `shrink_to_byte_cap`）：按 `sqrt(cap/size)` 逐次缩小重编码直到落入上限 |
-
-**P1：C++ 服务器**
-
-| # | 缺陷 | 修正 |
-|---|---|---|
-| 7 | fixed/strip 的 `/layout` 无 `KeyedLocks`、无 `run_with_timeout`（flow 有，Python 两模式都有）：大图集/CBR 枚举可无限占用请求线程、并发重复枚举 | 加同款锁 + 超时；worker 自持 `cfg/ref` 并自行打开适配器（调用方超时返回后会销毁传入 adapter，捕获引用会悬垂） |
-| 8 | `/pages/{n}` 先构造适配器再查页缓存：CBR 命中缓存的翻页也会跑 `unrar` 列目录，可把 200 拖成 503/422 | flow 与 fixed 都改为缓存未命中才构造适配器 |
-| 9 | `/files` 分页是"全目录做完重活再切片"：几万文件的目录翻第 2 页也全量 stat + 读 1MB 头算指纹 + 数子目录图片 | 改两阶段（与 Python 同款）：第一阶段只按名字分类/自然排序/切片，第二阶段才对页内条目做重活；顺带修复"列出后消失的文件显示成 0 字节条目" |
+| 6 | `fit=original` 超 `max_page_bytes` 只提高 JPEG 质量、保持原宽，编码后不复查（PNG 大图仍超限） | `comics._shrink_to_byte_cap`：按 `sqrt(cap/size)` 逐次缩小重编码直到落入上限 |
 
 **P1：Android 客户端**
 
@@ -1461,33 +1423,27 @@ Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）
 
 | # | 缺陷 | 修正 |
 |---|---|---|
-| 14 | meta/locate 先查 layout 后鉴权：不可见书库的 book_id 可借越界页响应探测 `total_pages` | 两实现先 `require_book` 再查 layout（与 `/pages` 一致） |
-| 15 | `/files?path=/` 的 `libraries` 带真实文件系统路径（`/server/info` 已剔除） | 两实现都不再下发 `path` |
-| 16 | 缓存文件是合法非对象 JSON（`null`/`[]`）时 `.get()/value()` 抛异常 → 该 layout 永远 500 且不自愈 | 两实现按损坏隔离（Python 校验 `isinstance(dict)`，C++ `is_object()`） |
-| 17 | `comic.default_fit` 配置解析后无实现（默认硬编码 viewport） | 两实现缺省 `fit` 取配置值（显式参数优先） |
-| 18 | `/asset` URL/ETag 不含 `rev`：等长编辑后 JSON 模式内嵌图片强缓存一年不更新 | ETag 加 `{book_id}:{rev}:asset:...`；`jsonout` asset URL 带 `&rev=`（C++ 同步） |
-| 19 | 页元数据无 ETag/Cache-Control（设计 5.4 要求同页面缓存策略） | 两实现返回 ETag（页面图片 ETag 追加 `:meta`）+ immutable，支持 If-None-Match → 304 |
-| 20 | 图集注册表无上限、注册时持锁整文件重写 | 两实现按最近更新淘汰（上限 5000）；Python 用独立 `_save_lock` 串行化"快照+落盘"（写盘不持 `_lock`，不丢注册） |
+| 14 | meta/locate 先查 layout 后鉴权：不可见书库的 book_id 可借越界页响应探测 `total_pages` | 先 `require_book` 再查 layout（与 `/pages` 一致） |
+| 15 | `/files?path=/` 的 `libraries` 带真实文件系统路径（`/server/info` 已剔除） | 不再下发 `path` |
+| 16 | 缓存文件是合法非对象 JSON（`null`/`[]`）时 `.get()/value()` 抛异常 → 该 layout 永远 500 且不自愈 | 按损坏隔离（校验 `isinstance(dict)`） |
+| 17 | `comic.default_fit` 配置解析后无实现（默认硬编码 viewport） | 缺省 `fit` 取配置值（显式参数优先） |
+| 18 | `/asset` URL/ETag 不含 `rev`：等长编辑后 JSON 模式内嵌图片强缓存一年不更新 | ETag 加 `{book_id}:{rev}:asset:...`；`jsonout` asset URL 带 `&rev=` |
+| 19 | 页元数据无 ETag/Cache-Control（设计 5.4 要求同页面缓存策略） | 返回 ETag（页面图片 ETag 追加 `:meta`）+ immutable，支持 If-None-Match → 304 |
+| 20 | 图集注册表无上限、注册时持锁整文件重写 | 按最近更新淘汰（上限 5000）；用独立 `_save_lock` 串行化"快照+落盘"（写盘不持 `_lock`，不丢注册） |
 | 21 | `progress.json` 并发保存可让旧快照后落盘并清 dirty，`flush()` 丢最后一次写入 | `ProgressStore.save` 用 `_save_lock` 串行化"快照 + os.replace" |
-| 22 | C++ `etag_matches` 未 trim 整体值/`W/` 后空白：`" * "`、`W/ "x"` 语义与 Python 不一致 | 补齐 trim（与 Python `_etag_matches` 一致） |
 | 23 | Android 页元数据的过期响应可把 Pager 拉回旧页；重排恢复与用户重排可并发；重排失败无重试入口；搜索结果不随重排失效 | `fetchPageMeta` 校验 layoutId/currentPage 后再应用；`recoverLayout` 复用 `relayoutJob`（可被新重排取消）；翻页时若签名不匹配补一次重排；搜索结果页码失效时改用锚点 `/locate` 定位 |
 
 **v0.6 验证方式**
 
 ```bat
-cd server && .venv\Scripts\python -m py_compile app\...        :: 改动文件语法通过
-cd ..\server-cpp && powershell -ExecutionPolicy Bypass -File build.ps1   :: 构建通过
-cd ..\android && gradlew.bat :app:assembleDebug                            :: 构建通过
+cd server && .venv\Scripts\python -m py_compile app\...   :: 改动文件语法通过
+cd ..\android && gradlew.bat :app:assembleDebug           :: 构建通过
 ```
 
 **仍然存在（v0.6 未修，均为已知取舍/低危）**：虚拟路径的二次 `unquote`
 （名字含 `%xx` 的真实目录不可达）；EPUB flow 路径的 OPF 前缀资源（重名 basename
-时取不到）与 `data:` URI 内联图片（整本可能 0 页）；C++ 自然排序与 Python 的
-Unicode 等价性（全角数字 / casefold）；C++ `/meta` 的 `size` 取 `ref.size`
-（Python 为 `meta.size or ref.size`，MOBI 下有差异）；C++ 鉴权先于参数校验
-（错误码优先级）；C++ `progress.get_any` 同秒记录的 tie-break；C++ fixed 页
-`aspect` 失败返回 `null`（Python `0.0`）；未知 font_id 的字体文件回退默认字体
-（两实现刻意一致）；`library.sort` 仅支持 `natural` 一种取值。
+时取不到）与 `data:` URI 内联图片（整本可能 0 页）；未知 font_id 的字体文件回退
+默认字体；`library.sort` 仅支持 `natural` 一种取值。
 
 ### v0.6.1（2026-10-05，支持打开单个图片）
 
@@ -1495,9 +1451,9 @@ Unicode 等价性（全角数字 / casefold）；C++ `/meta` 的 `size` 取 `ref
 （`POST /books/open-folder` 接受图片路径 → 注册为"单页图集" → `FolderComicContainer`
 单文件模式 → 阅读器 fixed 模式；Android 点按 image 行即走该链路，见 7.5），
 但 `gallery.show_image_files` 默认 `false`，图片文件根本不出现在目录列表里，
-用户无从点按。本次把默认值翻为开（两实现一致）：
+用户无从点按。本次把默认值翻为开：
 
-- `gallery.show_image_files` 默认 `true`（Python `config.py` / C++ `config.h` /
+- `gallery.show_image_files` 默认 `true`（`config.py` /
   随附 `config.yaml` 同步）；设为 `false` 可回到旧行为；
 - 其余语义不变：`min_images_in_folder > 1` 时图片行仍按服务端 `openable=false`
   置灰并给出原因（列表不能谎报可打开）；`show_all_files=false` 时非电子书照旧隐藏；
@@ -1505,4 +1461,4 @@ Unicode 等价性（全角数字 / casefold）；C++ `/meta` 的 `size` 取 `ref
   （默认列出且 openable）、`::test_files_hide_single_images_when_disabled`
   （显式关闭时不列出）。
 
-验证：`py_compile` 通过、`build.ps1` 构建通过（按项目约定未跑测试套件）。
+验证：`py_compile` 通过（按项目约定未跑测试套件）。
