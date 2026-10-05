@@ -36,6 +36,7 @@ pip install -e .
 | `library.watch_debounce_s` | 变化事件防抖窗口（默认 2 秒，窗口内事件合并为一次重扫） |
 | `library.encoding_overrides` | TXT 编码检测失败时的书级覆盖 |
 | `gallery.folder_as_book` | 是否允许"文件夹作为图集打开" |
+| `gallery.show_image_files` | 目录列表列出单张图片文件（默认开，点按即作为单页图集打开） |
 | `comic.default_fit` | 漫画默认取页方式（`viewport` / `original`） |
 | `render.fonts_dir` | 字体目录（默认 `assets/fonts`） |
 | `cache.*` / `limits.*` | 缓存上限与安全上限 |

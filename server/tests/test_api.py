@@ -487,6 +487,42 @@ def test_open_folder_single_image(api, tmp_books: Path):
     assert api.get(f"{API}/books/{book_id}/cover").status_code == 200
 
 
+def test_files_list_single_images_by_default(api, tmp_books: Path):
+    """单张图片默认出现在目录列表里（show_image_files 默认开，点按即单页图集）。"""
+    (tmp_books / "solo.png").write_bytes(png_bytes(120, 200))
+    # 非电子书仍按 show_all_files=false 隐藏：图片行可见不能波及普通文件
+    (tmp_books / "readme.md").write_text("hi", encoding="utf-8")
+
+    body = api.get(f"{API}/files", params={"path": "/lib"}).json()
+    entries = {e["name"]: e for e in body["entries"]}
+    solo = entries["solo.png"]
+    assert solo["type"] == "image"
+    assert solo["format"] == "gallery"
+    assert solo["gallery"]["image_count"] == 1
+    assert solo["gallery"]["can_open_as_book"] is True
+    assert solo["openable"] is True and solo["reason"] is None
+    assert solo["book_id"]
+    listed = entries["readme.md"]
+    assert listed["type"] == "file" and listed["openable"] is False
+
+
+def test_files_hide_single_images_when_disabled(api, tmp_books: Path, make_config):
+    """show_image_files=false 时目录列表不得列出图片文件（旧行为可配回）。"""
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    (tmp_books / "solo.png").write_bytes(png_bytes(120, 200))
+    cfg = make_config(gallery={"show_image_files": False})
+    cfg.base_dir = tmp_books.parent
+
+    app = create_app(cfg, background_scan=False)
+    with TestClient(app) as client:
+        app.state.ctx.library.scan_blocking()
+        body = client.get(f"{API}/files", params={"path": "/lib"}).json()
+        assert "solo.png" not in {e["name"] for e in body["entries"]}
+
+
 def test_open_folder_unknown_path(api):
     resp = api.post(f"{API}/books/open-folder", json={"path": "/lib/nope"})
     assert resp.status_code == 400

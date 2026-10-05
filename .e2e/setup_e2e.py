@@ -90,7 +90,7 @@ gallery:
   folder_as_book: true
   min_images_in_folder: 1
   recursive: false
-  show_image_files: false
+  show_image_files: true
 
 comic:
   skip_entries: ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]

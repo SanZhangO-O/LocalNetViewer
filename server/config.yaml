@@ -38,7 +38,7 @@ gallery:
   folder_as_book: true      # 图片文件夹可"作为图集"打开（浏览页提供入口）
   min_images_in_folder: 1   # 显示"打开为图集"入口所需的最少图片数
   recursive: false          # 图集是否包含子文件夹中的图片
-  show_image_files: false   # 是否在目录列表中直接列出单张图片文件
+  show_image_files: true    # 目录列表直接列出单张图片文件（点按即作为单页图集打开）
 
 comic:
   skip_entries: ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]

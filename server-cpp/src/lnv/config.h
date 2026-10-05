@@ -39,7 +39,8 @@ struct GalleryCfg {
     bool folder_as_book = true;
     int min_images_in_folder = 1;
     bool recursive = false;
-    bool show_image_files = false;
+    // 目录列表直接列出单张图片文件：点按即按"单页图集"打开（与 Python 默认一致）
+    bool show_image_files = true;
 };
 
 struct ComicCfg {

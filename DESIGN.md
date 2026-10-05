@@ -2,7 +2,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 版本 | v0.6（审查修复第四轮；缺陷修正记录见 13 节） |
+| 版本 | v0.6.1（v0.6 审查修复后增量：默认列出单张图片；缺陷修正记录见 13 节） |
 | 日期 | 2026-10-05 |
 | 状态 | 服务器与客户端均已实现；缺陷修正记录见 13 节 |
 | 范围 | 局域网电子书阅读系统：Python 服务器 + Android 客户端 |
@@ -242,7 +242,7 @@ gallery:
   folder_as_book: true      # 图片文件夹可"作为图集"打开（浏览页提供入口）
   min_images_in_folder: 1   # 显示"打开为图集"入口所需的最少图片数
   recursive: false          # 图集是否包含子文件夹中的图片
-  show_image_files: false   # 是否在目录列表中直接列出单张图片文件
+  show_image_files: true    # 目录列表直接列出单张图片文件（点按即作为单页图集打开）
 
 comic:
   skip_entries: ["__MACOSX/*", "*/.*", "Thumbs.db", "desktop.ini"]
@@ -895,7 +895,7 @@ android/app/src/main/java/com/zqr/localnetviewer/
 - **封面 / 标题**：第一张图片作封面；标题默认文件夹名。
 - **进度**：锚点为页号；目录内增删图片不改变 book_id，进度保留（页码可能小幅偏移）。会话中途内容变化导致页码越界时返回 `PAGE_OUT_OF_RANGE`，客户端提示刷新（重新 `/layout`，总页数实时枚举）。
 - **图片数缓存**：子目录的 `image_count` 在书库扫描时计算并缓存（目录 mtime 变化时重算），避免列目录时的全量遍历。
-- **单张图片（可选）**：`gallery.show_image_files=true` 时目录列表额外列出图片文件，点按即打开"单页图集"（同一虚拟书机制）。
+- **单张图片**：目录列表默认列出图片文件（`gallery.show_image_files`，默认开；设为 `false` 可隐藏），点按即打开"单页图集"（同一虚拟书机制，`POST /books/open-folder` 接受图片路径）。
 - **无效目录**：不含图片（或低于 `min_images_in_folder`）的目录调用 `open-folder` 返回 `UNSUPPORTED_FORMAT`（客户端本就不显示入口）；`recursive` 以请求参数优先，缺省用配置值。
 
 ---
@@ -1472,3 +1472,21 @@ Unicode 等价性（全角数字 / casefold）；C++ `/meta` 的 `size` 取 `ref
 （错误码优先级）；C++ `progress.get_any` 同秒记录的 tie-break；C++ fixed 页
 `aspect` 失败返回 `null`（Python `0.0`）；未知 font_id 的字体文件回退默认字体
 （两实现刻意一致）；`library.sort` 仅支持 `natural` 一种取值。
+
+### v0.6.1（2026-10-05，支持打开单个图片）
+
+需求：**程序要能直接打开单个图片文件**。单张图片的完整打开链路早已存在
+（`POST /books/open-folder` 接受图片路径 → 注册为"单页图集" → `FolderComicContainer`
+单文件模式 → 阅读器 fixed 模式；Android 点按 image 行即走该链路，见 7.5），
+但 `gallery.show_image_files` 默认 `false`，图片文件根本不出现在目录列表里，
+用户无从点按。本次把默认值翻为开（两实现一致）：
+
+- `gallery.show_image_files` 默认 `true`（Python `config.py` / C++ `config.h` /
+  随附 `config.yaml` 同步）；设为 `false` 可回到旧行为；
+- 其余语义不变：`min_images_in_folder > 1` 时图片行仍按服务端 `openable=false`
+  置灰并给出原因（列表不能谎报可打开）；`show_all_files=false` 时非电子书照旧隐藏；
+- 回归：`server/tests/test_api.py::test_files_list_single_images_by_default`
+  （默认列出且 openable）、`::test_files_hide_single_images_when_disabled`
+  （显式关闭时不列出）。
+
+验证：`py_compile` 通过、`build.ps1` 构建通过（按项目约定未跑测试套件）。

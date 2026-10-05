@@ -91,6 +91,7 @@ gradlew.bat assembleDebug
 | EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，等比完整显示、尽量铺满屏幕 |
 | PDF | pypdfium2 直渲（固定版式） |
 | CBZ/CBR/CB7/CBT、图片文件夹 | 图片即页，自然排序；CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr` |
+| 单张图片文件（jpg/png/webp/gif/bmp/avif/tif 等） | 目录列表直接列出（`gallery.show_image_files`），点按即作为"单页图集"打开 |
 | FB2 | XML → 块模型 |
 | MOBI/AZW3 | 检测到 Calibre `ebook-convert` 时转换缓存为 EPUB（可选）；漫画型（图片为主）自动按固定版式漫画打开，适应屏幕 |
 

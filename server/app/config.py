@@ -105,7 +105,10 @@ class GalleryCfg(BaseModel):
     folder_as_book: bool = True
     min_images_in_folder: int = Field(default=1, ge=0)
     recursive: bool = False
-    show_image_files: bool = False
+    # 目录列表直接列出单张图片文件：点按即按"单页图集"打开（设计 7.5）。
+    # 服务器与客户端的打开链路（register → FolderComicContainer 单文件模式 →
+    # 阅读器 fixed 模式）早已支持，这里只决定图片是否出现在列表里。
+    show_image_files: bool = True
 
 
 class ComicCfg(BaseModel):

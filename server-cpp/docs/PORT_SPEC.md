@@ -265,7 +265,7 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 | `folder_as_book` | `true` | 允许把目录注册为图集书 |
 | `min_images_in_folder` | `1` | 目录可作图集的最少图片数 |
 | `recursive` | `false` | 图集是否递归含子目录 |
-| `show_image_files` | `false` | 目录列表是否列出单张图片文件（type:"image"） |
+| `show_image_files` | `true` | 目录列表是否列出单张图片文件（type:"image"，点按即作为单页图集打开） |
 
 **comic**
 | 键 | 默认 | 语义 |
