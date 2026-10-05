@@ -151,7 +151,7 @@ def create_app(
             "name": cfg.server.name or "LocalNetViewer",
             "version": __version__,
             "api": "/api/v1",
-            "auth_required": cfg.auth_required,
+            "auth_required": cfg.credential_required,
         }
 
     @app.get("/healthz", include_in_schema=False, dependencies=[AuthDep])

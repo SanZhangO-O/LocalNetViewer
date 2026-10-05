@@ -8,20 +8,22 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 
 from ..models.schemas import Anchor, ErrorCode, ProgressPutRequest, ProgressRecord
-from .deps import AuthDep, get_ctx
+from ..services.access import AccessScope
+from .deps import ScopeDep, get_ctx
 from .errors import AppError
 
 router = APIRouter(tags=["progress"])
 
 
-@router.get("/progress/{book_id}", response_model=ProgressRecord, dependencies=[AuthDep])
+@router.get("/progress/{book_id}", response_model=ProgressRecord)
 async def get_progress(
     book_id: str,
     device_id: Optional[str] = Query(default=None),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> ProgressRecord:
     """取阅读进度；未指定 device_id 时返回该书最近一次进度。"""
-    await ctx.require_book_async(book_id)
+    await ctx.require_book_async(book_id, scope)
     record = ctx.progress.get(book_id, device_id) or (
         None if device_id else ctx.progress.get_any(book_id)
     )
@@ -32,15 +34,16 @@ async def get_progress(
     return _to_record(record)
 
 
-@router.put("/progress/{book_id}", response_model=ProgressRecord, dependencies=[AuthDep])
+@router.put("/progress/{book_id}", response_model=ProgressRecord)
 async def put_progress(
     book_id: str,
     body: ProgressPutRequest,
     device_id: Optional[str] = Query(default=None),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> ProgressRecord:
     """写入阅读进度（仅写 key-value，不触碰书籍文件）。"""
-    await ctx.require_book_async(book_id)
+    await ctx.require_book_async(book_id, scope)
     # 进度写入落盘是同步 IO：放到线程池，避免阻塞事件循环
     record = await asyncio.to_thread(
         ctx.progress.put,

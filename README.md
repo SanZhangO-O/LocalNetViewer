@@ -55,7 +55,9 @@ gradlew.bat assembleDebug
 ```
 
 安装后进入连接页，输入服务器启动信息里给出的 `IP:端口`（可省略端口，默认 8765），
-如服务器启用了令牌则一并填写。
+按需填写访问密码：`library.roots[].password` 为书库级密码（输入某书库密码只看到该书库
+与公开书库），`server.auth_token` 为管理员令牌（看到全部书库）。历史地址按"地址 + 密码"
+分别记录，可用不同密码连接同一服务器的不同书库。
 
 ## 核心约束与设计取舍
 
@@ -67,6 +69,9 @@ gradlew.bat assembleDebug
   页面缓存（内存 LRU，字节 + 张数双上限），客户端 Coil 磁盘缓存兜底。
 - **服务器渲染、客户端控制**：页码 / 章节名不由服务器绘制，客户端叠加半透明底栏，
   服务器通过 `margin.bottom` 预留空间，因此切换沉浸模式不会触发重新排版。
+- **多书库 + 访问密码**：`library.roots` 可配多个书库，每个书库可选 `password`
+  （留空 = 公开）；客户端用不同密码连接即进入不同书库，看不到的书库在路径与
+  book_id 层面都与"不存在"一致（防跨库探测）。
 
 ## 已实现的范围（里程碑）
 
@@ -83,7 +88,7 @@ gradlew.bat assembleDebug
 | 格式 | 说明 |
 |---|---|
 | TXT | 编码检测（BOM → charset-normalizer → GB18030）+ 章节切分，可配置书级编码覆盖 |
-| EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析 |
+| EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，铺满屏幕 |
 | PDF | pypdfium2 直渲（固定版式） |
 | CBZ/CBR/CB7/CBT、图片文件夹 | 图片即页，自然排序；CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr` |
 | FB2 | XML → 块模型 |

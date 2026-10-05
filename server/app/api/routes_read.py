@@ -21,7 +21,8 @@ from ..models.schemas import (
 )
 from ..render.jsonout import build_page_json
 from ..render.raster import fixed_page_bytes, render_flow_page, strip_page_bytes
-from .deps import AuthDep, get_ctx
+from ..services.access import AccessScope
+from .deps import ScopeDep, get_ctx
 from .errors import AppError
 
 router = APIRouter(tags=["read"])
@@ -38,14 +39,15 @@ def _mark_orphan(exc: BaseException, adapter: BookAdapter) -> None:
         adapter.mark_orphaned()
 
 
-@router.post(
-    "/books/{book_id}/layout", response_model=LayoutResponse, dependencies=[AuthDep]
-)
+@router.post("/books/{book_id}/layout", response_model=LayoutResponse)
 async def register_layout(
-    book_id: str, profile: LayoutProfile, ctx=Depends(get_ctx)
+    book_id: str,
+    profile: LayoutProfile,
+    scope: AccessScope = ScopeDep,
+    ctx=Depends(get_ctx),
 ) -> LayoutResponse:
     """注册排版参数 → layout_id、总页数、章节起始页（设计 4.6）。"""
-    ref = await ctx.require_book_async(book_id)
+    ref = await ctx.require_book_async(book_id, scope)
     async with ctx.open_adapter_async(ref) as adapter:
         try:
             result = await asyncio.to_thread(ctx.layouts.build, ref, adapter, profile)
@@ -201,7 +203,7 @@ def _etag_matches(header_value: Optional[str], etag: str) -> bool:
     return False
 
 
-@router.get("/books/{book_id}/pages/{page}", dependencies=[AuthDep])
+@router.get("/books/{book_id}/pages/{page}")
 async def get_page(
     book_id: str,
     page: int,
@@ -215,6 +217,7 @@ async def get_page(
     rtl: int = Query(default=0, ge=0, le=1),
     if_none_match: Optional[str] = Header(default=None, alias="If-None-Match"),
     range_header: Optional[str] = Header(default=None, alias="Range"),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> Response:
     """页面内容：PNG（默认）或 JSON；固定版式支持 fit / quality / pair。"""
@@ -225,8 +228,9 @@ async def get_page(
     if fit_mode not in VALID_FITS:
         raise AppError(ErrorCode.BAD_REQUEST, f"fit 只支持 {'/'.join(VALID_FITS)}", {"fit": fit})
 
-    # 先确认书籍存在，再确认 layout：删掉的书应报 BOOK_NOT_FOUND 而不是 LAYOUT_NOT_FOUND
-    ref = await ctx.require_book_async(book_id)
+    # 先确认书籍存在（且在当前凭据可见书库内），再确认 layout：
+    # 删掉的书应报 BOOK_NOT_FOUND 而不是 LAYOUT_NOT_FOUND
+    ref = await ctx.require_book_async(book_id, scope)
     entry = await ctx.require_layout_async(book_id, layout_id)
     _check_page(entry, page)
     is_fixed = entry.pagemap.mode in ("fixed", "strip")
@@ -338,13 +342,12 @@ def _is_fixed_mode(entry) -> bool:
     return entry.pagemap.mode in ("fixed", "strip")
 
 
-@router.get(
-    "/books/{book_id}/pages/{page}/meta", response_model=PageMetaResponse, dependencies=[AuthDep]
-)
+@router.get("/books/{book_id}/pages/{page}/meta", response_model=PageMetaResponse)
 async def page_meta(
     book_id: str,
     page: int,
     layout_id: str = Query(...),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> PageMetaResponse:
     """页元数据（锚点、章节名、页码）；客户端翻页停稳后请求一次（防抖）。"""
@@ -352,9 +355,11 @@ async def page_meta(
     _check_page(entry, page)
     record = entry.pagemap.record(page)
     assert record is not None
+    # 先校验书籍可见性再返回首行文本 / 长宽比：layout_id 与书籍无关（几何哈希），
+    # 不校验的话其他书库的 book_id 也能读到正文首行
+    ref = await ctx.require_book_async(book_id, scope)
     aspect: Optional[float] = None
     if entry.pagemap.mode in ("fixed", "strip"):
-        ref = await ctx.require_book_async(book_id)
         # 条漫页是"切片"，页号 != 源图序号，必须用记录的源图索引取长宽比
         target_page = record.image_index + 1 if record.image_index >= 0 else page
         async with ctx.open_adapter_async(ref) as adapter:
@@ -375,32 +380,35 @@ async def page_meta(
 
 
 # ------------------------------------------------------------------ locate
-@router.get("/books/{book_id}/locate", response_model=LocateResponse, dependencies=[AuthDep])
+@router.get("/books/{book_id}/locate", response_model=LocateResponse)
 async def locate(
     book_id: str,
     layout_id: str = Query(...),
     chapter: int = Query(default=0, ge=0),
     block: int = Query(default=0, ge=0),
     char: int = Query(default=0, ge=0),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> LocateResponse:
     """锚点 → 页码（重新布局 / 恢复进度用，设计 3.3 / 5.3）。"""
     entry = await ctx.require_layout_async(book_id, layout_id)
+    await ctx.require_book_async(book_id, scope)
     data = anchors_mod.locate(entry.pagemap, (chapter, block, char))
     return LocateResponse(**data)
 
 
 # ------------------------------------------------------------------ search
-@router.get("/books/{book_id}/search", response_model=SearchResponse, dependencies=[AuthDep])
+@router.get("/books/{book_id}/search", response_model=SearchResponse)
 async def search(
     book_id: str,
     q: str = Query(..., min_length=1),
     layout_id: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
+    scope: AccessScope = ScopeDep,
     ctx=Depends(get_ctx),
 ) -> SearchResponse:
     """全文搜索（TXT/EPUB）；无 layout_id 时 page 为 null（设计 5.3）。"""
-    ref = await ctx.require_book_async(book_id)
+    ref = await ctx.require_book_async(book_id, scope)
     pagemap = None
     if layout_id:
         entry = await asyncio.to_thread(ctx.layouts.entry, book_id, layout_id)

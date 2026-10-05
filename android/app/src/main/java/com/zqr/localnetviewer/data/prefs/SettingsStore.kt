@@ -147,7 +147,12 @@ class SettingsStore(private val context: Context) {
     suspend fun setServer(url: String, token: String): AppSettings =
         update { it.copy(serverUrl = url, authToken = token) }
 
-    /** 记住地址（同一地址只保留一条，置顶并按最近使用排序）。 */
+    /**
+     * 记住地址（按"地址 + 令牌/密码"去重，置顶并按最近使用排序）。
+     *
+     * 同一服务器可用不同书库密码连接不同书库，密码本身就是条目身份的一部分：
+     * 只按 URL 去重会让第二次连接覆盖第一条，历史里只剩一个书库的入口。
+     */
     suspend fun rememberServer(url: String, name: String, token: String) {
         val now = System.currentTimeMillis()
         runCatchingIo {
@@ -155,17 +160,18 @@ class SettingsStore(private val context: Context) {
                 val existing = decodeHistory(prefs[KEY_HISTORY])
                 val updated = buildList {
                     add(ServerAddress(url = url, name = name, token = token, lastUsed = now))
-                    addAll(existing.filterNot { it.url == url })
+                    addAll(existing.filterNot { it.url == url && it.token == token })
                 }.sortedByDescending { it.lastUsed }.take(MAX_HISTORY)
                 prefs[KEY_HISTORY] = prefsJson.encodeToString(updated)
             }
         }
     }
 
-    suspend fun forgetServer(url: String) {
+    suspend fun forgetServer(url: String, token: String) {
         runCatchingIo {
             store.edit { prefs ->
-                val remaining = decodeHistory(prefs[KEY_HISTORY]).filterNot { it.url == url }
+                val remaining = decodeHistory(prefs[KEY_HISTORY])
+                    .filterNot { it.url == url && it.token == token }
                 prefs[KEY_HISTORY] = prefsJson.encodeToString(remaining)
             }
         }

@@ -46,11 +46,28 @@ class ServerCfg(BaseModel):
 class LibraryRootCfg(BaseModel):
     name: str
     path: str
+    # 访问密码：留空 = 公开书库；填写后客户端需携带对应 X-Auth-Token 才能看到该书库。
+    # 多个书库可共用同一密码（输入该密码即可同时看到它们）。
+    password: str = ""
 
     @field_validator("path")
     @classmethod
     def _expand(cls, v: str) -> str:
         return os.path.expandvars(os.path.expanduser(v.strip()))
+
+    @field_validator("password", mode="before")
+    @classmethod
+    def _coerce_password(cls, v: object) -> object:
+        # YAML 未加引号的数字密码（password: 123456）按字符串收下，与 C++ 实现一致；
+        # 显式 null 原样透传，由 str 类型校验按配置错误拒绝（与 C++ 拒绝 null 一致）。
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return str(v)
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _strip_password(cls, v: str) -> str:
+        return (v or "").strip()
 
 
 class LibraryCfg(BaseModel):
@@ -178,6 +195,18 @@ class AppConfig(BaseModel):
     @property
     def auth_required(self) -> bool:
         return bool(self.server.auth_token.strip())
+
+    @property
+    def public_root_names(self) -> set:
+        """未设密码、任何人可见的书库名。"""
+        return {r.name for r in self.library.roots if not (r.password or "").strip()}
+
+    @property
+    def credential_required(self) -> bool:
+        """完全没有任何书库可见（管理员令牌启用，或全部书库都设了密码）时为真。"""
+        if self.auth_required:
+            return True
+        return bool(self.library.roots) and not self.public_root_names
 
     @model_validator(mode="after")
     def _check_roots(self) -> "AppConfig":

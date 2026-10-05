@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from fastapi.responses import FileResponse
 
 from ..models.schemas import (
@@ -16,6 +16,7 @@ from ..models.schemas import (
     LibraryInfo,
     ServerInfoResponse,
 )
+from ..services.access import resolve_access
 from .deps import AuthDep, get_ctx
 from .errors import AppError
 
@@ -29,22 +30,35 @@ def _version() -> str:
 
 
 @router.get("/server/info", response_model=ServerInfoResponse)
-async def server_info(ctx=Depends(get_ctx)) -> ServerInfoResponse:
+async def server_info(
+    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
+    ctx=Depends(get_ctx),
+) -> ServerInfoResponse:
     """服务信息（不需要令牌：客户端要先知道是否需要令牌）。
 
-    这个端点**不鉴权**，因此不能带真实文件系统路径（设计 9 / paths.py 的
-    "真实路径永不返回给客户端"）：只给出书库名与藏书数。带路径的完整列表在
-    需要令牌的 ``/files`` 里。
+    这个端点**不强制鉴权**，但会按请求携带的 ``X-Auth-Token`` 过滤书库列表：
+    密码无效 → 401（客户端提示"访问密码错误"）；未带密码但服务器要求 → 200 +
+    ``auth_required=true`` + 空列表（客户端提示输入密码）。
+    响应不能带真实文件系统路径（设计 9 / paths.py 的"真实路径永不返回给客户端"）。
     """
+    result = resolve_access(ctx.config, x_auth_token)
+    if not result.valid and not result.missing:
+        raise AppError(ErrorCode.UNAUTHORIZED, "访问密码错误", {"auth_required": True})
+    if not result.valid:
+        infos = []
+    elif result.scope.all:
+        infos = ctx.library.libraries_info(None)
+    else:
+        infos = ctx.library.libraries_info(result.scope)
     libs = [
         LibraryInfo(name=item["name"], book_count=item["book_count"], path=None)
-        for item in ctx.library.libraries_info()
+        for item in infos
     ]
     return ServerInfoResponse(
         name=ctx.config.server.name or "LocalNetViewer",
         version=_version(),
         api_version="v1",
-        auth_required=ctx.config.auth_required,
+        auth_required=ctx.config.credential_required,
         libraries=libs,
         features=FeaturesInfo(
             png=True,

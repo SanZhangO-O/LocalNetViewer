@@ -63,17 +63,7 @@ static ImageBuf crop_slice(const ImageBuf& src, long long y0, long long height) 
 
 ComicAdapter::ComicAdapter(const AppConfig& cfg, const BookRef& ref)
     : cfg_(cfg), ref_(ref) {
-    // 真实格式：ref.format 优先，否则扩展名，兜底 gallery
-    format = ref.format.empty()
-                 ? (ext_of(ref.name()).size() > 1 ? ext_of(ref.name()).substr(1) : "gallery")
-                 : ref.format;
-    for (auto& c : format) c = (char)std::tolower((unsigned char)c);
-    mode = "fixed";
     title_ = stem_of(ref.name());
-    max_page_bytes_ = cfg.limits.max_page_bytes;      // 0 = 不限
-    max_source_pixels_ = cfg.limits.max_source_pixels;
-    jpeg_quality_ = cfg.comic.jpeg_quality;
-    strip_min_aspect_ = cfg.comic.strip_min_aspect;
 
     std::error_code ec;
     std::string ext = ext_of(ref.name());
@@ -101,9 +91,34 @@ ComicAdapter::ComicAdapter(const AppConfig& cfg, const BookRef& ref)
         throw UnsupportedFormatError("不支持的漫画容器: " + (ext.empty() ? ref.name() : ext),
                                      "未知容器类型");
     }
+    init_common();
+}
+
+// 外部容器（图片型 EPUB 分流）：容器接管所有权，title 由调用方给出
+ComicAdapter::ComicAdapter(const AppConfig& cfg, const BookRef& ref,
+                           std::unique_ptr<Container> container, std::string title)
+    : cfg_(cfg), ref_(ref) {
+    title_ = std::move(title);
+    container_ = std::move(container);
+    preserve_order_ = true;  // 页序 = spine 顺序（见 comics.h preserve_order_）
+    init_common();
+}
+
+void ComicAdapter::init_common() {
+    // 真实格式：ref.format 优先，否则扩展名，兜底 gallery
+    format = ref_.format.empty()
+                 ? (ext_of(ref_.name()).size() > 1 ? ext_of(ref_.name()).substr(1) : "gallery")
+                 : ref_.format;
+    for (auto& c : format) c = (char)std::tolower((unsigned char)c);
+    mode = "fixed";
+    max_page_bytes_ = cfg_.limits.max_page_bytes;      // 0 = 不限
+    max_source_pixels_ = cfg_.limits.max_source_pixels;
+    jpeg_quality_ = cfg_.comic.jpeg_quality;
+    strip_min_aspect_ = cfg_.comic.strip_min_aspect;
+
     // RAR/7z 按需单条目解压：声明尺寸可能不可信，把总量上限交给容器读取路径
     // 累计校验（超过即杀子进程并抛错，审查 M3）
-    container_->set_total_limit(cfg.limits.max_archive_total_mb * 1024 * 1024);
+    container_->set_total_limit(cfg_.limits.max_archive_total_mb * 1024 * 1024);
     build_names();
 }
 
@@ -129,7 +144,9 @@ void ComicAdapter::build_names() {
     }
     if (max_total > 0 && total > max_total)
         throw ParseError(archive_total_limit_error(total));
-    std::sort(out.begin(), out.end(), natural_key_less);  // 自然排序页序（§4.9）
+    if (!preserve_order_) {
+        std::sort(out.begin(), out.end(), natural_key_less);  // 自然排序页序（§4.9）
+    }
     names_ = std::move(out);
 }
 

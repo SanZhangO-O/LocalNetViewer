@@ -9,13 +9,10 @@
 #include "lnv/formats/pdf.h"
 #include "lnv/formats/mobi.h"
 
-// ---- 依赖说明（由另一代理实现，见任务分工）----
-// - 漫画/图集：lnv/formats/comics.h 中的 create_comic_adapter(cfg, ref)
-//   （cbz/cbz3/zip、cbr/rar、cb7/7z、cbt/tar 以及 gallery 虚拟书）；
-// - PDF：create_pdf_adapter(cfg, ref)——预期在 "lnv/formats/pdf.h"（同一代理实现，
-//   若该头不存在则与 comics.h 同文件，届时把下面的声明换成对应 include）；
-// - MOBI/AZW3：create_mobi_adapter(cfg, ref)——预期在 "lnv/formats/mobi.h"（同一代理）。
-// 三个工厂函数目前均未在本仓库头文件中声明，这里给出前向声明以保持本文件自洽：
+// ---- 依赖说明 ----
+// - 漫画/图集 / PDF：本文件就地组装（ComicAdapter / PdfAdapter）；
+// - EPUB：create_epub_adapter（epub.h）——内含图片型（漫画）分流，固定版式铺满屏幕；
+// - MOBI/AZW3：open_mobi_adapter（mobi.h）——先转换，再按是否漫画分流。
 namespace lnv {
 std::unique_ptr<BookAdapter> create_comic_adapter(const AppConfig& cfg, const BookRef& ref,
                                                   const AdapterEnv&) {
@@ -24,10 +21,6 @@ std::unique_ptr<BookAdapter> create_comic_adapter(const AppConfig& cfg, const Bo
 std::unique_ptr<BookAdapter> create_pdf_adapter(const AppConfig& cfg, const BookRef& ref,
                                                 const AdapterEnv&) {
     return std::make_unique<PdfAdapter>(cfg, ref);
-}
-std::unique_ptr<BookAdapter> create_mobi_adapter(const AppConfig& cfg, const BookRef& ref,
-                                                 const AdapterEnv& env) {
-    return std::make_unique<MobiAdapter>(cfg, ref, env);
 }
 }  // namespace lnv
 
@@ -70,10 +63,12 @@ std::unique_ptr<BookAdapter> create_adapter(const AppConfig& cfg, const BookRef&
     }
 
     if (fmt == "txt") return std::make_unique<TxtAdapter>(cfg, ref);
-    if (fmt == "epub") return std::make_unique<EpubAdapter>(cfg, ref, env);
+    // EPUB：图片型（漫画）→ 固定版式，文本型 → 流式（create_epub_adapter 内部检测）
+    if (fmt == "epub") return create_epub_adapter(cfg, ref, env);
     if (fmt == "fb2") return std::make_unique<Fb2Adapter>(cfg, ref);
     if (fmt == "pdf") return create_pdf_adapter(cfg, ref, env);
-    if (fmt == "mobi" || fmt == "azw3" || fmt == "azw") return create_mobi_adapter(cfg, ref, env);
+    // MOBI/AZW3：转换后按是否漫画分流（open_mobi_adapter）
+    if (fmt == "mobi" || fmt == "azw3" || fmt == "azw") return open_mobi_adapter(cfg, ref, env);
     // cbz/cbz3/zip、cbr/rar、cb7/7z、cbt/tar → 漫画容器适配器
     return create_comic_adapter(cfg, ref, env);
 }

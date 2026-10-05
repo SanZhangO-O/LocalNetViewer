@@ -19,8 +19,8 @@ import kotlinx.coroutines.launch
 /**
  * 连接页状态机（设计 6.3 ConnectScreen）。
  *
- * 连接流程：`/server/info`（3s 超时）→ 若服务器要求令牌则再校验一次带令牌的请求
- * （区分"无法连接 / 需要令牌 / 令牌错误"）→ 保存地址与令牌 → 进入浏览页。
+ * 连接流程：`/server/info`（3s 超时，携带凭据）→ 需要凭据或已填写时再用 `/files`
+ * 校验一次（区分"无法连接 / 需要密码 / 密码错误"）→ 保存地址与凭据 → 进入浏览页。
  */
 class ConnectViewModel(app: App) : AndroidViewModel(app) {
 
@@ -79,9 +79,11 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
         connect(item.url, item.token)
     }
 
-    fun forget(url: String) {
+    fun forget(item: ServerAddress) {
         // 删除历史地址失败（IO）不影响主流程
-        viewModelScope.launch { runCatchingIo { settingsStore.forgetServer(url) } }
+        viewModelScope.launch {
+            runCatchingIo { settingsStore.forgetServer(item.url, item.token) }
+        }
     }
 
     fun consumeConnected() {
@@ -111,15 +113,17 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
                 probeClient.configure(url, tokenValue, ApiClient.PROBE_TIMEOUT_SECONDS)
                 val probeRepository = LibraryRepository(probeClient)
                 val info = probeRepository.serverInfo()
-                if (info.authRequired) {
-                    if (tokenValue.isEmpty()) {
-                        throw ApiException(ApiException.CODE_UNAUTHORIZED, "该服务器需要访问令牌，请填写后重试")
-                    }
+                // 凭据是书库密码（或管理员令牌）：auth_required=true 且未填写 → 先提示；
+                // 填了就用 /files 验证一次（区分"密码错误"与其它失败）
+                if (info.authRequired && tokenValue.isEmpty()) {
+                    throw ApiException(ApiException.CODE_UNAUTHORIZED, "该书库需要访问密码，请填写后重试")
+                }
+                if (info.authRequired || tokenValue.isNotEmpty()) {
                     try {
                         probeRepository.listFiles("/", 1, 0)
                     } catch (unauthorized: ApiException) {
                         if (unauthorized.isUnauthorized) {
-                            throw ApiException(unauthorized.code, "令牌错误，请检查后重试")
+                            throw ApiException(unauthorized.code, "访问密码错误，请检查后重试")
                         }
                         throw unauthorized
                     }
@@ -127,14 +131,14 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
                 if (seq != connectSeq) return@launch
                 // 校验通过：才配置全局客户端并恢复常规超时（页面图片下载需要更长时间）
                 client.configure(url, tokenValue, ApiClient.DEFAULT_CALL_TIMEOUT_SECONDS)
-                // 地址/令牌落盘失败不影响本次连接
-                runCatchingIo {
-                    settingsStore.setServer(url, tokenValue)
-                    settingsStore.rememberServer(url, info.name, tokenValue)
-                }
                 val summary = info.libraries
                     .joinToString("、") { "${it.name}(${it.bookCount} 本)" }
                     .ifEmpty { "未配置书库" }
+                // 地址/凭据落盘失败不影响本次连接；历史名带可见书库，便于按密码区分同一地址
+                runCatchingIo {
+                    settingsStore.setServer(url, tokenValue)
+                    settingsStore.rememberServer(url, "${info.name} · $summary", tokenValue)
+                }
                 // 服务器信息放到 App 上：连接成功后本页立刻被移出返回栈，
                 // 渲染在这里的"服务器信息卡片"用户根本看不到（设计 6.3）
                 appRef.updateServerSummary("${info.name} v${info.version} · $summary")

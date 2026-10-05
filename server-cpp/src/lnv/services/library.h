@@ -1,6 +1,7 @@
 #pragma once
 // 书库服务：扫描、索引、目录列表、book_id 查找（对应 Python services/library.py）
 #include <shared_mutex>
+#include "lnv/auth.h"  // AccessScope（按密码访问不同书库，设计 9）
 #include "lnv/config.h"
 #include "lnv/formats/adapter.h"
 
@@ -46,15 +47,23 @@ public:
     void save_index();
 
     // /server/info 与 /files 的 libraries 列表（book_count 从索引统计）
+    // allowed 非空时只返回访问范围内的书库（nullptr = 全部）
     struct LibCount { std::string name; int book_count; std::optional<std::string> path; };
-    std::vector<LibCount> libraries_info() const;
+    std::vector<LibCount> libraries_info(const AccessScope* allowed = nullptr) const;
 
     // 虚拟路径 → 目录列表（§1.3 FilesResponse 的 entries 数据部分）。
     // 输出的 entry JSON 字段与 Python 一致（name/type/path/format/book_id/size/mtime/cover_url/gallery/openable/reason）。
     // libraries 字段仅 path=="/" 时由调用方补充。
     // offset 用 long long：Python 的查询参数是无界 int，响应里要**原样回显**，
     // 且巨大 offset 必须得到空列表而不是被窄化成 0（审查 H4）
-    nlohmann::json list_dir(const std::string& vpath_raw, int limit, long long offset) const;
+    // allowed 非空时只列访问范围内的书库根；范围外路径抛 BadPath（与"不存在"一致，防探测）
+    nlohmann::json list_dir(const std::string& vpath_raw, int limit, long long offset,
+                            const AccessScope* allowed = nullptr) const;
+
+    // 虚拟路径首段书库名（无 / 非法 → 空串）
+    static std::string root_name_of(const std::string& vpath);
+    // 书库不在访问范围内 → 抛 BadPath（与"书库不存在"不可区分）
+    void ensure_path_allowed(const std::string& vpath, const AccessScope* allowed) const;
 
     // book_id 查找（含图集注册表里的虚拟书）；不存在 → nullopt
     std::optional<BookRef> require_book(const std::string& book_id) const;

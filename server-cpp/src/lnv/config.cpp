@@ -27,6 +27,18 @@ bool AppConfig::auth_required() const {
     return false;
 }
 
+bool AppConfig::credential_required() const {
+    if (auth_required()) return true;
+    if (library.roots.empty()) return false;
+    for (const auto& r : library.roots) {
+        bool blank = true;
+        for (char c : r.password)
+            if (!std::isspace((unsigned char)c)) { blank = false; break; }
+        if (blank) return false;  // 存在公开书库 → 无需凭据也能看到内容
+    }
+    return true;
+}
+
 const LibraryRootCfg* AppConfig::root_by_name(const std::string& name) const {
     for (const auto& r : library.roots)
         if (r.name == name) return &r;
@@ -165,6 +177,16 @@ LibraryCfg parse_library(const YAML::Node& n) {
             size_t b = p.find_first_not_of(" \t");
             size_t e = p.find_last_not_of(" \t");
             root.path = b == std::string::npos ? "" : p.substr(b, e - b + 1);
+            // password：可选键；显式 null 与 Python pydantic（str 字段）一样按配置错误拒绝
+            const YAML::Node pw_node = r["password"];
+            if (pw_node) {
+                if (pw_node.IsNull())
+                    throw ConfigError("配置校验失败: " + at + ".password 不能为 null");
+                std::string pw = pw_node.as<std::string>();
+                size_t pb = pw.find_first_not_of(" \t\r\n");
+                size_t pe = pw.find_last_not_of(" \t\r\n");
+                root.password = pb == std::string::npos ? "" : pw.substr(pb, pe - pb + 1);
+            }
             c.roots.push_back(std::move(root));
             idx++;
         }

@@ -73,19 +73,31 @@ def startup_banner(ctx, host: str, port: int) -> str:
 
 
 def _security_warnings(ctx, host: str) -> list:
-    """对外监听且未配令牌时的醒目告警（安全默认见 config.ServerCfg.host）。"""
+    """对外监听且未启用任何访问控制时的醒目告警（安全默认见 config.ServerCfg.host）。
+
+    访问控制有两种：管理员令牌（server.auth_token）或给每个书库都设 password。
+    只要存在公开书库且无管理员令牌，就仍有内容对所有设备开放。
+    """
     loopback = host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
     if loopback:
         return []
-    token_on = bool((ctx.config.server.auth_token or "").strip())
-    if token_on:
+    cfg = ctx.config
+    if (cfg.server.auth_token or "").strip():
+        return []
+    roots = cfg.library.roots
+    if roots and all((r.password or "").strip() for r in roots):
         return []
     return [
         "",
-        "⚠️  安全警告：当前监听 " + host + "（局域网内所有设备可访问）且未启用访问令牌。",
-        "   同一网络中的任何人都能浏览您的整个书库。建议在 config.yaml 中设置：",
+        "⚠️  安全警告：当前监听 " + host + "（局域网内所有设备可访问）且存在公开书库。",
+        "   同一网络中的任何人都能浏览公开书库。建议在 config.yaml 中设置：",
         "     server:",
-        "       auth_token: <自定义口令>",
+        "       auth_token: <管理员口令>      # 或给每个书库设置独立密码：",
+        "     library:",
+        "       roots:",
+        "         - name: 我的书库",
+        "           path: ...",
+        "           password: <访问密码>",
         "   或将 host 改为 127.0.0.1（仅本机可用）。",
     ]
 

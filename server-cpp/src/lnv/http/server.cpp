@@ -263,6 +263,17 @@ AppError book_not_found(const std::string& book_id) {
                     json::object({{"book_id", book_id}}));
 }
 
+// 解析当前请求的访问范围；凭据缺失/错误 → 401（与 Python api/deps.py:access_scope 同文案）
+AccessScope scope_of(AppContext& ctx, const httplib::Request& req) {
+    const AccessResult result = resolve_access(ctx.cfg, header_opt(req, "X-Auth-Token"));
+    if (!result.valid) {
+        throw AppError(ErrorCode::Unauthorized,
+                       result.missing ? "需要访问密码" : "访问密码错误",
+                       json::object({{"auth_required", true}}));
+    }
+    return result.scope;
+}
+
 // layout_id 必填（已由 Validator 校验）+ 条目查找（LAYOUT_NOT_FOUND）
 LayoutEntry require_entry(AppContext& ctx, const std::string& book_id,
                           const std::string& layout_id) {
@@ -320,17 +331,25 @@ Handler wrap(AppContext& ctx, bool require_auth, Handler fn, bool head_405 = tru
 
 // ---------------------------------------------------------------- 端点实现
 
-// GET /api/v1/server/info（不鉴权；routes_server.py）
-void handle_server_info(AppContext& ctx, const httplib::Request&, httplib::Response& res) {
+// GET /api/v1/server/info（不强制鉴权；routes_server.py）
+// 书库列表按请求携带的 X-Auth-Token 过滤；凭据错误 → 401，缺失且必须提供 → 200 + 空列表
+void handle_server_info(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const auto& cfg = ctx.cfg;
+    const AccessResult result = resolve_access(cfg, header_opt(req, "X-Auth-Token"));
+    if (!result.valid && !result.missing)
+        throw AppError(ErrorCode::Unauthorized, "访问密码错误",
+                       json::object({{"auth_required", true}}));
     json libs = json::array();
-    for (const auto& l : ctx.library->libraries_info())
-        libs.push_back({{"name", l.name}, {"book_count", l.book_count}, {"path", nullptr}});
+    if (result.valid)
+        for (const auto& l : ctx.library->libraries_info(result.scope.all ? nullptr
+                                                                         : &result.scope))
+            libs.push_back(
+                {{"name", l.name}, {"book_count", l.book_count}, {"path", nullptr}});
     json j = {
         {"name", cfg.server.name},
         {"version", "0.1.0"},
         {"api_version", "v1"},
-        {"auth_required", cfg.auth_required()},
+        {"auth_required", cfg.credential_required()},
         {"libraries", libs},
         {"features", {
             {"png", true}, {"json", true}, {"search", true},
@@ -353,10 +372,11 @@ void handle_files(AppContext& ctx, const httplib::Request& req, httplib::Respons
     const long long offset = pv_int(v, qparam(req, "offset"), {"query", "offset"}, 0, int_ge(0));
     v.done();
 
-    json j = ctx.library->list_dir(path, static_cast<int>(limit), offset);
+    const AccessScope scope = scope_of(ctx, req);
+    json j = ctx.library->list_dir(path, static_cast<int>(limit), offset, &scope);
     if (path == "/") {
         json libs = json::array();
-        for (const auto& l : ctx.library->libraries_info())
+        for (const auto& l : ctx.library->libraries_info(&scope))
             libs.push_back({{"name", l.name}, {"book_count", l.book_count},
                             {"path", l.path ? json(*l.path) : json(nullptr)}});
         j["libraries"] = libs;
@@ -369,7 +389,8 @@ void handle_files(AppContext& ctx, const httplib::Request& req, httplib::Respons
 // GET /api/v1/books/{id}/meta（routes_books.py）
 void handle_book_meta(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string book_id = req.matches[1];
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     auto adapter = ctx.open_adapter(*ref);
     auto meta = adapter->meta();
@@ -416,9 +437,10 @@ void handle_cover(AppContext& ctx, const httplib::Request& req, httplib::Respons
     const long long w =
         pv_int(v, qparam(req, "w"), {"query", "w"}, 240, int_range(40, 1024));
     v.done();
-    // 契约：先解析书（被删除 → 404），用**当前** rev 计算 ETag；绝不在未解析书的
-    // 情况下命中 304（书被删/内容变化后旧 ETag 必须失效）。
-    auto ref = ctx.require_book(book_id);
+    // 契约：先解析书（被删除 / 不在访问范围 → 404），用**当前** rev 计算 ETag；
+    // 绝不在未解析书的情况下命中 304（书被删/内容变化后旧 ETag 必须失效）。
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     const std::string rev = ref->rev;
     const std::string etag = "\"" + book_id + ":" + rev + ":w" + std::to_string(w) + "\"";
@@ -460,13 +482,15 @@ void handle_asset(AppContext& ctx, const httplib::Request& req, httplib::Respons
     const std::string raw_path =
         pv_str(v, qparam(req, "path"), {"query", "path"}, "", /*required=*/true, 0);
     v.done();
+    // 先校验书籍可见性（与 Python 一致）：否则其他书库的 book_id 会命中 304 分支泄露存在性
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
+    if (!ref) throw book_not_found(book_id);
     const std::string safe = safe_asset_path(raw_path);
     const std::string etag = "\"" + book_id + ":asset:" + stable_hash(safe, 16) + "\"";
     res.set_header("ETag", etag);
     res.set_header("Cache-Control", "public, max-age=31536000, immutable");
     if (ctx.etag_matches(inm_ptr(req), etag)) { res.status = 304; return; }
-    auto ref = ctx.require_book(book_id);
-    if (!ref) throw book_not_found(book_id);
     auto adapter = ctx.open_adapter(*ref);
     ImageBytes img = adapter->asset(safe);
     if (img.mime.empty()) img.mime = sniff_mime(img.bytes);
@@ -489,6 +513,8 @@ void handle_open_folder(AppContext& ctx, const httplib::Request& req, httplib::R
     if (!ctx.cfg.gallery.folder_as_book)
         // Python routes_books.py:141-142 用 AppError(UNSUPPORTED_FORMAT, msg)：无 detail
         throw AppError(ErrorCode::UnsupportedFormat, "服务器已关闭“文件夹作为图集”功能");
+    const AccessScope scope = scope_of(ctx, req);
+    ctx.library->ensure_path_allowed(path, &scope);
     auto r = ctx.gallery->register_folder(path, recursive);
     // Python：cover_url 为空时回落到 /api/v1/books/{id}/cover（恒为字符串，不是 null）
     const std::string cover = r.cover_url.empty()
@@ -509,7 +535,8 @@ void handle_layout(AppContext& ctx, const httplib::Request& req, httplib::Respon
     // FastAPI 顺序：请求体校验（依赖求解）→ handler 内 require_book
     json body = parse_body(req);
     LayoutProfile profile = LayoutProfile::from_json(body);
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     auto adapter = ctx.open_adapter(*ref);
     auto r = ctx.layouts->build(*ref, *adapter, profile);
@@ -576,7 +603,8 @@ void handle_page(AppContext& ctx, const httplib::Request& req, httplib::Response
                        json::object({{"fit", fit_raw}}));
 
     // 3) book → 4) layout → 5) 页码
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     auto entry = require_entry(ctx, book_id, layout_id);
     const PageMap& pm = entry.pagemap;
@@ -732,13 +760,16 @@ void handle_page_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
     const int page = check_page(pm, page_ll);
     const PageRecord* rec = pm.record(page);
 
+    // 顺序同 Python：先 layout/页码，再校验书籍可见性（layout_id 与书籍无关，
+    // 不校验的话其他书库的 book_id 也能读到正文首行），最后取 aspect。
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
+    if (!ref) throw book_not_found(book_id);
+
     // aspect 仅 fixed/strip；strip 用 image_index + 1（页号 ≠ 源图序号）；异常 → null
-    // 顺序同 Python：先 layout/页码，只有需要 aspect 时才 require_book
     json aspect = nullptr;
     if (pm.mode != "flow") {
         try {
-            auto ref = ctx.require_book(book_id);
-            if (!ref) throw book_not_found(book_id);
             auto adapter = ctx.open_adapter(*ref);
             const int target_page = rec->image_index >= 0 ? rec->image_index + 1 : page;
             aspect = adapter->page_aspect(target_page);
@@ -761,8 +792,7 @@ void handle_page_meta(AppContext& ctx, const httplib::Request& req, httplib::Res
 }
 
 // GET /api/v1/books/{id}/locate（routes_read.py + layout/anchors.py §4.5）
-// 注意：Python 的 locate **不**校验书是否存在，只查 layout（require_layout_async），
-// 因此删掉的书若仍有 layout 缓存也能定位。保持一致以免同一请求两边给不同错误码。
+// 顺序同 Python：先查 layout（LAYOUT_NOT_FOUND 优先），再校验书籍存在且在访问范围内。
 void handle_locate(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string book_id = req.matches[1];
     Validator v;
@@ -775,6 +805,8 @@ void handle_locate(AppContext& ctx, const httplib::Request& req, httplib::Respon
     v.done();
 
     auto entry = require_entry(ctx, book_id, layout_id);
+    const AccessScope scope = scope_of(ctx, req);
+    if (!ctx.require_book(book_id, &scope)) throw book_not_found(book_id);
     // 锚点用 long long：巨大值在 Python 里是"永远在文档之后"→ 定位到末页且 clamped=true。
     // 夹到 INT_MAX 后语义完全一致（真实锚点远小于 INT_MAX），而直接窄化会变成 0/负数
     // 从而定位到首页（审查 H4）。
@@ -806,7 +838,8 @@ void handle_search(AppContext& ctx, const httplib::Request& req, httplib::Respon
         pv_int(v, qparam(req, "limit"), {"query", "limit"}, 50, int_range(1, 500));
     v.done();
 
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     // layout 存在但 mode≠flow → 415（entry 提到块外：pagemap 指针在块外仍需有效）
     const PageMap* pagemap = nullptr;
@@ -842,7 +875,8 @@ void handle_search(AppContext& ctx, const httplib::Request& req, httplib::Respon
 // GET /api/v1/progress/{book_id}（routes_progress.py §4.10）
 void handle_progress_get(AppContext& ctx, const httplib::Request& req, httplib::Response& res) {
     const std::string book_id = req.matches[1];
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     std::optional<ProgressService::Record> rec;
     // 空 device_id 视同未提供（Python：`None if device_id else get_any(...)`，
@@ -904,7 +938,8 @@ void handle_progress_put(AppContext& ctx, const httplib::Request& req, httplib::
                            0.0, 1.0);
     v.done();
 
-    auto ref = ctx.require_book(book_id);
+    const AccessScope scope = scope_of(ctx, req);
+    auto ref = ctx.require_book(book_id, &scope);
     if (!ref) throw book_not_found(book_id);
     std::optional<std::string> device;
     if (auto dev = qparam(req, "device_id")) device = *dev;
@@ -1081,7 +1116,7 @@ void handle_font_file(AppContext& ctx, const httplib::Request& req, httplib::Res
 // GET / 与 GET /healthz（鉴权，无前缀）
 void handle_root(AppContext& ctx, const httplib::Request&, httplib::Response& res) {
     json j = {{"name", ctx.cfg.server.name}, {"version", "0.1.0"},
-              {"api", "/api/v1"}, {"auth_required", ctx.cfg.auth_required()}};
+              {"api", "/api/v1"}, {"auth_required", ctx.cfg.credential_required()}};
     res.set_content(j.dump(), "application/json");
 }
 

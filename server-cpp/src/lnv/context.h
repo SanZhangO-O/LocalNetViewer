@@ -35,7 +35,9 @@ struct AppContext {
     void shutdown();  // 停扫描 → save index → progress flush
 
     // ---- 书籍 ----
-    std::optional<BookRef> require_book(const std::string& book_id) const;
+    // scope 非空时校验书籍所在书库是否可见；不可见按"书不存在"抛 404（设计 9）
+    std::optional<BookRef> require_book(const std::string& book_id,
+                                        const AccessScope* scope = nullptr) const;
     std::optional<LayoutEntry> require_layout(const std::string& book_id,
                                               const std::string& layout_id);
     // 指纹变化时清空派生缓存

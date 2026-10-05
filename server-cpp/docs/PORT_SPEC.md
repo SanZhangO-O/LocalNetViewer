@@ -26,7 +26,7 @@
 ### 1.1 全局约定
 
 - 路由前缀：`/api/v1`（`main.py: APIRouter(prefix="/api/v1")`）。
-- 鉴权：除 `GET /api/v1/server/info` 外，全部端点依赖 `require_token`（见 §5）。`GET /`、`GET /healthz`（无前缀）**也**要求令牌（`main.py`）。
+- 鉴权：除 `GET /api/v1/server/info`（不强制鉴权，但按凭据过滤书库列表）外，全部端点依赖访问范围校验（见 §5）。`GET /`、`GET /healthz`（无前缀）**也**要求凭据（`main.py`）。
 - 配置 `auth_token` 非空时，`/docs`、`/redoc`、`/openapi.json` **关闭**（返回 404）。
 - 错误响应体（`errors.py::AppError.payload`）：`{"code": str, "message": str}`，`detail` 非空时附加 `"detail": object`。
 - 401 时附加响应头 `WWW-Authenticate: X-Auth-Token`。
@@ -39,7 +39,7 @@
 | `BAD_REQUEST` | 400 | "请求参数缺失或非法"（校验）；"format 只支持 png/json"；"fit 只支持 viewport/original"（routes_read） | 参数校验失败、枚举非法 |
 | `BAD_PATH` | 400 | "路径非法"/具体原因（`paths.py::PathError` 消息直接透传，如 "path 不允许包含 '..'"、"书库不存在: X"、"路径不存在: X"、"不是目录: X"、"目录无法读取: …"） | normalize_vpath / list_dir |
 | `PATH_TRAVERSAL` | 403 | "越出书库根目录: <真实路径>" | resolve_in_root |
-| `UNAUTHORIZED` | 401 | "令牌缺失或错误"，detail `{"auth_required": true}` | require_token |
+| `UNAUTHORIZED` | 401 | 无凭据且必须提供 → "需要访问密码"；凭据错误 → "访问密码错误"，detail `{"auth_required": true}` | access_scope / require_token |
 | `BOOK_NOT_FOUND` | 404 | "书不存在或已被移除"，detail `{"book_id": …}` | AppContext.require_book |
 | `LAYOUT_NOT_FOUND` | 404 | "layout_id 不存在或已失效，请重新 POST /layout"，detail `{"book_id","layout_id"}` | AppContext.require_layout；search |
 | `PAGE_OUT_OF_RANGE` | 404 | `f"页码越界：{page} / {total}"`，detail `{"page","total_pages"}` | get_page / page_meta |
@@ -66,8 +66,8 @@
   "name": "LocalNetViewer",            // config.server.name 或默认
   "version": "0.1.0",
   "api_version": "v1",
-  "auth_required": false,              // bool(config.server.auth_token 非空)
-  "libraries": [ {"name": str, "book_count": int, "path": null} ],  // 注意：此处 path 恒为 null（不泄露真实路径）
+  "auth_required": false,              // 无凭据时完全不可见：auth_token 非空，或全部书库都设了 password
+  "libraries": [ {"name": str, "book_count": int, "path": null} ],  // 按请求 X-Auth-Token 过滤；未带凭据且必须提供时为空；path 恒为 null（不泄露真实路径）
   "features": {
     "png": true, "json": true, "search": true,
     "gallery": bool(comic.gallery.folder_as_book),
@@ -229,7 +229,7 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 
 #### GET / 与 GET /healthz（鉴权）
 
-`/` → `{"name","version","api":"/api/v1","auth_required"}`；`/healthz` → `{"ok": true, "scanning": bool}`。
+`/` → `{"name","version","api":"/api/v1","auth_required"}`（auth_required = 无凭据时完全不可见，见 §5）；`/healthz` → `{"ok": true, "scanning": bool}`。
 
 ---
 
@@ -247,12 +247,12 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 | `name` | `"LocalNetViewer"` | 展示名（/server/info、/） |
 | `host` | `"127.0.0.1"` | 监听地址；安全默认仅本机 |
 | `port` | `8765` | 1..65535 |
-| `auth_token` | `""` | 空=不鉴权；非空=所有端点（除 /server/info）需 X-Auth-Token |
+| `auth_token` | `""` | 管理员令牌：空=无管理员；非空=匹配它的 X-Auth-Token 可见全部书库（见 §5） |
 
 **library**
 | 键 | 默认 | 语义 |
 |---|---|---|
-| `roots` | `[]` | `{name, path}` 列表；name 不得含 `/`、`\`，不得重名（校验失败启动即报错）；path 做 `expanduser`/`expandvars` |
+| `roots` | `[]` | `{name, path, password?}` 列表；name 不得含 `/`、`\`，不得重名（校验失败启动即报错）；path 做 `expanduser`/`expandvars`；password 可选（strip 后空=公开书库，非空=输入该密码才可见该书库，多个书库可共用；显式 null 按配置错误拒绝） |
 | `include_ext` | `.txt .epub .pdf .cbz .cbr .cb7 .cbt .fb2 .mobi .azw3` | 列表中显示的书籍扩展名（自动补 `.`、小写、去重） |
 | `show_all_files` | `false` | 列出非电子书（`type:"file"`，`openable:false`，reason "非电子书格式"） |
 | `sort` | `"natural"` | 仅声明；实际列表排序硬编码 natural |
@@ -313,7 +313,7 @@ Query：`device_id`（可选）。Body `ProgressPutRequest`：`{"anchor":{chapte
 - 启动顺序：加载配置（失败 exit 2）→ 建 AppContext（ensure_dirs：cache、cache/parsed、cache/layouts、fonts_dir；`Image.MAX_IMAGE_PIXELS = limits.max_source_pixels`）→ 读 `cache/index.json` → **`library.scan_mode=="eager"` 且非 `--no-scan` 时**同步全量扫描一次（增量：size+mtime+format 未变则复用索引中的 book_id；`--no-scan` 时改为后台补扫）→ 打印横幅（书库统计、字体、令牌状态、全部网卡地址、防火墙提示）→ uvicorn 单进程（workers=1）启动。
 
   `library.scan_mode` 默认 `"lazy"`：此时**不做任何全量扫描**（Python/C++ 一致），也不启用目录变化监听；索引只由 `/files` 按目录扫描增量补齐。`eager` 才与旧行为一致。
-- 横幅安全告警：host 非回环且未配令牌时打印醒目警告。
+- 横幅安全告警：host 非回环且未配管理员令牌、且存在公开书库时打印醒目警告（建议 auth_token 或给每个书库设 password）。
 - 关停：cancel 扫描 → wait_idle(10s) → save_index → progress flush。
 - 访问日志中间件：`METHOD path -> status 耗时ms`。
 - 地址枚举（netinfo.py）：优先 psutil，退化用 getaddrinfo + UDP connect(8.8.8.8) 探测出口；虚拟网卡（vpn/tap/tun/docker/wsl 等关键字）标记"可能不可达"；IPv6、回环、链路本地不推荐。
@@ -406,9 +406,17 @@ book_id = sha1( ascii(str(int(file_size))) + 文件头前 1 MiB 原始字节 ).h
 
 ### 4.3 EPUB / FB2 / 漫画 / PDF / MOBI
 
+**图片型检测（两实现共用契约；Python `formats/imagebook.py` / C++ `formats/imagebook.{h,cpp}`）**：
+按 spine 块模型统计，图片页 ≥8 且平均每页正文 ≤64 字符 → 图片书，按固定版式漫画
+打开（`format`/`size` 取原书 ref，`mode=fixed`，页 = spine 图片顺序）。直接 EPUB 只在
+容器创建时检测（`/meta` 也会触发）；候选预筛：正文 XHTML 总量 > 8KB × 图片条目数 →
+直接判非漫画、不做块扫描（Python 用 zip 未压缩尺寸，C++ 用已读入内存的 spine 字节数）。
+检测缓存：键 = 路径 + mtime/size，LRU 32（MOBI 为转换产物路径 + rev）。
+
 **EPUB**（formats/epub.py）：
 - 主路径 ebooklib，失败（缺失/不合规）退化 zipfile+lxml 手写：`META-INF/container.xml` → rootfile `full-path` → OPF；manifest(id→href/media-type/properties) + spine(itemref 顺序，仅 `application/xhtml*`)；章标题：EPUB3 nav（properties 含 `nav`）优先，其次 NCX（navPoint/navLabel/text + content/src），href 去 fragment、unquote、相对 OPF 目录规范化。
 - meta 快速：只解析容器（spine+标题），不解析正文 HTML。
+- **图片型分流（等同 Python，见 §4.3 imagebook）**：`create_epub_adapter` 先做图片型检测；命中则返回 `ComicAdapter`（外部容器 = spine 图片，`format=epub`、`mode=fixed`、页数 = 图片数），否则返回 `EpubAdapter`。C++ 的 spine 文档在 meta 阶段已整体读入，预筛直接用内存字节数（Python 用 zip 未压缩尺寸），候选书才做块扫描。
 - document：按 spine 顺序 HTML→块；忽略 CSS；跳过 `script style head title nav noscript template iframe object video audio math`（含祖先在跳过集合内的元素）；`h1..h6`→heading（level 1..6；含块级后代时只取直接文本）；文本容器 `p div li blockquote pre td th figcaption dd dt section article main aside header footer caption address`→paragraph（含块级后代时只取直接文本，顺序在子块之前）；`hr`→separator；`img/image`（src/data-src/xlink:href/Clark 记法/属性名后缀 `href`）→image 块（`data:` URI 丢弃；尺寸 probe 失败默认 600×800）。空白折叠 `[ \t\r\n\f\v]+`→单空格；CJK 相邻空格删除（正则 `(?<=[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef])[ \t]+(?=同左)`）；b/strong→bold，i/em→italic（span 合并相邻同 style）。章 title：toc 标题 → 首个非空 heading → 文件名 stem。
 - 资源读取：依次尝试原名/unquote/去前导`/`/normpath/小写全名匹配/basename 唯一匹配（多个同名 → ASSET_NOT_FOUND）；单条目受 `max_archive_entry_mb` 流式限制。
 - 封面：文件名匹配 `(^|/)cover[^/]*\.(jpe?g|png|gif|webp|bmp)$`（IGNORECASE）→ basename 含 "cover" → 任何图片第一个；无 → 文字封面。带 `w` 时解码缩到 ≤w 并编码 JPEG q84。
@@ -430,7 +438,7 @@ book_id = sha1( ascii(str(int(file_size))) + 文件头前 1 MiB 原始字节 ).h
 
 **PDF**（formats/pdf.py）：pypdfium2（PDFium）。fixed。`page_native_size` = 页面 pt × 2.0（`DEFAULT_RENDER_PT_TO_PX`，约 144dpi）。`fit=original`：scale = 2.0 × clamp(0.5..2.0, render_scale)；`fit=viewport`：scale = viewport_w × clamp(scale) / w_pt。`_clamp_scale`：w_pt×scale × h_pt×scale > `render.max_page_pixels` 时 scale ×= sqrt(max_pixels/pixels)。渲染 → PIL RGB → JPEG（quality 参数，prefer_jpeg 恒 true）。封面：第 1 页 viewport w=480 q82。pair：两页各按 viewport 宽渲染后 hstack；末页落单。metadata Title/Author。
 
-**MOBI/AZW3**（formats/mobi.py）：探测 `ebook-convert`（PATH）；缺失 → 415 reason "需安装 Calibre"。转换到 `cache/converted/{book_id}.epub`（先写 `.tmp.epub` 再原子 replace——临时名必须保持 `.epub` 扩展名，ebook-convert 按输出扩展名选输出插件；每本书一把进程内锁；子进程超时 = parse_timeout_s × 4，最少 60s；exit≠0 或产物空 → PARSE_FAILED，stderr 尾 500 字节入 message）。此后完全走 EPUB 路径，meta/document 的 `format` 字段改回原格式（mobi/azw3）。**漫画分流（仅 Python 已实现，C++ 待移植）**：转换后扫描 spine（块模型与 flow 一致），若图片页 ≥8 且平均每页正文 ≤64 字符，则按**固定版式漫画**打开（`mode=fixed`，页 = spine 图片顺序，复用漫画管线的 fit/双页/条漫/封面），否则维持流式 EPUB；检测结果进程内缓存（键 = 转换产物路径 + mtime/size，上限 32 条）。回归：`server/tests/test_mobi_comic.py`。
+**MOBI/AZW3**（formats/mobi.py）：探测 `ebook-convert`（PATH）；缺失 → 415 reason "需安装 Calibre"。转换到 `cache/converted/{book_id}.epub`（先写 `.tmp.epub` 再原子 replace——临时名必须保持 `.epub` 扩展名，ebook-convert 按输出扩展名选输出插件；每本书一把进程内锁；子进程超时 = parse_timeout_s × 4，最少 60s；exit≠0 或产物空 → PARSE_FAILED，stderr 尾 500 字节入 message）。此后完全走 EPUB 路径，meta/document 的 `format` 字段改回原格式（mobi/azw3）。**漫画分流（Python 与 C++ 一致，见 §4.3 imagebook）**：转换后扫描 spine（块模型与 flow 一致），若图片页 ≥8 且平均每页正文 ≤64 字符，则按**固定版式漫画**打开（`mode=fixed`，页 = spine 图片顺序，复用漫画管线的 fit/双页/条漫/封面），否则维持流式 EPUB；检测结果进程内缓存（键 = 转换产物路径 + mtime/size，上限 32 条）。C++ 由 `open_mobi_adapter`（mobi.h）在转换后取内层 EpubAdapter 检测并移交容器。回归：`server/tests/test_mobi_comic.py`、`server-cpp/tests/test_formats.py`。
 
 ### 4.4 分页/布局引擎（layout/engine.py、services/layouts.py）
 
@@ -504,16 +512,23 @@ book_id = sha1( ascii(str(int(file_size))) + 文件头前 1 MiB 原始字节 ).h
 
 ---
 
-## 5. 认证
+## 5. 认证与书库访问范围
 
-来源：`server/app/api/deps.py`。
+来源：`server/app/services/access.py`、`server/app/api/deps.py`。
 
-- Header 名：`X-Auth-Token`。
-- 配置 `server.auth_token` strip 后为空 → 完全跳过校验（无鉴权模式）。
-- 非空时：请求头值 strip、UTF-8 编码后与期望值做**常量时间比较**（`secrets.compare_digest`，bytes 级——非 ASCII 用 str 比较会抛异常，必须编码成 bytes）。失败 → 401 `UNAUTHORIZED`，message "令牌缺失或错误"，detail `{"auth_required": true}`，响应头 `WWW-Authenticate: X-Auth-Token`。
-- 豁免端点：仅 `GET /api/v1/server/info`。`/`、`/healthz`、其余全部端点均需校验。开启鉴权后交互式文档（/docs /redoc /openapi.json）关闭。
-
-C++ 注意：必须使用常量时间比较（如逐字节 XOR 累积），且先 strip 两端空白。
+- Header 名：`X-Auth-Token`；两种凭据（strip 后比较，常量时间/逐字节 XOR）：
+  - `server.auth_token`（管理员令牌）→ `scope.all`，可见全部书库；
+  - `library.roots[].password`（书库密码）→ 可见**匹配密码的书库 + 所有公开（未设密码）书库**（密码相同的书库一起可见）。
+- 解析（`resolve_access`）：
+  - 有凭据且匹配管理员 → 全部；匹配书库密码 → 该书库 + 公开书库；谁都不匹配 → 401 "访问密码错误"（**不**静默降级为只显示公开书库）；
+  - 无凭据：`auth_token` 非空或"存在书库且全部加锁" → 401 "需要访问密码"；否则只见公开书库（全公开时 = 旧版无鉴权行为，兼容）。
+- 401 响应：detail `{"auth_required": true}`，响应头 `WWW-Authenticate: X-Auth-Token`。
+- 按范围过滤的端点：
+  - `/server/info`：**不强制鉴权**，但带凭据时按范围过滤 `libraries`；凭据错误 → 401；无凭据且必须提供 → 200 + 空 `libraries` + `auth_required=true`。始终不返回真实路径。
+  - `/files`：`path=/` 的根列表与 `libraries` 字段按范围过滤；范围外书库路径 → `BAD_PATH "书库不存在: X"`（与不存在不可区分）。
+  - `/books/*`（meta/cover/asset/layout/pages/pages-meta/locate/search）、`/open-folder`、`/progress/*`：书籍（含图集虚拟书，按 vpath 首段）不在范围内 → `BOOK_NOT_FOUND`；`open-folder` 的目录不在范围内 → `BAD_PATH`。asset 先校验书籍存在/可见再判 304。`/pages/{n}/meta`、`/locate` 先做 layout/页码校验（LAYOUT_NOT_FOUND / PAGE_OUT_OF_RANGE 优先），再校验书籍。
+- 豁免/鉴权边界：`GET /`、`GET /healthz`、`/render/fonts*` 仍需**任意有效凭据**（或无需凭据的公开访问）。开启管理员令牌后交互式文档（/docs /redoc /openapi.json）关闭。
+- 端口与 Python 一致：请求头经 latin-1 解码后，Python 会先还原 UTF-8 字节（`_normalize_header`）再比较，因此非 ASCII（中文）密码可用；C++ 直接按原始 UTF-8 字节比较，天然一致。
 
 ---
 

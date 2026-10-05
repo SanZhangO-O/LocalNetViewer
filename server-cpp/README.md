@@ -129,5 +129,5 @@ cd server
   （正文一致，`meta.encoding` 可能不同）。
 - httplib 自身的错误（超长 URI → 414、超长请求头 → 400）现在也带统一 JSON 错误信封；
   Python 对超长 URI 返回 400。两者状态码不同但都返回可解析的错误体。
-- **非 ASCII 令牌**：本实现按原始字节比较，可正常工作；Python 用 latin-1 解码后的头再
-  比较，非 ASCII 令牌实际上永远匹配不上。建议令牌只用 ASCII 可见字符。
+- **非 ASCII 令牌 / 密码**：两边都可用。本实现按原始字节比较；Python 会先把
+  latin-1 解码的请求头还原成 UTF-8（`services/access.py::_normalize_header`）再比较。

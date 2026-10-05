@@ -39,6 +39,7 @@ from ..util.paths import (
 )
 from ..util.textutil import content_revision
 from . import gallery as gallery_mod
+from .access import AccessScope
 
 INDEX_VERSION = 1
 HEAD_BYTES = 1 << 20  # 1MB
@@ -212,12 +213,14 @@ class LibraryService:
         with self._lock:
             return len(self._books)
 
-    def libraries_info(self) -> List[Dict[str, Any]]:
+    def libraries_info(self, allowed: Optional[AccessScope] = None) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         # 直接在锁内按 root 计数：旧实现每次 /server/info 都 dict(self._books)
         # 复制整份索引（每本书一个 dict），书库大时纯属浪费
         with self._lock:
             for root in self.config.library.roots:
+                if allowed is not None and not allowed.allows_root(root.name):
+                    continue
                 prefix = f"/{root.name}"
                 count = sum(
                     1
@@ -507,7 +510,24 @@ class LibraryService:
         return "/".join(parts[1:])
 
     # ------------------------------------------------------------ 目录列表
-    def list_dir(self, vpath: str, limit: int = 1000, offset: int = 0) -> Dict[str, Any]:
+    def ensure_path_allowed(self, vpath: str, allowed: Optional[AccessScope]) -> None:
+        """路径首段书库不在访问范围内时，与"书库不存在"同样处理（不泄露存在性）。"""
+        if allowed is None or allowed.all:
+            return
+        try:
+            name = self.root_name_of(vpath)
+        except PathError:
+            name = None
+        if name is None or not allowed.allows_root(name):
+            raise PathError(f"书库不存在: {name or vpath}")
+
+    def list_dir(
+        self,
+        vpath: str,
+        limit: int = 1000,
+        offset: int = 0,
+        allowed: Optional[AccessScope] = None,
+    ) -> Dict[str, Any]:
         """目录列表（分页）。
 
         分成两个阶段，让分页不仅裁剪响应体，也裁剪服务器的每页成本：
@@ -522,11 +542,14 @@ class LibraryService:
         """
         v = normalize_vpath(vpath, allow_empty=True)
         if v == "/":
-            return self._list_roots(limit, offset)
+            return self._list_roots(limit, offset, allowed)
 
         root_name = self.root_name_of(v)
         if root_name is None or self.config.root_by_name(root_name) is None:
             raise PathError(f"书库不存在: {root_name or v}")
+        if allowed is not None and not allowed.allows_root(root_name):
+            # 不在访问范围的书库与不存在等价（避免用路径探测其他书库是否存在）
+            raise PathError(f"书库不存在: {root_name}")
         real = self.resolve_real(v)
         if real is None or not real.exists():
             raise PathError(f"路径不存在: {v}")
@@ -703,9 +726,13 @@ class LibraryService:
             "scanning": self._scanning.is_set(),
         }
 
-    def _list_roots(self, limit: int, offset: int) -> Dict[str, Any]:
+    def _list_roots(
+        self, limit: int, offset: int, allowed: Optional[AccessScope] = None
+    ) -> Dict[str, Any]:
         entries: List[Dict[str, Any]] = []
         for root in self.config.library.roots:
+            if allowed is not None and not allowed.allows_root(root.name):
+                continue
             exists = Path(root.path).is_dir()
             entries.append(
                 {
@@ -722,7 +749,7 @@ class LibraryService:
         return {
             "path": "/",
             "parent": None,
-            "libraries": self.libraries_info(),
+            "libraries": self.libraries_info(allowed),
             "gallery": None,
             "entries": page,
             "total": total,

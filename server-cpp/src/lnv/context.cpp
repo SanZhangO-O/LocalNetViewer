@@ -64,10 +64,16 @@ void AppContext::shutdown() {
     if (progress) progress->flush();
 }
 
-std::optional<BookRef> AppContext::require_book(const std::string& book_id) const {
+std::optional<BookRef> AppContext::require_book(const std::string& book_id,
+                                                const AccessScope* scope) const {
     // 图集虚拟书优先（不在 library 索引里，注册表见 cache/galleries.json）
     auto ref = gallery->book_ref(book_id);
     if (!ref) ref = library->require_book(book_id);
+    // 不在访问范围内的书与不存在同样报 404：不能靠 book_id 访问其他书库的内容
+    if (ref && scope != nullptr && !scope->all &&
+        !scope->allows(LibraryService::root_name_of(ref->vpath))) {
+        ref.reset();
+    }
     if (!ref) {
         throw AppError(ErrorCode::BookNotFound, "书不存在或已被移除",
                        nlohmann::json{{"book_id", book_id}});
@@ -219,11 +225,24 @@ bool AppContext::etag_matches(const std::string* header_value, const std::string
 
 std::string AppContext::startup_report() const {
     std::string out = "LocalNetViewer Server (C++) v0.1.0\n";
-    for (const auto& lib : library->libraries_info())
-        out += "书库: " + lib.name + " (" + std::to_string(lib.book_count) + " 本)\n";
+    std::string locked;
+    for (const auto& root : cfg.library.roots) {
+        if (!root.password.empty()) {
+            if (!locked.empty()) locked += "、";
+            locked += root.name;
+        }
+    }
+    for (const auto& lib : library->libraries_info()) {
+        const LibraryRootCfg* root = cfg.root_by_name(lib.name);
+        const bool needs_password = root != nullptr && !root->password.empty();
+        out += "书库: " + lib.name + " (" + std::to_string(lib.book_count) + " 本)  [" +
+               (needs_password ? "需密码" : "公开") + "]\n";
+    }
     out += "字体: " + fonts->default_id() + "（共 " +
            std::to_string(fonts->list_infos().size()) + " 个）\n";
     out += cfg.auth_required() ? "访问令牌: 已启用\n" : "访问令牌: 未启用\n";
+    if (!locked.empty())
+        out += "访问密码: " + locked + "（输入对应密码只可见该书库）\n";
     return out;
 }
 

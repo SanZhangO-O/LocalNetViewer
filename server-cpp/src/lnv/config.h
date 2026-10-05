@@ -15,6 +15,9 @@ struct ConfigError : std::runtime_error { using std::runtime_error::runtime_erro
 struct LibraryRootCfg {
     std::string name;
     std::string path;
+    // 访问密码（设计 9）：留空 = 公开书库；填写后需携带对应 X-Auth-Token 才可见。
+    // 多个书库可共用同一密码。
+    std::string password;
 };
 
 struct LibraryCfg {
@@ -100,6 +103,8 @@ struct AppConfig {
     std::filesystem::path index_path() const { return cache_dir() / "index.json"; }
     std::filesystem::path gallery_registry_path() const { return cache_dir() / "galleries.json"; }
     bool auth_required() const;
+    // 未提供任何凭据时完全不可见（管理员令牌启用，或全部书库都设了密码）
+    bool credential_required() const;
 
     const LibraryRootCfg* root_by_name(const std::string& name) const;
     std::optional<std::string> encoding_override(const std::string& vpath) const;

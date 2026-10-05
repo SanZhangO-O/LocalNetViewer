@@ -7,6 +7,7 @@
 // - meta() 只做容器级解析，不解析正文 HTML。
 #include "lnv/config.h"
 #include "lnv/formats/adapter.h"
+#include "lnv/formats/imagebook.h"
 #include "lnv/util/textutil.h"
 
 namespace lnv {
@@ -27,6 +28,14 @@ public:
     std::pair<int, int> image_size_pub(const std::string& name);
     // 容器路径 → OPF 相对路径（用于图片块的 asset 字段）
     std::string opf_relative(const std::string& container_path) const;
+
+    // ---- 图片型检测（formats/imagebook.py 对应）----
+    // 扫描 spine 块模型（图片页 ≥8 且平均每页正文 ≤64 字符 → manga），
+    // pages = spine 顺序的容器内图片路径；结果由 imagebook.cpp 缓存。
+    ImageBookInfo scan_image_book();
+    // 容器内条目读取（漫画分流容器用；守卫与 asset 一致）
+    std::string read_entry_pub(const std::string& name);
+    const BookRef& book_ref() const { return ref_; }
 
 private:
     struct Doc {
@@ -55,8 +64,10 @@ private:
     const Model& model();  // 懒加载
     void load_model();
 
-    // HTML → 块（手写容错解析，见 epub.cpp）
-    std::vector<Block> html_to_blocks(const std::string& html, const std::string& item_name);
+    // HTML → 块（手写容错解析，见 epub.cpp）。
+    // image_paths 非空时按出现顺序收集图片的**容器内路径**（图片型检测用）。
+    std::vector<Block> html_to_blocks(const std::string& html, const std::string& item_name,
+                                      std::vector<std::string>* image_paths = nullptr);
     // 图片资源尺寸（probe 失败 600×800，带缓存）
     std::pair<int, int> image_size(const std::string& name);
 

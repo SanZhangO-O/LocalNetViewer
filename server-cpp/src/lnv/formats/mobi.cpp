@@ -1,7 +1,8 @@
 // MOBI / AZW3 适配器实现：ebook-convert → EPUB 缓存 → EpubAdapter
 // 对应 Python formats/mobi.py；子进程用 CreateProcess + WaitForSingleObject 超时 kill。
 #include "lnv/formats/mobi.h"
-#include "lnv/formats/epub.h"  // 另一代理实现：需提供 create_epub_adapter(cfg, ref)
+#include "lnv/formats/comics.h"     // ComicAdapter（漫画分流）
+#include "lnv/formats/imagebook.h"  // image_book_info / make_epub_comic_adapter
 #include "lnv/cache/store.h"   // enforce_dir_quota（converted 目录 2GiB 配额）
 #include "lnv/util/concurrency.h"  // KeyedLocks / heavy_gate
 #include "lnv/util/paths.h"
@@ -161,8 +162,9 @@ MobiAdapter::MobiAdapter(const AppConfig& cfg, const BookRef& ref, const Adapter
     eref.mtime = 0.0;  // 转换产物 mtime 仅信息性，读取即可（不参与缓存键）
     eref.virtual_book = ref.virtual_book;
     eref.extra = ref.extra;
-    // 依赖：formats/epub.h 需提供该工厂（另一代理实现）
-    inner_ = create_epub_adapter(cfg_, eref, env_);
+    // 直接建 EpubAdapter（不经 create_epub_adapter 的图片型分流：
+    // 是否漫画由 open_mobi_adapter 在拿到内层后统一判定）
+    inner_ = std::make_unique<EpubAdapter>(cfg_, eref, env_);
 }
 
 std::filesystem::path MobiAdapter::converted_path() const {
@@ -236,5 +238,15 @@ DocumentModel MobiAdapter::document() {
 std::optional<ImageBytes> MobiAdapter::cover(int width) { return inner_->cover(width); }
 
 ImageBytes MobiAdapter::asset(const std::string& path) { return inner_->asset(path); }
+
+// MOBI/AZW3 工厂：先转换，再按"是否漫画"分流到固定版式或流式适配器
+// （对应 Python formats/mobi.open_mobi_adapter；检测结果进程内缓存）。
+std::unique_ptr<BookAdapter> open_mobi_adapter(const AppConfig& cfg, const BookRef& ref,
+                                               const AdapterEnv& env) {
+    auto flow = std::make_unique<MobiAdapter>(cfg, ref, env);  // 构造即完成转换（命中缓存零开销）
+    ImageBookInfo info = image_book_info(flow->inner());
+    if (!info.manga) return flow;
+    return make_epub_comic_adapter(cfg, ref, flow->take_inner(), info);
+}
 
 }  // namespace lnv

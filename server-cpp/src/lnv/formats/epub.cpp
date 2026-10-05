@@ -5,9 +5,11 @@
 #include <miniz.h>
 #include <pugixml.hpp>
 
+#include "lnv/formats/comics.h"     // ComicAdapter（图片型 EPUB 分流）
 #include "lnv/formats/container.h"  // decode_zip_name（条目名 cp437 还原）
 #include "lnv/render/raster.h"      // text_cover：坏书封面退化（对齐 Python）
 #include "lnv/util/imaging.h"
+#include "lnv/util/paths.h"
 
 namespace lnv {
 namespace {
@@ -1672,9 +1674,9 @@ AdapterMeta EpubAdapter::meta() {
 }
 
 // ---- HTML → 块 ----
-// _image_block：src/data-src/xlink:href/属性名以 href 结尾 → image 块
-std::optional<Block> epub_image_block(EpubAdapter& self, const HNode& tag,
-                                      const std::string& item_name) {
+// src/data-src/xlink:href/属性名以 href 结尾 → 容器内路径（空串 = 无 / 不可用）
+std::string epub_image_resolved(EpubAdapter& self, const HNode& tag,
+                                const std::string& item_name) {
     std::string src;
     auto get = [&](const char* k) -> std::string {
         auto it = tag.attrs.find(k);
@@ -1694,12 +1696,18 @@ std::optional<Block> epub_image_block(EpubAdapter& self, const HNode& tag,
     }
     // strip
     size_t b = src.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) return std::nullopt;
+    if (b == std::string::npos) return "";
     size_t e = src.find_last_not_of(" \t\r\n");
     src = src.substr(b, e - b + 1);
-    if (src.empty()) return std::nullopt;
-    if (src.rfind("data:", 0) == 0) return std::nullopt;  // data: URI 无法经 /asset 提供
-    std::string resolved = self.resolve_href_pub(item_name, src);
+    if (src.empty()) return "";
+    if (src.rfind("data:", 0) == 0) return "";  // data: URI 无法经 /asset 提供
+    return self.resolve_href_pub(item_name, src);
+}
+
+// _image_block：解析结果 → image 块
+std::optional<Block> epub_image_block(EpubAdapter& self, const HNode& tag,
+                                      const std::string& item_name) {
+    std::string resolved = epub_image_resolved(self, tag, item_name);
     if (resolved.empty()) return std::nullopt;
     auto [w, h] = self.image_size_pub(resolved);
     Block blk;
@@ -1711,9 +1719,10 @@ std::optional<Block> epub_image_block(EpubAdapter& self, const HNode& tag,
     return blk;
 }
 
-// 遍历（等价 find_all(True) 的文档序逐元素处理；跳过子树 = 逐元素 in_skipped 的等价）
+// 遍历（等价 find_all(True) 的文档序逐元素处理；跳过子树 = 逐元素 in_skipped 的等价）。
+// image_paths 非空时按出现顺序收集图片的容器内路径（图片型检测用）。
 void epub_walk(EpubAdapter& self, const HNode& n, const std::string& item_name,
-               std::vector<Block>& blocks) {
+               std::vector<Block>& blocks, std::vector<std::string>* image_paths) {
     for (const HNode& c : n.children) {
         if (c.is_text) continue;
         if (is_skip_tag(c.name)) continue;  // 整棵子树跳过
@@ -1762,17 +1771,22 @@ void epub_walk(EpubAdapter& self, const HNode& n, const std::string& item_name,
             blk.type = BlockType::Separator;
             blocks.push_back(std::move(blk));
         } else if (c.name == "img" || c.name == "image") {
+            if (image_paths != nullptr) {
+                std::string resolved = epub_image_resolved(self, c, item_name);
+                if (!resolved.empty()) image_paths->push_back(std::move(resolved));
+            }
             if (auto blk = epub_image_block(self, c, item_name)) {
                 blocks.push_back(std::move(*blk));
             }
         }
         // 继续遍历后代（与 find_all(True) 一致）
-        epub_walk(self, c, item_name, blocks);
+        epub_walk(self, c, item_name, blocks, image_paths);
     }
 }
 
 std::vector<Block> EpubAdapter::html_to_blocks(const std::string& html,
-                                               const std::string& item_name) {
+                                               const std::string& item_name,
+                                               std::vector<std::string>* image_paths) {
     HNode root = parse_html_tree(html);
     // 等价 soup.body if soup.body is not None else soup：找首个 body 元素
     const HNode* body = &root;
@@ -1785,9 +1799,46 @@ std::vector<Block> EpubAdapter::html_to_blocks(const std::string& html,
     };
     if (const HNode* b = find_body(root)) body = b;
     std::vector<Block> blocks;
-    epub_walk(*this, *body, item_name, blocks);
+    epub_walk(*this, *body, item_name, blocks, image_paths);
     return blocks;
 }
+
+// len(block.text.strip())：Python str.strip() 去首尾 Unicode 空白（含全角空格）
+static long long stripped_text_len(const U32Text& text) {
+    auto is_ws = [](char32_t c) {
+        return c == U' ' || c == U'\t' || c == U'\n' || c == U'\r' || c == U'\x0b' ||
+               c == U'\x0c' || c == U'\u3000';
+    };
+    size_t b = 0, e = text.size();
+    while (b < e && is_ws(text[b])) ++b;
+    while (e > b && is_ws(text[e - 1])) --e;
+    return (long long)(e - b);
+}
+
+// 图片型检测：与 Python imagebook.scan_image_book 同一判据。
+// 预筛用内存中的 spine 字节数（文档在 meta 阶段已读入），避免文本 EPUB
+// 在 /meta 阶段被全量解析成块。
+ImageBookInfo EpubAdapter::scan_image_book() {
+    const Model& m = model();
+    ImageBookInfo out;
+    out.title = m.title.empty() ? stem_of(ref_.name()) : m.title;
+    if ((int)m.image_names.size() < kImageBookMinPages) return out;
+    long long xhtml_bytes = 0;
+    for (const Doc& d : m.docs) xhtml_bytes += (long long)d.html.size();
+    if (xhtml_bytes > kImageBookXhtmlBytesPerImage * (long long)m.image_names.size()) return out;
+    for (const Doc& d : m.docs) {
+        std::vector<Block> blocks = html_to_blocks(d.html, d.name, &out.pages);
+        for (const Block& b : blocks) {
+            if (b.type != BlockType::Heading && b.type != BlockType::Paragraph) continue;
+            out.text_chars += stripped_text_len(b.text());
+        }
+    }
+    out.manga = (int)out.pages.size() >= kImageBookMinPages &&
+                out.text_chars <= (long long)kImageBookMaxTextPerPage * (long long)out.pages.size();
+    return out;
+}
+
+std::string EpubAdapter::read_entry_pub(const std::string& name) { return read_entry(name); }
 
 std::pair<int, int> EpubAdapter::image_size(const std::string& name) {
     auto it = size_cache_.find(name);
@@ -1920,7 +1971,12 @@ namespace lnv {
 
 std::unique_ptr<BookAdapter> create_epub_adapter(const AppConfig& cfg, const BookRef& ref,
                                                  const AdapterEnv& env) {
-    return std::make_unique<EpubAdapter>(cfg, ref, env);
+    // 图片型（漫画，每页一图）→ 固定版式漫画管线（铺满屏幕）；文本型维持流式。
+    // 检测有进程内缓存；预筛保证文本 EPUB 的 /meta 不做全量 HTML 解析。
+    auto flow = std::make_unique<EpubAdapter>(cfg, ref, env);
+    ImageBookInfo info = image_book_info(*flow);
+    if (!info.manga) return flow;
+    return make_epub_comic_adapter(cfg, ref, std::move(flow), info);
 }
 
 }  // namespace lnv

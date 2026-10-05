@@ -88,7 +88,10 @@ fun ConnectScreen(
             OutlinedTextField(
                 value = state.token,
                 onValueChange = vm::onTokenChange,
-                label = { Text("访问令牌（服务器未启用则留空）") },
+                label = { Text("访问密码 / 令牌（无则留空）") },
+                supportingText = {
+                    Text("输入书库密码进入对应书库；管理员令牌可见全部书库")
+                },
                 singleLine = true,
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
@@ -158,7 +161,7 @@ fun ConnectScreen(
                     HistoryRow(
                         item = item,
                         onClick = { vm.useHistory(item) },
-                        onDelete = { vm.forget(item.url) },
+                        onDelete = { vm.forget(item) },
                     )
                 }
             }

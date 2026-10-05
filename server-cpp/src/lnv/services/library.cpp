@@ -523,7 +523,8 @@ bool LibraryService::scanning() const { return scanning_.load(); }
 
 // ------------------------------------------------------------------ 统计
 
-std::vector<LibraryService::LibCount> LibraryService::libraries_info() const {
+std::vector<LibraryService::LibCount> LibraryService::libraries_info(
+    const AccessScope* allowed) const {
     std::vector<LibCount> out;
     std::map<std::string, LibraryBook> snapshot;
     {
@@ -531,6 +532,7 @@ std::vector<LibraryService::LibCount> LibraryService::libraries_info() const {
         snapshot = by_vpath_;
     }
     for (const auto& root : cfg_.library.roots) {
+        if (allowed != nullptr && !allowed->allows(root.name)) continue;
         std::string prefix = "/" + root.name;
         int count = 0;
         for (auto& [vp, b] : snapshot) {
@@ -542,10 +544,28 @@ std::vector<LibraryService::LibCount> LibraryService::libraries_info() const {
     return out;
 }
 
+std::string LibraryService::root_name_of(const std::string& vpath) {
+    try {
+        std::string v = normalize_vpath(vpath, true);
+        for (auto& p : vpath_parts(v)) return p;
+    } catch (const PathError&) {
+        // 规范化失败（含非法字符）按"无书库名"处理
+    }
+    return std::string();
+}
+
+void LibraryService::ensure_path_allowed(const std::string& vpath,
+                                         const AccessScope* allowed) const {
+    if (allowed == nullptr || allowed->all) return;
+    const std::string name = root_name_of(vpath);
+    if (name.empty() || !allowed->allows(name))
+        throw AppError(ErrorCode::BadPath, "书库不存在: " + (name.empty() ? vpath : name));
+}
+
 // ------------------------------------------------------------------ 目录列表
 
-nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
-                                        long long offset) const {
+nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit, long long offset,
+                                        const AccessScope* allowed) const {
     // list_dir 名义上是 const，但 Python 版会因 book_id 重算而更新索引
     // （_book_id_for 副作用）；对象本身并非 const，这里用 const_cast 保持头文件签名。
     auto* self = const_cast<LibraryService*>(this);
@@ -561,6 +581,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
         // ---- 书库根列表 ----
         std::vector<nlohmann::json> entries;
         for (const auto& root : cfg_.library.roots) {
+            if (allowed != nullptr && !allowed->allows(root.name)) continue;
             std::filesystem::path p = std::filesystem::u8path(root.path);
             bool exists = std::filesystem::is_directory(p);
             entries.push_back({
@@ -586,7 +607,7 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
             entries.begin() + start,
             entries.begin() + std::min<size_t>(start + (size_t)lim, entries.size()));
         nlohmann::json libs = nlohmann::json::array();
-        for (auto& lc : libraries_info()) {
+        for (auto& lc : libraries_info(allowed)) {
             libs.push_back(
                 {{"name", lc.name}, {"book_count", lc.book_count}, {"path", *lc.path}});
         }
@@ -609,6 +630,9 @@ nlohmann::json LibraryService::list_dir(const std::string& vpath_raw, int limit,
     if (parts.empty()) throw AppError(ErrorCode::BadPath, "书库不存在: " + v);
     const LibraryRootCfg* root = cfg_.root_by_name(parts[0]);
     if (root == nullptr) throw AppError(ErrorCode::BadPath, "书库不存在: " + parts[0]);
+    // 不在访问范围的书库与不存在等价（避免用路径探测其他书库是否存在）
+    if (allowed != nullptr && !allowed->allows(parts[0]))
+        throw AppError(ErrorCode::BadPath, "书库不存在: " + parts[0]);
 
     std::filesystem::path real;
     try {

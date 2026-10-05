@@ -120,14 +120,20 @@ int main(int argc, char** argv) {
             std::printf("访问：http://%s:%d  %s\n", a.url_host.c_str(),
                         ctx->cfg.server.port, a.label.c_str());
     }
-    // host 非回环且未配令牌 → 醒目安全警告
+    // host 非回环且存在公开书库（无管理员令牌、也非全部书库加锁）→ 醒目安全警告
+    // （与 Python run.py::_security_warnings 同条件；0.0.0.0 是全部网卡，不算回环）
     const std::string& h = ctx->cfg.server.host;
     const bool loopback =
-        h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "0.0.0.0";
-    if (!loopback && !ctx->cfg.auth_required()) {
+        h == "127.0.0.1" || h == "localhost" || h == "::1" || h.rfind("127.", 0) == 0;
+    bool has_public_root = false;  // password 在配置解析时已 strip
+    for (const auto& r : ctx->cfg.library.roots)
+        if (r.password.empty()) has_public_root = true;
+    if (!loopback && !ctx->cfg.auth_required() &&
+        (ctx->cfg.library.roots.empty() || has_public_root)) {
         std::fprintf(stderr,
-                     "\n*** 安全警告：监听地址 %s 非本机回环，且未配置 auth_token，"
-                     "局域网内任何人可访问！建议在 config.yaml 配置 server.auth_token ***\n\n",
+                     "\n*** 安全警告：监听地址 %s 非本机回环，且存在公开书库，"
+                     "局域网内任何人可浏览。建议在 config.yaml 配置 server.auth_token，"
+                     "或给每个书库设置 library.roots[].password ***\n\n",
                      h.c_str());
     }
     std::printf("防火墙放行提示：%s\n", lnv::firewall_hint(ctx->cfg.server.port).c_str());

@@ -152,6 +152,36 @@ class EpubAdapter(FlowAdapter):
             )
         raise AssetNotFoundError(f"EPUB 内不存在资源: {name}")
 
+    def entry_size(self, name: str) -> int:
+        """条目未压缩字节数（zip 中央目录，不解压）；不存在返回 0。
+
+        图片型检测的廉价预筛用（见 formats/imagebook.py）：判断正文 XHTML 总量
+        是否小到值得做块扫描，避免文本 EPUB 在 /meta 阶段被全量解析。
+        """
+        for cand in (
+            name,
+            unquote(name),
+            name.lstrip("/"),
+            posixpath.normpath(name),
+        ):
+            if cand in self._zip_names:
+                return self._zipinfo_size(cand)
+        low = self._lower_map.get(name.lower())
+        if low is not None:
+            return self._zipinfo_size(low)
+        # basename 唯一匹配兜底（与 _read_entry 同一消歧规则）
+        base = posixpath.basename(name).lower()
+        matches = [e for e in self._zip_names if posixpath.basename(e).lower() == base]
+        if len(matches) == 1:
+            return self._zipinfo_size(matches[0])
+        return 0
+
+    def _zipinfo_size(self, entry: str) -> int:
+        try:
+            return int(self._zip.getinfo(entry).file_size)
+        except KeyError:
+            return 0
+
     def _read_guarded(self, entry: str) -> bytes:
         limit = int(self.env.config.limits.max_archive_entry_mb or 0) * 1024 * 1024
         with self._zip.open(entry) as fh:

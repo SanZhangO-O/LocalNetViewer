@@ -1,13 +1,17 @@
-"""FastAPI 依赖：AppContext 注入与可选令牌校验（设计 5.1 / 9）。"""
+"""FastAPI 依赖：AppContext 注入与访问范围解析（设计 5.1 / 9）。
+
+``X-Auth-Token`` 既可以是 ``server.auth_token``（管理员令牌，见全部书库），
+也可以是某个书库的 ``password``（只见该书库 + 公开书库）。规则见 services/access.py。
+"""
 
 from __future__ import annotations
 
-import secrets
 from typing import TYPE_CHECKING
 
 from fastapi import Depends, Header, Request
 
 from ..models.schemas import ErrorCode
+from ..services.access import AccessScope, resolve_access
 from .errors import AppError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -21,28 +25,30 @@ def get_ctx(request: Request) -> "AppContext":
     return ctx
 
 
+def access_scope(
+    request: Request,
+    x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
+) -> AccessScope:
+    """解析请求可见的书库范围；凭据无效 / 缺失（且必须提供）→ 401。"""
+    ctx = get_ctx(request)
+    result = resolve_access(ctx.config, x_auth_token)
+    if not result.valid:
+        raise AppError(
+            ErrorCode.UNAUTHORIZED,
+            "需要访问密码" if result.missing else "访问密码错误",
+            {"auth_required": True},
+        )
+    return result.scope
+
+
 def require_token(
     request: Request,
     x_auth_token: str | None = Header(default=None, alias="X-Auth-Token"),
 ) -> None:
-    """配置了 ``server.auth_token`` 时校验令牌；``/server/info`` 豁免。"""
-    ctx = get_ctx(request)
-    expected = (ctx.config.server.auth_token or "").strip()
-    if not expected:
-        return
-    # 常量时间比较，避免逐字节短路造成的时序侧信道。
-    # encode 成 bytes：compare_digest 对含非 ASCII 字符的 str 会抛 TypeError（500），
-    # 而这里应当返回 401。
-    if not secrets.compare_digest(
-        (x_auth_token or "").strip().encode("utf-8"),
-        expected.encode("utf-8"),
-    ):
-        raise AppError(
-            ErrorCode.UNAUTHORIZED,
-            "令牌缺失或错误",
-            {"auth_required": True},
-        )
+    """仅校验凭据（不需要按书库过滤的端点用，如字体列表）。"""
+    access_scope(request, x_auth_token)
 
 
 CtxDep = Depends(get_ctx)
+ScopeDep = Depends(access_scope)
 AuthDep = Depends(require_token)

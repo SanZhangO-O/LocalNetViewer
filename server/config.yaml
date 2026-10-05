@@ -5,12 +5,18 @@ server:
   name: LocalNetViewer
   host: 0.0.0.0
   port: 8765
-  auth_token: ""            # 留空则不需要令牌；填写后客户端需携带 X-Auth-Token
+  # 管理员令牌：留空则不启用；填写后客户端需携带 X-Auth-Token（可见全部书库）。
+  # 书库级访问密码见 library.roots[].password（两者可同时使用）。
+  auth_token: ""
 
 library:
   roots:
     - name: 我的书库
       path: F:\book
+      password: ""   # 访问密码：留空 = 公开书库；输入该密码才可见（只见该书库）
+    - name: Books
+      path: C:\Books
+      # password: ""        # 公开书库：不输入密码也能看到它
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序

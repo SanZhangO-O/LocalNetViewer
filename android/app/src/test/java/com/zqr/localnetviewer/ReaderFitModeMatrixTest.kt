@@ -4,6 +4,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.IntSize
 import com.zqr.localnetviewer.data.prefs.AppSettings
 import com.zqr.localnetviewer.ui.common.InsetsPx
+import com.zqr.localnetviewer.ui.reader.FillScreenScale
 import com.zqr.localnetviewer.ui.reader.FitMode
 import com.zqr.localnetviewer.ui.reader.InnerScrollAxis
 import com.zqr.localnetviewer.ui.reader.contentScaleFor
@@ -30,7 +31,7 @@ class ReaderFitModeMatrixTest {
     @Test
     fun `固定版式四种模式的显示策略`() {
         val expected = mapOf(
-            "screen" to (ContentScale.FillBounds to InnerScrollAxis.NONE),
+            "screen" to (FillScreenScale to InnerScrollAxis.NONE),
             "page" to (ContentScale.Fit to InnerScrollAxis.NONE),
             "width" to (ContentScale.FillWidth to InnerScrollAxis.VERTICAL),
             "height" to (ContentScale.FillHeight to InnerScrollAxis.HORIZONTAL),

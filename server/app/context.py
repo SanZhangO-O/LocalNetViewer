@@ -20,6 +20,7 @@ from .formats.base import AdapterEnv, BookAdapter, BookRef
 from .formats.mobi import sweep_converted_cache
 from .layout.fonts import FontManager
 from .models.schemas import ErrorCode
+from .services.access import AccessScope
 from .services.gallery import GalleryService
 from .services.layouts import LayoutService
 from .services.library import LibraryService
@@ -27,6 +28,7 @@ from .services.progress import ProgressStore
 from .services.search import SearchService
 from .services.watcher import LibraryWatcher
 from .util import imaging
+from .util.paths import PathError
 from .api.errors import AppError
 
 logger = logging.getLogger("localnetviewer")
@@ -118,17 +120,30 @@ class AppContext:
             await asyncio.to_thread(_quiet_close, adapter)
 
     # ------------------------------------------------------------ 书籍
-    def require_book(self, book_id: str) -> BookRef:
+    def _scope_allows(self, ref: BookRef, scope: Optional[AccessScope]) -> bool:
+        """书籍所在书库是否在凭据允许范围内（书库名为空 / 非法视为不允许）。"""
+        if scope is None:
+            return True
+        try:
+            name = self.library.root_name_of(ref.vpath)
+        except PathError:
+            return False
+        return scope.allows_root(name)
+
+    def require_book(self, book_id: str, scope: Optional[AccessScope] = None) -> BookRef:
         ref = self.library.book_by_id(book_id)
-        if ref is None:
+        # 不在访问范围内的书与不存在同样报 404：不能靠 book_id 访问其他书库的内容
+        if ref is None or not self._scope_allows(ref, scope):
             raise AppError(
                 ErrorCode.BOOK_NOT_FOUND, "书不存在或已被移除", {"book_id": book_id}
             )
         return ref
 
-    async def require_book_async(self, book_id: str) -> BookRef:
+    async def require_book_async(
+        self, book_id: str, scope: Optional[AccessScope] = None
+    ) -> BookRef:
         """异步版：``book_by_id`` 命中"文件被就地替换"分支时会重算 book_id（读 1MB 文件头）。"""
-        return await asyncio.to_thread(self.require_book, book_id)
+        return await asyncio.to_thread(self.require_book, book_id, scope)
 
     def require_layout(self, book_id: str, layout_id: str):
         entry = self.layouts.entry(book_id, layout_id)
@@ -236,7 +251,17 @@ class AppContext:
                 )
                 count = info["book_count"] if info else 0
                 state = "扫描中" if self.library.scanning else "扫描完成"
-                lines.append(f"书库: {root.name} ({root.path}, {count} 本)  [{state}]")
+                access = "公开" if not (root.password or "").strip() else "需密码"
+                lines.append(
+                    f"书库: {root.name} ({root.path}, {count} 本)  [{state}，{access}]"
+                )
+            locked = [
+                r.name for r in cfg.library.roots if (r.password or "").strip()
+            ]
+            if locked:
+                lines.append(
+                    "访问密码: " + "、".join(locked) + "（输入对应密码只可见该书库）"
+                )
         else:
             lines.append("书库: 未配置（请编辑 config.yaml 的 library.roots）")
         watch = self.watcher.status()

@@ -262,3 +262,76 @@ def test_epub3_nav_title_keeps_inner_whitespace(server, make_book):
     with server.client() as c:
         meta = c.get(f"/api/v1/books/{bid}/meta").json()
     assert meta["chapters"][0]["title"] == "Chapter    One"
+
+
+# --------------------------------------------------------------------- 图片型 EPUB 分流
+def image_epub_bytes(pages: int, text_per_page: int = 0, title: str = "漫画") -> bytes:
+    """每页一张图（可选少量正文）的 EPUB，用于图片型分流回归。"""
+    items = []
+    refs = []
+    extra = {}
+    for i in range(1, pages + 1):
+        iid = f"p{i:03d}"
+        text = "字" * text_per_page
+        items.append(
+            f'<item id="{iid}" href="text/{iid}.xhtml" media-type="application/xhtml+xml"/>'
+        )
+        refs.append(f'<itemref idref="{iid}"/>')
+        extra[f"OEBPS/text/{iid}.xhtml"] = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<html xmlns="http://www.w3.org/1999/xhtml"><body>'
+            f'<p>{text}</p><p><img src="../images/{iid}.png"/></p></body></html>'
+        ).encode("utf-8")
+        extra[f"OEBPS/images/{iid}.png"] = png_bytes(200 + i, 300 + i)
+    package = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        '<dc:identifier id="id">t</dc:identifier>'
+        f"<dc:title>{title}</dc:title><dc:language>zh</dc:language></metadata>"
+        "<manifest>" + "".join(items) + "</manifest>"
+        "<spine>" + "".join(refs) + "</spine></package>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr("META-INF/container.xml", CONTAINER)
+        zf.writestr("OEBPS/content.opf", package)
+        for name, data in extra.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def test_image_epub_opens_as_fixed_comic(server, make_book):
+    """图片型 EPUB（每页一图）必须按固定版式漫画打开（mode=fixed、页数=图片数）。
+
+    走文本流排版时图片会被塞进带边距的版心、四周空边，无法铺满屏幕（真实反馈）。
+    """
+    make_book("epub/manga.epub", image_epub_bytes(10, text_per_page=3))
+    bid = server.book_id("/lib/epub", "manga.epub")
+    with server.client() as c:
+        meta = c.get(f"/api/v1/books/{bid}/meta").json()
+        assert meta["mode"] == "fixed"
+        assert meta["format"] == "epub"
+        assert meta["page_count"] == 10
+        layout = c.post(f"/api/v1/books/{bid}/layout", json=FIXED).json()
+        assert layout["mode"] == "fixed"
+        assert layout["total_pages"] == 10
+        r = c.get(
+            f"/api/v1/books/{bid}/pages/1",
+            params={"layout_id": layout["layout_id"], "fit": "viewport"},
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("image/")
+        # 页序 = spine 顺序（首尾尺寸与造书时一致）
+        assert Image.open(io.BytesIO(r.content)).size[0] > 200
+
+
+def test_text_epub_keeps_flow_mode(server, make_book):
+    """正文为主的 EPUB 维持流式排版（图片型检测不得误伤插图书/小说）。"""
+    html = "<html><body><p>" + ("正文内容。" * 800) + "</p></body></html>"
+    make_book("epub/novel.epub", epub_bytes(html, "小说"))
+    bid = server.book_id("/lib/epub", "novel.epub")
+    with server.client() as c:
+        meta = c.get(f"/api/v1/books/{bid}/meta").json()
+    assert meta["mode"] == "flow"
