@@ -329,7 +329,7 @@ server/
       "index": 0,
       "title": "第一章 科学边界",
       "blocks": [
-        {"type": "heading", "level": 1, "text": "第一章 科学边界"},
+        {"type": "heading", "level": 1, "spans": [{"text": "第一章 科学边界"}]},
         {"type": "paragraph", "spans": [{"text": "汪淼", "style": "none"}, {"text": "抬头看见", "style": "bold"}]},
         {"type": "image", "asset": "Images/figure1.jpg", "w": 800, "h": 600},
         {"type": "separator"}
@@ -779,7 +779,6 @@ android/app/src/main/java/com/zqr/localnetviewer/
   - **适应宽度 / 适应高度**：`FillWidth` / `FillHeight`；页内滚动
     （宽度→纵向、高度→横向），手势仲裁见 6.4。
   - 适应模式**只改客户端显示策略**，不进入 `profileSignature`，因此切换不触发重新 `/layout`。
-    旧版本存的 `fitMode="page"`（整页）与现在的"铺满屏幕"语义相同，解析时并入。
 - 沉浸模式：隐藏系统栏、保持屏幕常亮（`KEEP_SCREEN_ON`）。
 - **系统返回键**：目录/设置/搜索弹层打开时先关弹层；否则直接离开阅读页
   （沉浸态不拦返回——浏览内容时按返回应直接退出，工具栏由点击屏幕中部呼出）。
@@ -1391,8 +1390,8 @@ Pager 邻页 + `±1/±2` 预取），无需全量传输；但**条漫（strip）
 - "整页"（`fitMode=page`）语义与新的"铺满屏幕"相同，**选项合并**（设置面板不再单列，
   只剩铺满屏幕 / 适应宽度 / 适应高度）；旧安装残留的 `"page"` 解析为"铺满屏幕"，
   显示行为与合并前一致（完整显示）；
-- 回归：`android/app/src/test/.../ReaderFitModeDefaultTest`（默认值、绝不裁边、
-  旧值兼容）、`ReaderFitModeMatrixTest`（模式矩阵）。
+- 回归：`android/app/src/test/.../ReaderFitModeDefaultTest`（默认值、绝不裁边）、
+  `ReaderFitModeMatrixTest`（模式矩阵）。
 
 ### v0.6（2026-10-05，双端对抗性审查修复）
 

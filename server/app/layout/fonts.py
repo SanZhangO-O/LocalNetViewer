@@ -463,7 +463,4 @@ def _name_suggests_cjk(face: FontFace) -> bool:
 
 
 def _default_font(size: int) -> ImageFont.FreeTypeFont:
-    try:
-        return ImageFont.load_default(size=size)  # Pillow >= 10
-    except TypeError:  # pragma: no cover - 旧版 Pillow
-        return ImageFont.load_default()
+    return ImageFont.load_default(size=size)

@@ -125,9 +125,6 @@ class Block:
     def from_dict(d: Dict[str, Any]) -> "Block":
         t = str(d.get("type", BLOCK_PARAGRAPH))
         spans = [Span.from_dict(s) for s in d.get("spans", [])]
-        if not spans and d.get("text"):
-            # 兼容设计 4.4 文档示例里的简化写法 {"type":"heading","text":"…"}
-            spans = [Span(str(d["text"]))]
         return Block(
             type=t,
             spans=spans,

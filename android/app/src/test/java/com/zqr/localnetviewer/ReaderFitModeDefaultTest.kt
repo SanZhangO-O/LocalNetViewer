@@ -48,14 +48,6 @@ class ReaderFitModeDefaultTest {
     }
 
     @Test
-    fun `旧版 page 值并入铺满屏幕，仍为等比完整显示`() {
-        assertEquals(FitMode.SCREEN, FitMode.of("page"))
-        val settings = AppSettings.DEFAULT.copy(fitMode = "page")
-        assertEquals(ContentScale.Fit, contentScaleFor(settings, isFixed = true))
-        assertEquals(InnerScrollAxis.NONE, innerScrollFor(settings, isFixed = true))
-    }
-
-    @Test
     fun `未知适应模式兜底为铺满屏幕`() {
         assertEquals(FitMode.SCREEN, FitMode.of("nonsense"))
         val settings = AppSettings.DEFAULT.copy(fitMode = "nonsense")

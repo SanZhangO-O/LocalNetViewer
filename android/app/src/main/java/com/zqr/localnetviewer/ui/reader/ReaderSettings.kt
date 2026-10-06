@@ -32,8 +32,6 @@ enum class ReaderTheme(val id: String, val background: Long, val foreground: Lon
  * SCREEN 是默认：等比缩放**完整显示**整页（`Fit`），先保证图片内容不被裁切，
  * 再尽量占满屏幕；比例与视口不符时只留黑边，绝不裁边。WIDTH / HEIGHT 单向等比
  * 撑满 + 页内滚动。
- *
- * 旧版本存过 PAGE（"整页"）：语义与现在的 SCREEN 相同，解析时并入 SCREEN。
  */
 enum class FitMode(val id: String, val label: String) {
     SCREEN("screen", "铺满屏幕"),
@@ -172,7 +170,3 @@ fun innerScrollFor(settings: AppSettings, isFixed: Boolean): InnerScrollAxis {
         FitMode.HEIGHT -> InnerScrollAxis.HORIZONTAL
     }
 }
-
-/** 兼容旧调用点：是否需要页内滚动。 */
-fun needsInnerScroll(settings: AppSettings, isFixed: Boolean): Boolean =
-    innerScrollFor(settings, isFixed) != InnerScrollAxis.NONE

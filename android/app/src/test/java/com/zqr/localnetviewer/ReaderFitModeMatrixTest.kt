@@ -9,12 +9,9 @@ import com.zqr.localnetviewer.ui.reader.InnerScrollAxis
 import com.zqr.localnetviewer.ui.reader.contentScaleFor
 import com.zqr.localnetviewer.ui.reader.effectiveMode
 import com.zqr.localnetviewer.ui.reader.innerScrollFor
-import com.zqr.localnetviewer.ui.reader.needsInnerScroll
 import com.zqr.localnetviewer.ui.reader.profileSignature
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -28,13 +25,11 @@ class ReaderFitModeMatrixTest {
     private fun settings(fit: String) = AppSettings.DEFAULT.copy(fitMode = fit)
 
     @Test
-    fun `固定版式各模式的显示策略（含旧值 page）`() {
+    fun `固定版式各模式的显示策略`() {
         val expected = mapOf(
             "screen" to (ContentScale.Fit to InnerScrollAxis.NONE),
             "width" to (ContentScale.FillWidth to InnerScrollAxis.VERTICAL),
             "height" to (ContentScale.FillHeight to InnerScrollAxis.HORIZONTAL),
-            // 旧版存的 "page"（整页）：语义并入铺满屏幕，同为等比完整显示
-            "page" to (ContentScale.Fit to InnerScrollAxis.NONE),
         )
         expected.forEach { (id, pair) ->
             val s = settings(id)
@@ -45,20 +40,18 @@ class ReaderFitModeMatrixTest {
 
     @Test
     fun `文本书忽略适应模式`() {
-        for (id in listOf("screen", "page", "width", "height", "nonsense")) {
+        for (id in listOf("screen", "width", "height", "nonsense")) {
             val s = settings(id)
             assertEquals(ContentScale.Fit, contentScaleFor(s, isFixed = false))
             assertEquals(InnerScrollAxis.NONE, innerScrollFor(s, isFixed = false))
-            assertFalse(needsInnerScroll(s, isFixed = false))
         }
     }
 
     @Test
     fun `只有 width 与 height 需要页内滚动`() {
-        assertFalse(needsInnerScroll(settings("screen"), isFixed = true))
-        assertFalse(needsInnerScroll(settings("page"), isFixed = true))
-        assertTrue(needsInnerScroll(settings("width"), isFixed = true))
-        assertTrue(needsInnerScroll(settings("height"), isFixed = true))
+        assertEquals(InnerScrollAxis.NONE, innerScrollFor(settings("screen"), isFixed = true))
+        assertEquals(InnerScrollAxis.VERTICAL, innerScrollFor(settings("width"), isFixed = true))
+        assertEquals(InnerScrollAxis.HORIZONTAL, innerScrollFor(settings("height"), isFixed = true))
     }
 
     @Test
@@ -66,13 +59,11 @@ class ReaderFitModeMatrixTest {
         FitMode.entries.forEach { assertEquals(it, FitMode.of(it.id)) }
         assertEquals(FitMode.SCREEN, FitMode.of(""))
         assertEquals(FitMode.SCREEN, FitMode.of("nonsense"))
-        // 老版本存的是 "page"（整页）：已并入铺满屏幕，必须继续解析为完整显示
-        assertEquals(FitMode.SCREEN, FitMode.of("page"))
     }
 
     @Test
     fun `适应模式不参与分页签名`() {
-        val a = settings("page")
+        val a = settings("width")
         val b = settings("screen")
         val size = IntSize(1080, 1920)
         val insets = InsetsPx(0, 0, 0, 0)

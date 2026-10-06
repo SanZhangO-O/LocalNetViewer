@@ -282,10 +282,7 @@ def _draw_missing_image(canvas: Image.Image, x: float, y: float, w: int, h: int)
 
 def default_font(size: int) -> ImageFont.ImageFont:
     """Pillow 内置字体（无中文字形，仅用于占位/兜底）。"""
-    try:
-        return ImageFont.load_default(size=size)
-    except TypeError:  # pragma: no cover - 旧版 Pillow
-        return ImageFont.load_default()
+    return ImageFont.load_default(size=size)
 
 
 # ------------------------------------------------------------------ 固定版式
