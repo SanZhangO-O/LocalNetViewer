@@ -502,8 +502,8 @@ def test_files_list_single_images_by_default(api, tmp_books: Path):
     assert solo["gallery"]["can_open_as_book"] is True
     assert solo["openable"] is True and solo["reason"] is None
     assert solo["book_id"]
-    listed = entries["readme.md"]
-    assert listed["type"] == "file" and listed["openable"] is False
+    # 非电子书文件仍按 show_all_files=false 隐藏（图片可见不波及普通文件）
+    assert "readme.md" not in entries
 
 
 def test_files_hide_single_images_when_disabled(api, tmp_books: Path, make_config):

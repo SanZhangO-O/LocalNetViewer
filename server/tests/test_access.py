@@ -154,9 +154,11 @@ def test_locked_library_path_and_book_are_hidden(api: TestClient) -> None:
     book_id = book["book_id"]
 
     assert api.get(f"{API}/books/{book_id}/meta").status_code == 404
+    # 错误令牌在任何端点都是统一的 401（与 /files 的错误密码 401 同一契约，
+    # 不因路径/书籍不同而变化，同样不泄露存在性）
     assert (
         api.get(f"{API}/books/{book_id}/meta", headers={"X-Auth-Token": "bad"}).status_code
-        == 404
+        == 401
     )
     assert (
         api.get(f"{API}/books/{book_id}/meta", headers={"X-Auth-Token": "pw-b"}).status_code
@@ -191,7 +193,9 @@ def test_all_locked_requires_password(tmp_path: Path) -> None:
         assert info.json()["libraries"] == []
         ok = client.get(f"{API}/files", headers={"X-Auth-Token": "pw-a"})
         assert ok.status_code == 200
-        assert {e["name"] for e in ok.json()["entries"]} == {PUBLIC, PRIVATE}
+        # 全部书库加锁后没有"公开书库"可叠加：pw-a 只可见它对应的那一书库
+        # （与 resolve_access 单元测试 test_resolve_access_missing_when_all_locked 一致）
+        assert {e["name"] for e in ok.json()["entries"]} == {PUBLIC}
 
 
 def test_admin_token_still_sees_locked_libraries(tmp_path: Path) -> None:

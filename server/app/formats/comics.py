@@ -575,19 +575,43 @@ class SevenZipComicContainer(ComicContainer):
                 self._arc.reset()
             except Exception:
                 pass
-            try:
-                result = self._arc.read(targets=[real])
-            except Exception as exc:
-                raise ParseError(f"7z 条目读取失败 {key}: {exc}") from exc
-        data = result.get(real) if isinstance(result, dict) else None
-        if data is None:
-            for k, v in (result or {}).items():
-                if posixpath.normpath(str(k)) == key:
-                    data = v
-                    break
-        if data is None:
-            raise AssetNotFoundError(f"7z 内不存在条目: {key}")
-        payload = data.read() if hasattr(data, "read") else bytes(data)
+            # py7zr 1.x 删除了 read()/readall()：内存提取改走
+            # extract(targets, factory=BytesIOFactory(limit))；0.x 仍走 read()。
+            if hasattr(type(self._arc), "read"):
+                try:
+                    result = self._arc.read(targets=[real])
+                except Exception as exc:
+                    raise ParseError(f"7z 条目读取失败 {key}: {exc}") from exc
+                data = result.get(real) if isinstance(result, dict) else None
+                if data is None:
+                    for k, v in (result or {}).items():
+                        if posixpath.normpath(str(k)) == key:
+                            data = v
+                            break
+                if data is None:
+                    raise AssetNotFoundError(f"7z 内不存在条目: {key}")
+                payload = data.read() if hasattr(data, "read") else bytes(data)
+            else:
+                from py7zr.io import BytesIOFactory  # noqa: PLC0415
+
+                limit = self.max_entry_bytes or (512 * 1024 * 1024)
+                factory = BytesIOFactory(limit=limit)
+                try:
+                    self._arc.extract(targets=[real], factory=factory)
+                except Exception as exc:
+                    raise ParseError(f"7z 条目读取失败 {key}: {exc}") from exc
+                try:
+                    data = factory.get(real)
+                except KeyError:
+                    data = None
+                if data is None:
+                    for k, v in factory.products.items():
+                        if posixpath.normpath(str(k)) == key:
+                            data = v
+                            break
+                if data is None:
+                    raise AssetNotFoundError(f"7z 内不存在条目: {key}")
+                payload = data.read() if hasattr(data, "read") else bytes(data)
         # 7z 无法按条目流式限流，只能读后校验（声明尺寸已在 _guard_entry 校验过一次）
         return self._check_size(key, payload)
 

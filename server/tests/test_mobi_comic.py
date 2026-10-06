@@ -36,8 +36,8 @@ def _make_epub(path: Path, *, pages: int, text_per_page: int, title: str = "测�
     manifest: list[str] = []
     spine: list[str] = []
     extra: list[tuple[str, bytes]] = []
-    for i in range(1, pages + 1):
-        iid = f"p{i:03d}"
+    for i in range(pages):
+        iid = f"p{i + 1:03d}"
         name = f"text/{iid}.xhtml"
         text = "字" * text_per_page
         html = (

@@ -357,6 +357,55 @@ def test_sevenzip_missing_dependency_is_unsupported(env, tmp_path: Path, monkeyp
         SevenZipComicContainer(env, archive)
 
 
+def _write_cb7(archive: Path, pages: dict) -> None:
+    """写入 7z；py7zr 0.x 与 1.x 的 writestr 参数顺序不同（1.x 是 data, arcname）。"""
+    import py7zr
+
+    arc = py7zr.SevenZipFile(str(archive), "w")
+    try:
+        for name, data in pages.items():
+            try:
+                arc.writestr(name, data)
+            except TypeError:
+                arc.writestr(data, name)
+    finally:
+        arc.close()
+
+
+def test_sevenzip_container_reads_entries(env, tmp_path: Path):
+    """CB7 条目读取必须对已安装的 py7zr 版本可用。
+
+    回归：py7zr 1.x 删除了 ``SevenZipFile.read()/readall()``，导致 CB7 能列出
+    （layout/contents 正常）但取页一律 422 PARSE_FAILED（LESSONS 2026-10-06）。
+    """
+    import io
+
+    archive = tmp_path / "comic.cb7"
+    pages = {f"p{i:02d}.png": png_bytes(60, 90) for i in range(1, 4)}
+    _write_cb7(archive, pages)
+
+    container = SevenZipComicContainer(env, archive)
+    try:
+        assert container.names == ["p01.png", "p02.png", "p03.png"]
+        payload = container.read("p01.png")
+        assert payload[:8] == b"\x89PNG\r\n\x1a\n"
+    finally:
+        container.close()
+
+    ref = BookRef(
+        book_id="cb70000000000001", vpath="/lib/comic.cb7", path=archive, format="cb7"
+    )
+    adapter = ComicAdapter(env, ref)
+    try:
+        assert adapter.page_count() == 3
+        aspect = adapter.page_aspect(1)
+        assert aspect == pytest.approx(90 / 60, rel=0.01)
+        data, mime = adapter.page_bytes(2, viewport_w=300)
+        assert data and mime.startswith("image/")
+    finally:
+        adapter.close()
+
+
 def test_adapter_page_count_and_order(env, tmp_path: Path, cbz_factory):
     archive = cbz_factory(tmp_path / "comic.cbz", count=5, width=400, height=600)
     ref = BookRef(book_id="cbz0000000000001", vpath="/lib/comic.cbz", path=archive, format="cbz")

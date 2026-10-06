@@ -64,3 +64,43 @@
   `target == page` 去重不会再挡路）。
 - 防再犯: 状态机里凡是"乐观置位 + 失败保留旧数据"的字段，失败分支必须逐字段确认
   回滚；指示类派生状态要与它描述的数据同源同生命周期。
+
+## 2026-10-06 py7zr 1.x 移除 read()/readall()，CB7 列表正常但取页一律 422
+- 现象: CB7 能列出（/files、meta、layout、contents 全 200，页数正确），但
+  `/pages/{n}` 一律 422 PARSE_FAILED：`7z 条目读取失败 p01.png:
+  'SevenZipFile' object has no attribute 'read'`（page meta 的 aspect 也因此 0.0）。
+- 根因: `formats/comics.py::SevenZipComicContainer._read_by_real` 调用
+  `SevenZipFile.read(targets=[...])`——这是 py7zr 0.x 的内存读取 API；
+  环境（服务器 venv）装的是 py7zr 1.1.3，1.x 删除了 `read()`/`readall()`，
+  只保留 `extract(path/targets/factory=WriterFactory)`。
+- 修复（已应用）: `_read_by_real` 按 py7zr 版本分流——有 `read()` 的 0.x 走原路径；
+  1.x 走 `extract(targets=[real], factory=py7zr.io.BytesIOFactory(limit))` 后
+  `factory.get(real).read()`，`limit` 取 `limits.max_archive_entry_mb`（0 则 512MB 兜底），
+  超限仍由 `_check_size` 读后校验。回归测试 `tests/test_containers.py::
+  test_sevenzip_container_reads_entries`（真实 7z 写入 3 图 → 容器 read + 适配器
+  page_bytes/aspect 全链路）。
+- 防再犯: 可选依赖升级（py7zr/rarfile/ebooklib）后在真格式文件上跑一遍
+  "列出 → 打开 → 取页/取资源"三步验证，不能只看 `import` 成功。
+
+## 2026-10-06 基类抽 `_read_by_real` 后漏改 EpubImageContainer → 图片型 EPUB/MOBI 漫画构造即崩
+- 现象: 全量 pytest 6 个失败（test_epub_comic / test_mobi_comic / test_access /
+  test_api）。图片型 EPUB 一打开就
+  `TypeError: Can't instantiate abstract class EpubImageContainer without an
+  implementation for abstract method '_read_by_real'`——不仅测试挂，
+  "图片型 EPUB 自动按漫画打开"运行时也是坏的（meta/layout/pages 全不可用）。
+- 根因: `ComicContainer.read()/read_entry()` 重构为统一走抽象 `_read_by_real`
+  （流式限流入口）时，zip/rar/7z/tar/folder 五个容器都补了实现，
+  唯独 `EpubImageContainer` 还在直接覆盖 `read()`、也没实现新抽象方法——
+  ABC 在实例化时才报错，而这几个测试在更早的行就崩了，后面的断言从未跑过，
+  连带掩盖了夹具与断言的错位。
+- 修复: `EpubImageContainer` 实现 `_read_by_real`（转 `epub._read_entry`），并在
+  构造时填 `_raw_entries`（保持 spine 顺序、尺寸取 `epub.entry_size`）+
+  `_finish_init()`，基类 `read_entry/asset` 随之可用；`names` 仍按 spine 顺序。
+- 连带发现（陈旧断言，一并修正）: ①两个漫画测试的夹具 `_page_image(i)` 从
+  i=1 起算，断言却按 i=0 写（page1 期望 200x300，实际 210x310）——修好前置
+  崩溃后才暴露；②test_access 两处断言与已文档化契约矛盾（错误令牌在任何端点
+  统一 401；全锁定时输入某书库密码只可见对应书库）；③test_api 期望
+  show_all_files=false 时普通文件列出，与其自身注释"隐藏"矛盾。
+- 防再犯: 给抽象基类加抽象方法时，全局检索**所有子类**（含测试里直接构造的）；
+  测试夹具与断言的数值必须同源；"测试在更早的行失败"不代表后面的断言正确，
+  修好前置崩溃后要重看全部断言。

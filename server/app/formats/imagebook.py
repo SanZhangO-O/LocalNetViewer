@@ -130,16 +130,26 @@ class EpubImageContainer(ComicContainer):
         super().__init__(env)
         self._epub = epub
         self._names = list(names)
+        # 基类 read_entry/asset（/books/{id}/asset 预览）经 _raw_map → _read_by_real
+        # 读取；_finish_init 需要全量条目。顺序保持 spine 顺序（页序由 names 决定，
+        # 不做自然排序），尺寸取 EPUB zip 声明值供 _guard_entry 限流。
+        self._raw_entries = [
+            (n, int(self._epub.entry_size(n) or 0), False) for n in self._names
+        ]
+        self._finish_init()
 
     @property
     def names(self) -> List[str]:
         return self._names
 
-    def read(self, name: str) -> bytes:
+    def _read_by_real(self, real: str, key: str) -> bytes:
         try:
-            return self._epub._read_entry(name)
+            return self._epub._read_entry(real)
         except AssetNotFoundError as exc:
-            raise ParseError(f"EPUB 内不存在页面图片: {name}") from exc
+            raise ParseError(f"EPUB 内不存在页面图片: {real}") from exc
+
+    def read(self, name: str) -> bytes:
+        return self._read_by_real(name, name)
 
     def close(self) -> None:
         return None  # zip 句柄归 EpubImageContainer 所在适配器的 epub 持有
