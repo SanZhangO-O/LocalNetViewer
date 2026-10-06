@@ -12,7 +12,7 @@ server:
 library:
   roots:
     - name: 我的书库
-      path: F:\book
+      path: D:\Books
       password: ""   # 访问密码：留空 = 公开书库；输入该密码才可见（只见该书库）
     - name: Books
       path: C:\Books
