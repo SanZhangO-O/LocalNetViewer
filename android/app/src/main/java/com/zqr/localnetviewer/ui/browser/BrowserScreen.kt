@@ -86,6 +86,7 @@ import com.zqr.localnetviewer.ui.common.formatSize
 @Composable
 fun BrowserScreen(
     onOpenBook: (String) -> Unit,
+    onOpenArchive: (String) -> Unit = {},
     onDisconnect: () -> Unit,
     overrideViewModel: BrowserViewModel? = null,
 ) {
@@ -239,8 +240,17 @@ fun BrowserScreen(
                                 EntryRow(
                                     entry = entry,
                                     coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
-                                    onClick = { vm.onEntryClick(entry) },
+                                    onClick = {
+                                        // 压缩包打不开（无图片页 / 缺后端）时，"查看内容"升级为主操作
+                                        val archiveId = entry.bookId
+                                        if (entry.isArchiveBook() && !entry.openable && archiveId != null) {
+                                            onOpenArchive(archiveId)
+                                        } else {
+                                            vm.onEntryClick(entry)
+                                        }
+                                    },
                                     onOpenAsGallery = { vm.openFolderAsGallery(entry.path) },
+                                    onOpenArchive = onOpenArchive,
                                     opening = state.opening,
                                 )
                                 HorizontalDivider()
@@ -357,6 +367,7 @@ private fun EntryRow(
     coverUrl: String?,
     onClick: () -> Unit,
     onOpenAsGallery: () -> Unit,
+    onOpenArchive: (String) -> Unit,
     opening: Boolean,
 ) {
     Row(
@@ -407,6 +418,18 @@ private fun EntryRow(
         if ((entry.isDir || entry.isImageFile) && entry.gallery?.canOpenAsBook == true) {
             TextButton(onClick = onOpenAsGallery, enabled = !opening) {
                 Text("打开为图集")
+            }
+        }
+
+        // 压缩包书籍：默认点按仍作为书打开，"内容"进压缩包浏览（设计 7.6）。
+        // 旧服务器没有 contents API：请求 404 时界面显示 Snackbar 错误，不崩溃。
+        val archiveId = entry.bookId
+        if (entry.isArchiveBook() && archiveId != null) {
+            TextButton(
+                onClick = { onOpenArchive(archiveId) },
+                enabled = !opening,
+            ) {
+                Text(if (entry.openable) "内容" else "查看内容")
             }
         }
     }

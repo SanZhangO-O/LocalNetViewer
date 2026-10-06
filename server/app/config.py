@@ -145,6 +145,20 @@ class CacheCfg(BaseModel):
     doc_memory_max: int = Field(default=3, ge=1)
 
 
+class ArchiveCfg(BaseModel):
+    """压缩包内容浏览（设计 7.6）。
+
+    - browse：允许把压缩包当虚拟目录浏览（/books/{id}/contents）；
+    - max_depth：嵌套压缩包最多可下钻的层数（包中包）；
+    - extract_cache_mb：包内条目解压缓存（cache/extracted）总量上限，
+      按访问时间 LRU 淘汰；0 = 不限制。
+    """
+
+    browse: bool = True
+    max_depth: int = Field(default=2, ge=1, le=8)
+    extract_cache_mb: int = Field(default=512, ge=0)
+
+
 class LimitsCfg(BaseModel):
     max_book_mb: int = Field(default=2048, ge=0)
     max_page_bytes: int = Field(default=50 * 1024 * 1024, ge=0)
@@ -161,6 +175,7 @@ class AppConfig(BaseModel):
     library: LibraryCfg = Field(default_factory=LibraryCfg)
     gallery: GalleryCfg = Field(default_factory=GalleryCfg)
     comic: ComicCfg = Field(default_factory=ComicCfg)
+    archive: ArchiveCfg = Field(default_factory=ArchiveCfg)
     render: RenderCfg = Field(default_factory=RenderCfg)
     cache: CacheCfg = Field(default_factory=CacheCfg)
     limits: LimitsCfg = Field(default_factory=LimitsCfg)
@@ -199,6 +214,14 @@ class AppConfig(BaseModel):
     @property
     def gallery_registry_path(self) -> Path:
         return self.cache_dir / "galleries.json"
+
+    @property
+    def archive_registry_path(self) -> Path:
+        return self.cache_dir / "archives.json"
+
+    @property
+    def extract_cache_dir(self) -> Path:
+        return self.cache_dir / "extracted"
 
     @property
     def auth_required(self) -> bool:

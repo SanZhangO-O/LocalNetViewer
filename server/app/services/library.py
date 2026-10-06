@@ -38,7 +38,7 @@ from ..util.paths import (
     resolve_in_root,
 )
 from ..util.textutil import content_revision
-from .access import AccessScope
+from . import archive as archive_mod
 from . import gallery as gallery_mod
 from .access import AccessScope
 
@@ -89,6 +89,8 @@ class LibraryService:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.gallery: Optional[gallery_mod.GalleryService] = None  # 由 AppContext 注入
+        # 压缩包嵌套书服务（设计 7.6）：由 AppContext 注入，book_by_id 兜底用
+        self.archives: Optional[archive_mod.ArchiveService] = None
         self._lock = threading.RLock()
         self._scan_lock = threading.Lock()
         self._save_lock = threading.Lock()
@@ -912,6 +914,12 @@ class LibraryService:
         if self.gallery is not None:
             ref = self.gallery.resolve(bid)
             if ref is not None and visible(ref.vpath):
+                return ref
+        # 压缩包内嵌套书（设计 7.6）：resolve 内部已按链顶做 scope 校验，
+        # 不可见书库的嵌套书与不存在不可区分
+        if self.archives is not None:
+            ref = self.archives.resolve(bid, allowed)
+            if ref is not None:
                 return ref
         return None
 

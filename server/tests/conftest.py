@@ -16,6 +16,7 @@ from PIL import Image
 
 from app.config import (
     AppConfig,
+    ArchiveCfg,
     CacheCfg,
     ComicCfg,
     GalleryCfg,
@@ -52,6 +53,7 @@ def make_config(tmp_path: Path, tmp_books: Path) -> Callable[..., AppConfig]:
             ),
             gallery=GalleryCfg(**overrides.pop("gallery", {})),
             comic=ComicCfg(**overrides.pop("comic", {})),
+            archive=ArchiveCfg(**overrides.pop("archive", {})),
             render=RenderCfg(fonts_dir=str(tmp_path / "fonts"), **overrides.pop("render", {})),
             cache=CacheCfg(dir=str(tmp_path / "cache"), **overrides.pop("cache", {})),
             limits=LimitsCfg(**overrides.pop("limits", {})),

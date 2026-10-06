@@ -97,6 +97,17 @@ class App : Application(), SingletonImageLoader.Factory {
     }
 
     /**
+     * 当前服务器是否支持压缩包内容浏览（设计 7.6，features.archive_browse）。
+     * 连接探测成功时更新；断开时不主动复位（界面只在有服务器摘要时显示入口）。
+     */
+    var archiveBrowseAvailable: Boolean by mutableStateOf(false)
+        private set
+
+    fun updateArchiveBrowse(available: Boolean) {
+        archiveBrowseAvailable = available
+    }
+
+    /**
      * Coil 3 图片加载器：复用 OkHttp（与接口同一连接池）+ 磁盘缓存兜底页面图片。
      *
      * 页面图片的强缓存头（immutable）由服务器下发，Coil 磁盘缓存做二次兜底，

@@ -31,6 +31,8 @@ data class FeaturesDto(
     val fits: List<String> = listOf("viewport", "original"),
     val strip: Boolean = true,
     @SerialName("progress_sync") val progressSync: Boolean = false,
+    /** 压缩包内容浏览（设计 7.6）；旧服务器缺省 false，客户端隐藏"查看内容"入口。 */
+    @SerialName("archive_browse") val archiveBrowse: Boolean = false,
     @SerialName("strip_min_aspect") val stripMinAspect: Float = 1.5f,
 )
 

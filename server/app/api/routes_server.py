@@ -67,6 +67,7 @@ async def server_info(
             gallery=bool(ctx.config.gallery.folder_as_book),
             strip=True,
             progress_sync=True,
+            archive_browse=bool(ctx.config.archive.browse),
             strip_min_aspect=float(ctx.config.comic.strip_min_aspect),
         ),
         server_time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

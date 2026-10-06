@@ -16,11 +16,13 @@ from .cache.parsed import ParsedCache
 from .cache.store import LayoutStore
 from .config import AppConfig, ensure_dirs
 from .formats import registry
+from .formats.archivebook import sweep_extract_cache
 from .formats.base import AdapterEnv, BookAdapter, BookRef
 from .formats.mobi import sweep_converted_cache
 from .layout.fonts import FontManager
 from .models.schemas import ErrorCode
 from .services.access import AccessScope
+from .services.archive import ArchiveService
 from .services.gallery import GalleryService
 from .services.layouts import LayoutService
 from .services.library import LibraryService
@@ -50,6 +52,10 @@ class AppContext:
         self.library = LibraryService(config)
         self.gallery = GalleryService(config, self.library)
         self.library.gallery = self.gallery
+        self.env = AdapterEnv(config=config, parsed_cache=self.parsed, fonts=self.fonts)
+        # 压缩包内容浏览与嵌套书（设计 7.6）：env 先建好再传给服务
+        self.archives = ArchiveService(config, self.library, self.env)
+        self.library.archives = self.archives
         self.layouts = LayoutService(config, self.layout_store, self.parsed, self.fonts)
         self.search = SearchService()
         self.progress = ProgressStore(config)
@@ -57,12 +63,13 @@ class AppContext:
         # 线程在 main.lifespan 里启停，避免 TestClient 每次建 app 就开线程
         self.watcher = LibraryWatcher(config, self.library)
 
-        self.env = AdapterEnv(config=config, parsed_cache=self.parsed, fonts=self.fonts)
         self.started_at = time.time()
 
         # MOBI/AZW3 的转换缓存（cache/converted）不属于三级缓存，启动时做一次
         # 按 mtime 的 LRU 配额清理（设计：转换产物要有上限）
         sweep_converted_cache(config.cache_dir / "converted")
+        # 压缩包条目解压缓存（cache/extracted）同理：总量超限按访问时间 LRU 淘汰
+        sweep_extract_cache(config)
 
         # 书籍内容变化 → 丢弃全部由旧内容派生的缓存（设计 4.6）。
         # 少了这一步，"同尺寸就地编辑"会让服务器永远返回旧分页与旧页面图。
@@ -93,6 +100,11 @@ class AppContext:
                 except OSError:
                     pass
         except OSError:
+            pass
+        # 压缩包嵌套书（设计 7.6）：父压缩包内容变化 → 链上解压缓存全部作废
+        try:
+            self.archives.invalidate_extracted(book_id)
+        except Exception:  # noqa: BLE001 - 失效失败不影响主流程
             pass
         if removed:
             logger.info("书籍内容已变化，清理 %d 项缓存：%s", removed, book_id)
@@ -229,6 +241,7 @@ class AppContext:
             "library": self.library.index_stats(),
             "library_watch": self.watcher.status(),
             "gallery_books": self.gallery.registry_size(),
+            "archive_books": self.archives.registry_size(),
             "progress_records": self.progress.count(),
         }
 

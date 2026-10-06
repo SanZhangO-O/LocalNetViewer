@@ -519,6 +519,8 @@ LocalNetViewer Server v0.1
 | 12 | GET/PUT | `/progress/{book_id}?device_id=` | 服务器端进度同步（可选） | P4 |
 | 13 | POST | `/books/open-folder` | 文件夹 → 虚拟图集书（返回 book_id）；之后走标准 `/books/{id}/*` 流程 | P3 |
 | 14 | GET | `/render/fonts/{font_id}/file` | 字体文件下载（JSON 模式客户端对齐排版用） | P4 |
+| 15 | GET | `/books/{book_id}/contents?entry=&limit=&offset=` | 压缩包内部目录列表（把压缩包当虚拟目录浏览，设计 7.6）；`/meta` 的 `archive` 块带条目/图片概览 | v0.7 |
+| 16 | POST | `/books/{book_id}/contents/open` | 包内条目 → 嵌套书（幂等，返回新 book_id）；之后走标准 `/books/{id}/*` 流程 | v0.7 |
 
 ### 5.3 关键请求 / 响应示例
 
@@ -912,6 +914,24 @@ android/app/src/main/java/com/zqr/localnetviewer/
 - **图片数缓存**：子目录的 `image_count` 在书库扫描时计算并缓存（目录 mtime 变化时重算），避免列目录时的全量遍历。
 - **单张图片**：目录列表默认列出图片文件（`gallery.show_image_files`，默认开；设为 `false` 可隐藏），点按即打开"单页图集"（同一虚拟书机制，`POST /books/open-folder` 接受图片路径）。
 - **无效目录**：不含图片（或低于 `min_images_in_folder`）的目录调用 `open-folder` 返回 `UNSUPPORTED_FORMAT`（客户端本就不显示入口）；`recursive` 以请求参数优先，缺省用配置值。
+
+### 7.6 压缩包内容浏览（v0.7）
+
+压缩包（zip/rar/7z/tar 及对应 cb* 扩展名）除了按"漫画书"打开（7.4，默认行为不变），还可以**当虚拟目录浏览**，并能把包内的书 / 图片 / 目录打开为独立书籍。
+
+- **能力位**：`/server/info` 的 `features.archive_browse`（`archive.browse` 配置，默认开）；`/books/{id}/meta` 对压缩包书籍附带 `archive: {entry_count, image_count, depth, max_depth}` 概览（非压缩包书籍为 null）。
+- **contents 列表**：`GET /books/{book_id}/contents?entry=<包内目录>&limit=&offset=`。返回与 `/files` 同构的条目行（`dir / image / book / file`），分类与置灰规则一致：
+  - `image` 行带 `preview_url`（复用 `/books/{id}/asset?path=`，按 rev 破坏缓存）；
+  - `book` 行按扩展名给出 `format` 与 `openable`/`reason`（缺解压后端等）；
+  - 跳过规则（`comic.skip_entries`）、条目名规范化与 zip-slip 防护与漫画分页**同一套**实现（`formats.comics.browse()`）。
+- **嵌套书（contents/open）**：`POST /books/{book_id}/contents/open {"entry": "books/foo.epub"}` 把包内条目注册为独立虚拟书（幂等）：
+  - `nested_id = sha1("arc:<父id>:<条目路径>")[:16]`，确定性推导；父压缩包内容不变则 id 稳定 → 进度/布局缓存保留；父内容变化 → 旧嵌套 id 随父 id 一起失效（与"文件被替换"同语义）；
+  - 修订号 `nested_rev = sha1("<id>:<父rev>")[:12]`：父压缩包 rev 变化即全部派生缓存失效；
+  - 条目类型：书籍扩展名 → 解压到缓存后走常规适配器链（txt/epub/pdf/fb2/mobi/漫画容器）；单张图片 → 单页图集；目录 → **前缀图集**（该目录下的图片条目即页，自然排序，支持条漫切片——覆盖"一个压缩包多话漫画"）；嵌套压缩包本身也可作为漫画书打开，或继续 `contents` 浏览；
+  - 注册表持久化在 `cache/archives.json`（book_id 是哈希无法反推条目路径；上限 5000 条按 LRU 淘汰）；解析链顶时按 `scope` 校验顶层压缩包可见性——密码书库"不可见 = 不存在"语义自动继承。
+- **包中包**：链式下钻（最多 `archive.max_depth` 层，默认 2）。中间层压缩包条目解压到 `cache/extracted/<nested_id>/` 后继续打开；解压缓存按访问时间 LRU 淘汰（`archive.extract_cache_mb`，默认 512MB，启动 sweep），父压缩包内容变化时立即清除其链上缓存目录。
+- **客户端**：浏览页压缩包条目显示"内容"入口（默认点按仍作为书打开；条目打不开时"查看内容"升级为主操作）；压缩包浏览页（复用列表组件）内目录下钻、书籍/图片点按进阅读器、目录"作为图集打开"；旧服务器（无 contents API）隐藏入口或给出明确提示。
+- **边界**：加密 / 分卷压缩包维持现状报错；包内非书文件只列表不下载；`include_ext` 不含 zip 等扩展名时书库列表不显示对应压缩包（沿用 `/files` 的显示规则）。
 
 ---
 
@@ -1461,3 +1481,24 @@ cd ..\android && gradlew.bat :app:assembleDebug           :: 构建通过
   （显式关闭时不列出）。
 
 验证：`py_compile` 通过（按项目约定未跑测试套件）。
+
+### v0.7（2026-10-06，压缩包内容浏览）
+
+需求：**支持打开压缩包查看内容**。此前 zip/rar/7z/tar 一律按漫画容器打开、
+只暴露图片条目，纯文档压缩包打开后是 0 页。本次（设计见 7.6）：
+
+- 服务端：容器浏览模式（`formats.comics`：全量条目枚举 + 任意条目读取，安全
+  规则与分页共用）；`GET /books/{id}/contents` 列表、`POST /books/{id}/contents/open`
+  嵌套书注册（`services/archive.py` + `formats/archivebook.py`）；`/meta` 增加
+  `archive` 概览；`/server/info` 增加 `features.archive_browse`；`/asset` 扩展到
+  压缩包容器（图片预览）。配置 `archive.{browse,max_depth,extract_cache_mb}`。
+- 嵌套书 id = `sha1("arc:<父id>:<条目>")[:16]`（确定性），进度/布局缓存复用；
+  注册表 `cache/archives.json`；解压缓存 `cache/extracted` LRU + 父变化即清。
+- 客户端：浏览页压缩包条目"内容"入口（打不开时升级为主操作）；压缩包浏览页
+  （目录下钻 / 嵌套书进阅读器 / 目录作为图集打开）；DTO 与能力位单测。
+- 测试：`server/tests/test_archive_contents.py`（容器浏览 / contents API /
+  asset / 415 与 404 契约）、`server/tests/test_archive_nested_book.py`
+  （嵌套书闭环 / 包中包 / 深度上限 / 重启存活 / 父变化失效）、
+  `android/.../ArchiveDtosTest.kt`。
+
+验证：`py_compile` + `create_app` 导入通过（按项目约定未跑测试套件）。

@@ -17,19 +17,23 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.zqr.localnetviewer.App
 import com.zqr.localnetviewer.data.prefs.AppSettings
+import com.zqr.localnetviewer.ui.browser.ArchiveBrowserScreen
 import com.zqr.localnetviewer.ui.browser.BrowserScreen
 import com.zqr.localnetviewer.ui.connect.ConnectScreen
 import com.zqr.localnetviewer.ui.reader.ReaderScreen
 
-/** 路由表（设计 6.2：连接页 / 浏览页 / 阅读页）。 */
+/** 路由表（设计 6.2：连接页 / 浏览页 / 阅读页 / 压缩包浏览页）。 */
 object Routes {
     const val CONNECT = "connect"
     const val BROWSER = "browser"
     const val READER = "reader/{bookId}"
+    const val ARCHIVE = "archive/{bookId}"
     const val ARG_BOOK_ID = "bookId"
 
     // bookId URL 编码：图集 book_id 可能含 "/" 等路径字符，不编码会被路由拆参
     fun reader(bookId: String): String = "reader/${Uri.encode(bookId)}"
+
+    fun archive(bookId: String): String = "archive/${Uri.encode(bookId)}"
 }
 
 @Composable
@@ -67,15 +71,29 @@ fun AppNavHost() {
         composable(Routes.BROWSER) {
             BrowserScreen(
                 onOpenBook = { bookId -> navController.navigate(Routes.reader(bookId)) },
+                onOpenArchive = { bookId -> navController.navigate(Routes.archive(bookId)) },
                 onDisconnect = {
                     // 断开连接：清空概要与整个返回栈，回到连接页
                     // （不清空的话，重连失败时连接页/浏览页残留旧服务器的摘要）
                     app.updateServerSummary("")
+                    app.updateArchiveBrowse(false)
                     navController.navigate(Routes.CONNECT) {
                         popUpTo(navController.graph.startDestinationId) { inclusive = true }
                         launchSingleTop = true
                     }
                 },
+            )
+        }
+
+        composable(
+            route = Routes.ARCHIVE,
+            arguments = listOf(navArgument(Routes.ARG_BOOK_ID) { type = NavType.StringType }),
+        ) { entry ->
+            val bookId = entry.arguments?.getString(Routes.ARG_BOOK_ID).orEmpty()
+            ArchiveBrowserScreen(
+                bookId = bookId,
+                onOpenBook = { nestedId -> navController.navigate(Routes.reader(nestedId)) },
+                onBack = { navController.popBackStack() },
             )
         }
 

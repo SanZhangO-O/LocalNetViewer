@@ -9,6 +9,9 @@
 - 条目名编码兜底：非 UTF-8 条目按 cp437 解码后启发式尝试 GBK / Shift-JIS；
 - 安全：条目名规范化（防 zip-slip）、单条目与总解压大小上限（防 zip 炸弹）。
 - 条漫 strip：按视口高度切片，锚点 ``(0, 源图索引, 纵向偏移)``。
+- 浏览模式（设计 7.6）：压缩包容器（browsable=True）额外提供全量条目枚举
+  （``browse()``，含非图片条目、目录合成）与任意条目读取（``read_entry()``），
+  供"压缩包内容浏览"使用；安全规则与图片分页完全一致。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ import time
 import zipfile
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -46,8 +50,14 @@ _ZIP_EXTS = {".cbz", ".zip"}
 _RAR_EXTS = {".cbr", ".rar"}
 _SEVEN_EXTS = {".cb7", ".7z"}
 _TAR_EXTS = {".cbt", ".tar"}
+# 可浏览压缩包（设计 7.6）：contents API 只对这些容器开放
+ARCHIVE_EXTS = _ZIP_EXTS | _RAR_EXTS | _SEVEN_EXTS | _TAR_EXTS
 
 logger = logging.getLogger("localnetviewer.formats.comics")
+
+
+def is_archive_name(name: str) -> bool:
+    return ext_of(name) in ARCHIVE_EXTS
 
 
 # ------------------------------------------------------------------ 工具
@@ -228,14 +238,71 @@ def list_folder_images(
 
 
 # ------------------------------------------------------------------ 容器
+@dataclass(frozen=True)
+class ArchiveEntry:
+    """压缩包内条目（浏览模式，设计 7.6）：规范化后的相对路径。"""
+
+    name: str
+    size: int = 0
+    is_dir: bool = False
+
+
+def synthesize_dirs(
+    raw_entries: Sequence[Tuple[str, int, bool]], patterns: Sequence[str]
+) -> List[ArchiveEntry]:
+    """原始条目 (名, 字节, 是否目录) → 规范化 + 跳过规则 + 目录合成 + 自然排序。
+
+    浏览模式与图片分页共用同一套安全规则（``should_skip_entry`` /
+    ``is_unsafe_entry_name``）：隐藏条目、``__MACOSX``、zip-slip 名一律不可见。
+    压缩包不强制含目录条目（``a/b.png`` 可以没有 ``a/`` 记录），父目录按文件
+    条目合成。
+    """
+    dirs: Dict[str, int] = {}
+    files: Dict[str, int] = {}
+    seen: set = set()
+    for name, size, is_dir in raw_entries:
+        raw = str(name).replace("\\", "/")
+        if raw in seen:
+            continue
+        seen.add(raw)
+        norm = posixpath.normpath(raw)
+        if is_unsafe_entry_name(norm) or should_skip_entry(norm, patterns):
+            continue
+        if is_dir:
+            dirs[norm] = 0
+        else:
+            files[norm] = int(size or 0)
+        parts = norm.split("/")[:-1] if not is_dir else norm.split("/")
+        for i in range(1, len(parts) + 1):
+            dirs.setdefault("/".join(parts[:i]), 0)
+    out = [
+        ArchiveEntry(name=n, size=s, is_dir=False)
+        for n, s in files.items()
+        if n not in dirs
+    ]
+    out.extend(
+        ArchiveEntry(name=n, size=0, is_dir=True) for n in dirs if n not in files
+    )
+    out.sort(key=lambda e: natural_key(e.name))
+    return out
+
+
 class ComicContainer(ABC):
     """漫画容器：只暴露"图片条目名列表 + 按名读取"。"""
+
+    # 浏览模式（设计 7.6）只有真正的压缩包容器提供；文件夹/单图容器为 False
+    browsable: bool = False
 
     def __init__(self, env: AdapterEnv) -> None:
         self.env = env
         self.patterns = list(env.config.comic.skip_entries)
         self.max_entry_bytes = int(env.config.limits.max_archive_entry_mb or 0) * 1024 * 1024
         self.max_total_bytes = int(env.config.limits.max_archive_total_mb or 0) * 1024 * 1024
+        # 子类构造时填充：全量原始条目（已解码名），供浏览模式使用
+        self._raw_entries: List[Tuple[str, int, bool]] = []
+        # 规范化名 → 容器内真实名 / 声明尺寸（**全部文件条目**，不做图片过滤）
+        self._raw_map: Dict[str, str] = {}
+        self._raw_sizes: Dict[str, int] = {}
 
     @property
     @abstractmethod
@@ -243,11 +310,83 @@ class ComicContainer(ABC):
         """图片条目名（已自然排序）。"""
 
     @abstractmethod
+    def _read_by_real(self, real: str, key: str) -> bytes:
+        """按容器内真实名读取条目字节（流式限流由各实现负责）。"""
+
+    def _finish_init(self) -> None:
+        """构造收尾：从 _raw_entries 构建图片分页映射（原有语义不变）。"""
+        mapping: Dict[str, str] = {}
+        sizes: Dict[str, int] = {}
+        total = 0
+        for name, size, is_dir in self._raw_entries:
+            if is_dir:
+                continue
+            if should_skip_entry(name, self.patterns) or not is_image_name(name):
+                continue
+            norm = posixpath.normpath(name)
+            if is_unsafe_entry_name(norm):
+                continue
+            if norm in mapping:
+                # 规范化后同名（a/b.png 与 a/./b.png）：保留自然排序较小者并告警，
+                # 静默覆盖会让页数与实际条目数对不上
+                keep, drop = sorted([mapping[norm], name])
+                logger.warning(
+                    "容器内条目规范化后重名: %s 与 %s（保留 %s）",
+                    drop,
+                    name,
+                    keep,
+                )
+                if keep != name:
+                    continue
+            mapping[norm] = name
+            sizes[norm] = int(size or 0)
+            total += sizes[norm]
+        self._guard_total(total)
+        self._map = mapping
+        self._sizes = sizes
+        self._names = _sort_names(list(mapping.keys()))
+        # 浏览映射：全部文件条目（跳过规则在 browse() 里统一应用，这里不做过滤，
+        # 以便 read_entry 可以读取被分页白名单排除的非图片条目）
+        raw_map: Dict[str, str] = {}
+        raw_sizes: Dict[str, int] = {}
+        for name, size, is_dir in self._raw_entries:
+            if is_dir:
+                continue
+            norm = posixpath.normpath(name)
+            if is_unsafe_entry_name(norm) or norm in raw_map:
+                continue
+            raw_map[norm] = name
+            raw_sizes[norm] = int(size or 0)
+        self._raw_map = raw_map
+        self._raw_sizes = raw_sizes
+
+    def browse(self) -> List[ArchiveEntry]:
+        """全量条目（含非图片），目录合成，自然排序（设计 7.6）。"""
+        return synthesize_dirs(self._raw_entries, self.patterns)
+
+    def read_entry(self, name: str) -> bytes:
+        """按规范化名读取**任意**文件条目（浏览模式；不受图片白名单限制）。"""
+        key = posixpath.normpath(name)
+        real = self._raw_map.get(key)
+        if real is None:
+            raise AssetNotFoundError(f"压缩包内不存在条目: {name}")
+        self._guard_entry(key, self._raw_sizes.get(key, 0))
+        return self._read_by_real(real, key)
+
+    def entry_size(self, name: str) -> int:
+        return self._raw_sizes.get(posixpath.normpath(name), 0)
+
     def read(self, name: str) -> bytes:
-        """读取条目字节。"""
+        """读取图片页条目（分页白名单内的名字）。"""
+        key = posixpath.normpath(name)
+        real = self._map.get(key)
+        if real is None:
+            raise AssetNotFoundError(f"压缩包内不存在条目: {name}")
+        self._guard_entry(key, self.size_of(key))
+        return self._read_by_real(real, key)
 
     def size_of(self, name: str) -> int:
-        return len(self.read(name))
+        return self._sizes.get(posixpath.normpath(name), 0)
 
     def close(self) -> None:
         return None
@@ -292,6 +431,8 @@ class ComicContainer(ABC):
 
 
 class ZipComicContainer(ComicContainer):
+    browsable = True
+
     def __init__(self, env: AdapterEnv, path: Path) -> None:
         super().__init__(env)
         # zipfile.ZipFile 的共享句柄并非线程安全（读取会移动共享文件对象）。
@@ -302,55 +443,18 @@ class ZipComicContainer(ComicContainer):
             self._zip = zipfile.ZipFile(path)
         except (OSError, zipfile.BadZipFile) as exc:
             raise ParseError(f"ZIP 容器无法打开: {exc}") from exc
-        mapping: Dict[str, str] = {}
-        sizes: Dict[str, int] = {}
-        total = 0
+        raw: List[Tuple[str, int, bool]] = []
         for info in self._zip.infolist():
-            if info.is_dir():
-                continue
             name = decode_zip_name(info).replace("\\", "/")
-            if should_skip_entry(name, self.patterns):
-                continue
-            if not is_image_name(name):
-                continue
-            # zip-slip / 条目名规范化
-            norm = posixpath.normpath(name)
-            if is_unsafe_entry_name(norm):
-                continue
-            if norm in mapping:
-                # 规范化后同名（a/b.png 与 a/./b.png）：保留自然排序较小者并告警，
-                # 静默覆盖会让页数与实际条目数对不上
-                keep, drop = sorted([mapping[norm], info.filename])
-                logger.warning(
-                    "ZIP 内条目规范化后重名: %s 与 %s（保留 %s）",
-                    drop,
-                    info.filename,
-                    keep,
-                )
-                if keep != info.filename:
-                    continue
-            mapping[norm] = info.filename
-            # 尺寸也按规范化后的键记录，否则 _guard_entry 会因查不到而失效
-            sizes[norm] = int(info.file_size or 0)
-            total += sizes[norm]
-        self._guard_total(total)
-        self._map = mapping
-        self._sizes = sizes
-        self._names = _sort_names(list(mapping.keys()))
+            raw.append((name, int(info.file_size or 0), bool(info.is_dir())))
+        self._raw_entries = raw
+        self._finish_init()
 
     @property
     def names(self) -> List[str]:
         return self._names
 
-    def size_of(self, name: str) -> int:
-        return self._sizes.get(posixpath.normpath(name), 0)
-
-    def read(self, name: str) -> bytes:
-        key = posixpath.normpath(name)
-        real = self._map.get(key)
-        if real is None:
-            raise AssetNotFoundError(f"压缩包内不存在条目: {name}")
-        self._guard_entry(key, self.size_of(key))
+    def _read_by_real(self, real: str, key: str) -> bytes:
         try:
             with self._io_lock:
                 with self._zip.open(real) as fh:
@@ -358,7 +462,7 @@ class ZipComicContainer(ComicContainer):
         except ParseError:
             raise
         except (KeyError, OSError, zipfile.BadZipFile) as exc:
-            raise ParseError(f"条目读取失败 {name}: {exc}") from exc
+            raise ParseError(f"条目读取失败 {key}: {exc}") from exc
 
     def close(self) -> None:
         try:
@@ -381,6 +485,8 @@ def rar_backend_tool(rarfile_module) -> Optional[object]:
 
 
 class RarComicContainer(ComicContainer):
+    browsable = True
+
     def __init__(self, env: AdapterEnv, path: Path) -> None:
         super().__init__(env)
         try:
@@ -397,51 +503,32 @@ class RarComicContainer(ComicContainer):
             self._rf = rarfile.RarFile(str(path))
         except Exception as exc:
             raise ParseError(f"RAR 容器无法打开: {exc}") from exc
-        names: List[str] = []
-        sizes: Dict[str, int] = {}
-        mapping: Dict[str, str] = {}
-        total = 0
+        raw: List[Tuple[str, int, bool]] = []
         for info in self._rf.infolist():
-            if getattr(info, "is_dir", lambda: False)():
-                continue
-            raw = str(info.filename).replace("\\", "/")
-            if should_skip_entry(raw, self.patterns) or not is_image_name(raw):
-                continue
-            norm = posixpath.normpath(raw)
-            if is_unsafe_entry_name(norm):
-                continue
-            names.append(norm)
-            sizes[norm] = int(getattr(info, "file_size", 0) or 0)
-            # RAR 的条目名可能带 "./" 前缀等需要规范化的写法：必须记住
-            # 规范化名 → 容器内真实名，否则列表正常但每一页读取都失败
-            mapping[norm] = str(info.filename)
-            total += sizes[norm]
-        self._guard_total(total)
-        self._names = _sort_names(names)
-        self._sizes = sizes
-        self._map = mapping
+            is_dir = bool(getattr(info, "is_dir", lambda: False)())
+            raw.append(
+                (
+                    str(info.filename).replace("\\", "/"),
+                    int(getattr(info, "file_size", 0) or 0),
+                    is_dir,
+                )
+            )
+        self._raw_entries = raw
+        self._finish_init()
 
     @property
     def names(self) -> List[str]:
         return self._names
 
-    def size_of(self, name: str) -> int:
-        return self._sizes.get(posixpath.normpath(name), 0)
-
-    def read(self, name: str) -> bytes:
-        key = posixpath.normpath(name)
-        self._guard_entry(key, self.size_of(key))
-        raw = self._map.get(key)
-        if raw is None:
-            raise AssetNotFoundError(f"RAR 内不存在条目: {name}")
+    def _read_by_real(self, real: str, key: str) -> bytes:
         try:
-            with self._rf.open(raw) as fh:
+            with self._rf.open(real) as fh:
                 # 与 ZIP/TAR 一致地流式限流：只信包头声明的尺寸会被 zip 炸弹绕过
                 return self._read_stream(fh, key)
         except ParseError:
             raise
         except Exception as exc:
-            raise ParseError(f"RAR 条目读取失败 {name}: {exc}") from exc
+            raise ParseError(f"RAR 条目读取失败 {key}: {exc}") from exc
 
     def close(self) -> None:
         try:
@@ -451,6 +538,8 @@ class RarComicContainer(ComicContainer):
 
 
 class SevenZipComicContainer(ComicContainer):
+    browsable = True
+
     def __init__(self, env: AdapterEnv, path: Path) -> None:
         super().__init__(env)
         try:
@@ -463,57 +552,41 @@ class SevenZipComicContainer(ComicContainer):
             infos = self._arc.list()
         except Exception as exc:
             raise ParseError(f"7z 容器无法打开: {exc}") from exc
-        names: List[str] = []
-        sizes: Dict[str, int] = {}
-        mapping: Dict[str, str] = {}
-        total = 0
+        raw: List[Tuple[str, int, bool]] = []
         for info in infos:
-            if getattr(info, "is_directory", False):
-                continue
-            raw = str(info.filename).replace("\\", "/")
-            if should_skip_entry(raw, self.patterns) or not is_image_name(raw):
-                continue
-            norm = posixpath.normpath(raw)
-            if is_unsafe_entry_name(norm):
-                continue
-            names.append(norm)
-            sizes[norm] = int(getattr(info, "uncompressed", 0) or 0)
-            mapping[norm] = raw
-            total += sizes[norm]
-        self._guard_total(total)
-        self._names = _sort_names(names)
-        self._sizes = sizes
-        self._map = mapping
+            raw.append(
+                (
+                    str(info.filename).replace("\\", "/"),
+                    int(getattr(info, "uncompressed", 0) or 0),
+                    bool(getattr(info, "is_directory", False)),
+                )
+            )
+        self._raw_entries = raw
+        self._finish_init()
         self._lock = threading.Lock()
 
     @property
     def names(self) -> List[str]:
         return self._names
 
-    def size_of(self, name: str) -> int:
-        return self._sizes.get(posixpath.normpath(name), 0)
-
-    def read(self, name: str) -> bytes:
-        key = posixpath.normpath(name)
-        self._guard_entry(key, self.size_of(key))
-        raw = self._map.get(key, key)
+    def _read_by_real(self, real: str, key: str) -> bytes:
         with self._lock:
             try:
                 self._arc.reset()
             except Exception:
                 pass
             try:
-                result = self._arc.read(targets=[raw])
+                result = self._arc.read(targets=[real])
             except Exception as exc:
-                raise ParseError(f"7z 条目读取失败 {name}: {exc}") from exc
-        data = result.get(raw) if isinstance(result, dict) else None
+                raise ParseError(f"7z 条目读取失败 {key}: {exc}") from exc
+        data = result.get(real) if isinstance(result, dict) else None
         if data is None:
             for k, v in (result or {}).items():
                 if posixpath.normpath(str(k)) == key:
                     data = v
                     break
         if data is None:
-            raise AssetNotFoundError(f"7z 内不存在条目: {name}")
+            raise AssetNotFoundError(f"7z 内不存在条目: {key}")
         payload = data.read() if hasattr(data, "read") else bytes(data)
         # 7z 无法按条目流式限流，只能读后校验（声明尺寸已在 _guard_entry 校验过一次）
         return self._check_size(key, payload)
@@ -526,51 +599,37 @@ class SevenZipComicContainer(ComicContainer):
 
 
 class TarComicContainer(ComicContainer):
+    browsable = True
+
     def __init__(self, env: AdapterEnv, path: Path) -> None:
         super().__init__(env)
         try:
             self._tar = tarfile.open(str(path), "r:*")
         except Exception as exc:
             raise ParseError(f"TAR 容器无法打开: {exc}") from exc
-        names: List[str] = []
-        sizes: Dict[str, int] = {}
-        mapping: Dict[str, str] = {}
-        total = 0
+        raw: List[Tuple[str, int, bool]] = []
         for member in self._tar.getmembers():
-            if not member.isfile():
-                continue
-            raw = str(member.name).replace("\\", "/")
-            if should_skip_entry(raw, self.patterns) or not is_image_name(raw):
-                continue
-            norm = posixpath.normpath(raw)
-            if is_unsafe_entry_name(norm):
-                continue
-            names.append(norm)
-            sizes[norm] = int(member.size or 0)
-            mapping[norm] = raw
-            total += sizes[norm]
-        self._guard_total(total)
-        self._names = _sort_names(names)
-        self._sizes = sizes
-        self._map = mapping
+            raw.append(
+                (
+                    str(member.name).replace("\\", "/"),
+                    int(member.size or 0),
+                    not member.isfile(),
+                )
+            )
+        self._raw_entries = raw
+        self._finish_init()
 
     @property
     def names(self) -> List[str]:
         return self._names
 
-    def size_of(self, name: str) -> int:
-        return self._sizes.get(posixpath.normpath(name), 0)
-
-    def read(self, name: str) -> bytes:
-        key = posixpath.normpath(name)
-        self._guard_entry(key, self.size_of(key))
-        raw = self._map.get(key, key)
+    def _read_by_real(self, real: str, key: str) -> bytes:
         try:
-            fh = self._tar.extractfile(raw)
+            fh = self._tar.extractfile(real)
         except KeyError:
             fh = None
         if fh is None:
-            raise AssetNotFoundError(f"TAR 内不存在条目: {name}")
+            raise AssetNotFoundError(f"TAR 内不存在条目: {key}")
         with fh:
             return self._read_stream(fh, key)
 
@@ -639,6 +698,10 @@ class FolderComicContainer(ComicContainer):
             return target.read_bytes()
         except OSError as exc:
             raise ParseError(f"图片读取失败 {name}: {exc}") from exc
+
+    def _read_by_real(self, real: str, key: str) -> bytes:
+        # 文件夹容器没有"真实名"映射（read 自己做穿越校验），直接复用 read
+        return self.read(key)
 
 
 def open_container(env: AdapterEnv, path: Path, *, recursive: bool = False) -> ComicContainer:
@@ -726,6 +789,23 @@ class ComicAdapter(FixedAdapter):
         mime = self._mime_cache.get(name) or imaging.sniff_mime(data, ext_of(name))
         self._mime_cache[name] = mime
         return data, mime
+
+    # ------------------------------------------------------------ 浏览模式（设计 7.6）
+    def archive_info(self) -> Optional[Dict[str, int]]:
+        """压缩包内容概览：条目数 / 图片数；非压缩包容器（文件夹/单图）返回 None。"""
+        if not getattr(self._container, "browsable", False):
+            return None
+        entries = self._container.browse()
+        files = [e for e in entries if not e.is_dir]
+        return {
+            "entry_count": len(files),
+            "image_count": sum(1 for e in files if is_image_name(e.name)),
+        }
+
+    def asset(self, path: str) -> Tuple[bytes, str]:
+        """压缩包内任意条目的原始字节（图片预览用；上限校验在 read_entry 内）。"""
+        data = self._container.read_entry(path)
+        return data, imaging.sniff_mime(data, ext_of(path))
 
     def page_native_size(self, page: int) -> Tuple[int, int]:
         name = self._entry(page)

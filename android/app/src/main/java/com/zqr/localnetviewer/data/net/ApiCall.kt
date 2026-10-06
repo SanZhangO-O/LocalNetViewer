@@ -30,6 +30,11 @@ class ApiException(
 
     val isUnauthorized: Boolean get() = code == CODE_UNAUTHORIZED
 
+    /** 各类 404 语义（书 / 资源 / 条目 / 路径不存在），用于把报错转成可操作提示。 */
+    val isNotFound: Boolean
+        get() = httpStatus == 404 ||
+            code in setOf(CODE_NOT_FOUND, CODE_BOOK_NOT_FOUND, CODE_ASSET_NOT_FOUND)
+
     companion object {
         const val CODE_NETWORK = "NETWORK"
         const val CODE_TIMEOUT = "TIMEOUT"
@@ -37,6 +42,7 @@ class ApiException(
         const val CODE_LAYOUT_NOT_FOUND = "LAYOUT_NOT_FOUND"
         const val CODE_PAGE_OUT_OF_RANGE = "PAGE_OUT_OF_RANGE"
         const val CODE_BOOK_NOT_FOUND = "BOOK_NOT_FOUND"
+        const val CODE_ASSET_NOT_FOUND = "ASSET_NOT_FOUND"
         /** 错误体缺失/不可解析时的 404 兜底码：不能臆断为 BOOK_NOT_FOUND（会掩盖 layout 失效恢复）。 */
         const val CODE_NOT_FOUND = "NOT_FOUND"
         const val CODE_PARSE_FAILED = "PARSE_FAILED"

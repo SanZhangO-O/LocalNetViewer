@@ -80,6 +80,8 @@ class FeaturesInfo(BaseModel):
     fits: List[str] = Field(default_factory=lambda: ["viewport", "original"])
     strip: bool = True
     progress_sync: bool = True
+    # 压缩包内容浏览（设计 7.6）：客户端据此显示"查看内容"入口
+    archive_browse: bool = False
     # 高/宽 超过该值的长图可启用条漫 strip 模式（客户端据此提示）
     strip_min_aspect: float = 1.5
 
@@ -126,6 +128,55 @@ class FilesResponse(BaseModel):
     libraries: Optional[List[LibraryInfo]] = None
 
 
+# ------------------------------------------------------------- 压缩包内容
+class ArchiveSummary(BaseModel):
+    """压缩包内容概览（设计 7.6）。"""
+
+    entry_count: int = 0
+    image_count: int = 0
+    depth: int = 0
+    max_depth: int = 2
+
+
+class ArchiveEntryItem(BaseModel):
+    name: str
+    type: Literal["dir", "book", "file", "image"]
+    path: str
+    format: Optional[str] = None
+    size: Optional[int] = None
+    gallery: Optional[GalleryInfo] = None
+    preview_url: Optional[str] = None
+    openable: bool = True
+    reason: Optional[str] = None
+
+
+class ArchiveContentsResponse(BaseModel):
+    book_id: str
+    revision: str = ""
+    entry: str = ""
+    parent: Optional[str] = None
+    archive: ArchiveSummary = Field(default_factory=ArchiveSummary)
+    entries: List[ArchiveEntryItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 500
+    offset: int = 0
+
+
+class OpenArchiveRequest(BaseModel):
+    entry: str
+
+
+class OpenArchiveResponse(BaseModel):
+    book_id: str
+    title: str
+    format: str
+    kind: str = "book"
+    mode: Optional[Mode] = None
+    page_count: Optional[int] = None
+    cover_url: Optional[str] = None
+    depth: int = 1
+
+
 # --------------------------------------------------------------------- 元数据
 class ChapterInfo(BaseModel):
     index: int
@@ -157,6 +208,8 @@ class BookMetaResponse(BaseModel):
     render_support: RenderSupport = Field(default_factory=RenderSupport)
     chapters: List[ChapterInfo] = Field(default_factory=list)
     source: Optional[str] = None
+    # 压缩包书籍才有：内容概览（设计 7.6）
+    archive: Optional[ArchiveSummary] = None
 
 
 # ----------------------------------------------------------------- 排版参数

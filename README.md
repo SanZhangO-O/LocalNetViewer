@@ -85,6 +85,7 @@ gradlew.bat assembleDebug
 | EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，等比完整显示、尽量铺满屏幕 |
 | PDF | pypdfium2 直渲（固定版式） |
 | CBZ/CBR/CB7/CBT、图片文件夹 | 图片即页，自然排序；CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr` |
+| 压缩包内容浏览（zip/rar/7z/tar） | 压缩包可当虚拟目录浏览：包内的书（txt/epub/pdf/fb2/mobi）、图片、目录（作为图集）、嵌套压缩包都能打开；进度独立保存（v0.7，见 DESIGN.md 7.6） |
 | 单张图片文件（jpg/png/webp/gif/bmp/avif/tif 等） | 目录列表直接列出（`gallery.show_image_files`），点按即作为"单页图集"打开 |
 | FB2 | XML → 块模型 |
 | MOBI/AZW3 | 检测到 Calibre `ebook-convert` 时转换缓存为 EPUB（可选）；漫画型（图片为主）自动按固定版式漫画打开，适应屏幕 |
@@ -92,7 +93,7 @@ gradlew.bat assembleDebug
 ## 测试与验证
 
 服务器已带 pytest 测试套件（锚点往返、编码检测、zip-slip / 路径穿越、缓存失效、容器名称映射、
-中文字体探测、并发工具、HTTP 契约与端到端 API）。
+中文字体探测、并发工具、压缩包内容浏览与包内嵌套书、HTTP 契约与端到端 API）。
 客户端已通过 Gradle 构建与单元测试验证：
 
 ```bat

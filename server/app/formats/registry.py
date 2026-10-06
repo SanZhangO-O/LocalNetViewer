@@ -172,6 +172,13 @@ def adapter_class_for(ref: BookRef) -> Type[BookAdapter]:
 
 def create_adapter(env: AdapterEnv, ref: BookRef, *, recursive: bool = False) -> BookAdapter:
     """创建适配器；统一做大小上限与后端可用性校验。"""
+    # 压缩包内嵌套书（设计 7.6）：extra 携带解析好的链信息，由 archivebook
+    # 解压/过滤后委托回常规适配器链。放在最前面：嵌套 ref 是虚拟的，
+    # max_book_mb 与 format_for_ref 的目录判定都不适用于它。
+    if (ref.extra or {}).get("archive_entry"):
+        from .archivebook import create_archive_adapter  # noqa: PLC0415 - 延迟导入避免循环
+
+        return create_archive_adapter(env, ref)
     max_mb = int(env.config.limits.max_book_mb or 0)
     if max_mb and not ref.virtual and ref.size > max_mb * 1024 * 1024:
         raise ParseError(

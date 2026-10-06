@@ -7,9 +7,14 @@ import asyncio
 from fastapi import APIRouter, Depends, Header, Query, Response
 
 from ..models.schemas import (
+    ArchiveContentsResponse,
+    ArchiveEntryItem,
+    ArchiveSummary,
     BookMetaResponse,
     ChapterInfo,
     ErrorCode,
+    OpenArchiveRequest,
+    OpenArchiveResponse,
     OpenFolderRequest,
     OpenFolderResponse,
     RenderSupport,
@@ -36,6 +41,9 @@ async def book_meta(
     ref = await ctx.require_book_async(book_id, scope)
     async with ctx.open_adapter_async(ref) as adapter:
         meta = await asyncio.to_thread(adapter.meta)
+        # 压缩包内容概览（设计 7.6）：只有可浏览压缩包容器才有；列条目是轻量
+        # 活（与翻页打开容器同级别），meta 每次打开只调用一次
+        archive_info = await asyncio.to_thread(_archive_info_of, adapter)
     chapters = [
         ChapterInfo(
             index=int(ch.get("index", i)),
@@ -45,6 +53,14 @@ async def book_meta(
         )
         for i, ch in enumerate(meta.chapters or [])
     ]
+    archive = None
+    if archive_info is not None:
+        archive = ArchiveSummary(
+            entry_count=int(archive_info.get("entry_count", 0)),
+            image_count=int(archive_info.get("image_count", 0)),
+            depth=int((ref.extra or {}).get("depth", 0) or 0),
+            max_depth=int(ctx.config.archive.max_depth),
+        )
     return BookMetaResponse(
         book_id=ref.book_id,
         revision=ref.revision,
@@ -59,7 +75,18 @@ async def book_meta(
         render_support=RenderSupport(png=True, json=bool(meta.supports_json)),
         chapters=chapters,
         source=ref.vpath,
+        archive=archive,
     )
+
+
+def _archive_info_of(adapter) -> dict | None:
+    getter = getattr(adapter, "archive_info", None)
+    if getter is None:
+        return None
+    try:
+        return getter()
+    except Exception:  # noqa: BLE001 - 概览失败不影响 meta 本身
+        return None
 
 
 @router.get("/books/{book_id}/cover")
@@ -170,3 +197,61 @@ async def open_folder(
         cover_url=str(info.get("cover_url") or f"/api/v1/books/{info['book_id']}/cover"),
         mode="fixed",
     )
+
+
+# ------------------------------------------------------------- 压缩包内容（设计 7.6）
+@router.get("/books/{book_id}/contents", response_model=ArchiveContentsResponse)
+async def book_contents(
+    book_id: str,
+    entry: str = Query(default="", description="包内目录（空 = 根）"),
+    limit: int = Query(default=500, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
+    scope: AccessScope = ScopeDep,
+    ctx=Depends(get_ctx),
+) -> ArchiveContentsResponse:
+    """压缩包内部目录列表：把压缩包当虚拟目录浏览（设计 7.6）。
+
+    可见性与 /books/{id}/* 一致：书不存在或不在当前凭据可见书库内都是 404。
+    """
+    ref = await ctx.require_book_async(book_id, scope)
+    data = await asyncio.to_thread(ctx.archives.list_contents, ref, entry, limit, offset)
+    return ArchiveContentsResponse(
+        book_id=str(data["book_id"]),
+        revision=str(data.get("revision") or ""),
+        entry=str(data.get("entry") or ""),
+        parent=data.get("parent"),
+        archive=ArchiveSummary(**(data.get("archive") or {})),
+        entries=[
+            ArchiveEntryItem(
+                name=str(item["name"]),
+                type=item["type"],  # type: ignore[arg-type]
+                path=str(item["path"]),
+                format=item.get("format"),
+                size=item.get("size"),
+                gallery=item.get("gallery"),
+                preview_url=item.get("preview_url"),
+                openable=bool(item.get("openable", True)),
+                reason=item.get("reason"),
+            )
+            for item in data.get("entries", [])
+        ],
+        total=int(data.get("total", 0)),
+        limit=int(data.get("limit", limit)),
+        offset=int(data.get("offset", offset)),
+    )
+
+
+@router.post("/books/{book_id}/contents/open", response_model=OpenArchiveResponse)
+async def open_archive_entry(
+    book_id: str,
+    req: OpenArchiveRequest,
+    scope: AccessScope = ScopeDep,
+    ctx=Depends(get_ctx),
+) -> OpenArchiveResponse:
+    """包内条目 → 嵌套书（设计 7.6）；幂等，重复调用返回同一 book_id。
+
+    之后的 /meta、/layout、/pages、进度与普通书完全一致。
+    """
+    ref = await ctx.require_book_async(book_id, scope)
+    info = await asyncio.to_thread(ctx.archives.open_nested, ref, req.entry)
+    return OpenArchiveResponse(**info)

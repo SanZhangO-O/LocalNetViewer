@@ -1,12 +1,15 @@
 package com.zqr.localnetviewer.data.net
 
 import com.zqr.localnetviewer.data.net.dto.BookMetaDto
+import com.zqr.localnetviewer.data.net.dto.ArchiveContentsResponseDto
 import com.zqr.localnetviewer.data.net.dto.FileEntryDto
 import com.zqr.localnetviewer.data.net.dto.FilesResponseDto
 import com.zqr.localnetviewer.data.net.dto.FontsResponseDto
 import com.zqr.localnetviewer.data.net.dto.LayoutProfileDto
 import com.zqr.localnetviewer.data.net.dto.LayoutResponseDto
 import com.zqr.localnetviewer.data.net.dto.LocateResponseDto
+import com.zqr.localnetviewer.data.net.dto.OpenArchiveRequestDto
+import com.zqr.localnetviewer.data.net.dto.OpenArchiveResponseDto
 import com.zqr.localnetviewer.data.net.dto.OpenFolderRequestDto
 import com.zqr.localnetviewer.data.net.dto.OpenFolderResponseDto
 import com.zqr.localnetviewer.data.net.dto.PageMetaDto
@@ -70,6 +73,22 @@ interface ApiService {
 
     @POST("api/v1/books/open-folder")
     suspend fun openFolder(@Body body: OpenFolderRequestDto): OpenFolderResponseDto
+
+    /** 压缩包内部目录列表（设计 7.6）。 */
+    @GET("api/v1/books/{bookId}/contents")
+    suspend fun bookContents(
+        @Path("bookId") bookId: String,
+        @Query("entry") entry: String = "",
+        @Query("limit") limit: Int = 200,
+        @Query("offset") offset: Int = 0,
+    ): ArchiveContentsResponseDto
+
+    /** 包内条目 → 嵌套书（幂等）。 */
+    @POST("api/v1/books/{bookId}/contents/open")
+    suspend fun openArchiveEntry(
+        @Path("bookId") bookId: String,
+        @Body body: OpenArchiveRequestDto,
+    ): OpenArchiveResponseDto
 
     @GET("api/v1/render/fonts")
     suspend fun fonts(): FontsResponseDto
