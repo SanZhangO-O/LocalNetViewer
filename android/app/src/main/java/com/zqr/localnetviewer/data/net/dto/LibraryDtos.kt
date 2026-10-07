@@ -26,7 +26,7 @@ data class GalleryInfoDto(
 @Serializable
 data class FileEntryDto(
     val name: String,
-    /** dir | book | file | image */
+    /** dir | book | file | image | media */
     val type: String = "file",
     val path: String = "",
     val format: String? = null,
@@ -37,10 +37,18 @@ data class FileEntryDto(
     val gallery: GalleryInfoDto? = null,
     val openable: Boolean = true,
     val reason: String? = null,
+    /** 该书籍支持压缩包内容浏览（M5；旧服务器缺省 false）。 */
+    @SerialName("has_contents") val hasContents: Boolean = false,
+    /** 媒体条目类型：audio | video（type=media 时存在）。 */
+    @SerialName("media_kind") val mediaKind: String? = null,
+    /** 媒体流地址（支持 Range，视频播放器用）。 */
+    @SerialName("stream_url") val streamUrl: String? = null,
 ) {
     val isDir: Boolean get() = type == "dir"
     val isBook: Boolean get() = type == "book"
     val isImageFile: Boolean get() = type == "image"
+    val isMedia: Boolean get() = type == "media"
+    val isAudio: Boolean get() = mediaKind == "audio"
 }
 
 /** 书籍元数据 `GET /api/v1/books/{id}/meta`。 */

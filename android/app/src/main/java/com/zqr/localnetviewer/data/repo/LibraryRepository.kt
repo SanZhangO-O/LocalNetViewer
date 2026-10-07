@@ -48,6 +48,12 @@ class LibraryRepository(private val client: ApiClient) {
         return client.absoluteUrl(provided)
     }
 
+    /** 音频/视频流地址（服务端下发的 stream_url，支持 Range，M5）。 */
+    fun mediaUrl(entry: FileEntryDto): String? {
+        val provided = entry.streamUrl?.takeIf { it.isNotBlank() } ?: return null
+        return client.absoluteUrl(provided)
+    }
+
     fun coverUrl(bookId: String, width: Int = 240): String =
         client.absoluteUrl(ApiPaths.cover(bookId, width))
 

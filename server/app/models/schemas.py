@@ -82,6 +82,8 @@ class FeaturesInfo(BaseModel):
     progress_sync: bool = True
     # 压缩包内容浏览（设计 7.6）：客户端据此显示"查看内容"入口
     archive_browse: bool = False
+    # 音视频媒体流（M5）
+    media: bool = True
     # 高/宽 超过该值的长图可启用条漫 strip 模式（客户端据此提示）
     strip_min_aspect: float = 1.5
 
@@ -96,6 +98,23 @@ class ServerInfoResponse(BaseModel):
     server_time: str
 
 
+# --------------------------------------------------------------- 格式能力（M5）
+class FormatInfo(BaseModel):
+    """单个格式的能力描述（``GET /server/formats``）。"""
+
+    id: str
+    label: str = ""
+    kind: str = "doc"
+    exts: List[str] = Field(default_factory=list)
+    mode: str = ""
+    openable: bool = True
+    reason: Optional[str] = None
+
+
+class FormatsResponse(BaseModel):
+    formats: List[FormatInfo] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------- 目录
 class GalleryInfo(BaseModel):
     image_count: int = 0
@@ -104,7 +123,7 @@ class GalleryInfo(BaseModel):
 
 class FileEntry(BaseModel):
     name: str
-    type: Literal["dir", "book", "file", "image"]
+    type: Literal["dir", "book", "file", "image", "media"]
     path: str
     format: Optional[str] = None
     book_id: Optional[str] = None
@@ -114,6 +133,12 @@ class FileEntry(BaseModel):
     gallery: Optional[GalleryInfo] = None
     openable: bool = True
     reason: Optional[str] = None
+    # 该书籍支持压缩包内容浏览（M5：服务端判定，客户端不再硬编码格式清单）
+    has_contents: bool = False
+    # 媒体条目（音频/视频）：media_kind ∈ audio | video；stream_url 支持 Range
+    media_kind: Optional[Literal["audio", "video"]] = None
+    stream_url: Optional[str] = None
+    mime: Optional[str] = None
 
 
 class FilesResponse(BaseModel):

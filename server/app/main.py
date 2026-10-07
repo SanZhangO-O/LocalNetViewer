@@ -22,6 +22,7 @@ from . import __version__
 from .api import (
     routes_books,
     routes_files,
+    routes_media,
     routes_progress,
     routes_read,
     routes_server,
@@ -142,6 +143,7 @@ def create_app(
     api.include_router(routes_files.router)
     api.include_router(routes_books.router)
     api.include_router(routes_read.router)
+    api.include_router(routes_media.router)
     api.include_router(routes_progress.router)
     app.include_router(api)
 

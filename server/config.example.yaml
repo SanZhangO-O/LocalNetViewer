@@ -21,7 +21,10 @@ library:
     # - name: 漫画
     #   path: E:\Comics
     #   password: "some-password"
-  include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
+  # 列表显示哪些扩展名：不写 = 内置默认（M5 起覆盖几乎所有可读格式：电子书/
+  # 漫画/Office/HTML/Markdown/源码/字幕/图片/音视频等，见 app/formats/specs.py）。
+  # 需要收窄时显式列出，例如：
+  # include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序（当前仅支持 natural）
   # 扫描模式：
@@ -37,6 +40,15 @@ library:
   # 例：
   # encoding_overrides:
   #   /我的书库/老书/某本.txt: gb18030
+  # 未知扩展名内容嗅探（M5）：读文件头，把无扩展名/错扩展名的文本、图片、
+  # 文档容器也作为可读条目列出；关掉后只显示已知扩展名
+  sniff_unknown: true
+  # 扩展名 → 格式 id 覆盖（M5）：给私有/错扩展名文件手动指定解析器。
+  # 格式 id 见 GET /api/v1/server/formats（或 app/formats/specs.py）
+  ext_overrides: {}
+  # 例：
+  # ext_overrides:
+  #   .mybook: epub
 
 gallery:
   folder_as_book: true      # 图片文件夹可"作为图集"打开（浏览页提供入口）

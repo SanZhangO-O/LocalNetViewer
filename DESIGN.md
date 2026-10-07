@@ -936,6 +936,56 @@ android/app/src/main/java/com/zqr/localnetviewer/
 
 ---
 
+### 7.7 格式大扩展（v0.8 / M5）
+
+目标：把"支持更多文件类型"做成**可长期扩展**的机制，而不是继续在扩展名表上打补丁。
+
+- **单一事实源**：`formats/specs.py` 声明全部格式（id / label / kind / exts /
+  adapter / mode / backend / default_list）；`registry`、`config.DEFAULT_INCLUDE_EXT`、
+  `/server/formats`、README 表格均由此派生。新增格式 = 一条声明 + 一个适配器。
+- **能力接口**：`GET /api/v1/server/formats` 返回每个格式的扩展名、预览模式与
+  `openable`/`reason`（后端探测结果），客户端/脚本可据此做图标、置灰与排障。
+- **内容嗅探兜底**（`formats/detect.py`）：扩展名未识别时读文件头——
+  `%PDF` / `PK`（进一步读 zip 中央目录区分 epub/docx/xlsx/pptx/odt）/ `Rar!` /
+  `7z` / gzip+tar / 图片魔数（含 HEIC/JXL/PSD/RAW）→ 对应适配器；否则按
+  "可解码 + 可打印率"判纯文本。列表只对**当前页**的未知条目嗅探（成本与页大小
+  成正比）；`library.sniff_unknown=false` 可关闭。压缩包容器另有一层魔数兜底
+  （错扩展名的 zip/rar/7z/tar 仍能打开、能浏览内容）。
+- **扩展名覆盖**：`library.ext_overrides`（如 `{".mybook": "epub"}`）把私有/
+  错扩展名文件指到已有解析器；该扩展名不受 `include_ext` 限制、必定列出。
+- **新增格式与实现路径**：
+  - 文本家族：HTML（内置 HTML→块转换器，`formats/htmlbook.py`，被 Markdown/
+    DOCX/ODT 复用）、Markdown（markdown-it-py 可选，内置轻量转换器兜底）、
+    RTF（striprtf 可选，内置解析兜底）、源码/结构化文本（保留缩进的
+    `CodeAdapter`）、字幕/NFO；
+  - Office：DOCX / ODT / PPTX / XLSX 用 zip+XML **内置解析**（零硬依赖，
+    `formats/officebook.py`）；DOC/WPS/XLS/PPT 经 LibreOffice headless 转
+    对应格式后复用（探测缺失 → 置灰；产物缓存 `cache/converted/lo/`）；
+  - Calibre 族群：CHM/LIT/PDB/PRC/RB/SNB/TCR/LRF/AZW4/TXTZ/HTMLZ 复用
+    MOBI 的 `ebook-convert` 转换链；
+  - 固定版式：多页 TIFF（一帧一页，`formats/multipage.py`）、DjVu
+    （`ddjvu`/`djvused`，逐页 JPEG 缓存）、字体字样预览（PIL 渲染单页）；
+  - 容器：tar 家族含复合扩展名（`.tgz/.tar.gz/.tar.bz2/.tar.xz`，`ext_key_of`）、
+    `.fbz`/`.fb2.zip`（解包内 fb2）、CAB/LHA（bsdtar/libarchive）、
+    ISO（pycdlib）；`.cbz3` 修复为 zip 容器；ACE 不列入（libarchive 不支持，
+    有处理工具的用户用 `ext_overrides` 指到 `external` 自行处理）；
+  - 图像：基础清单扩到 TGA/PCX/ICO/DDS/PNM；HEIC/JXL（Pillow 插件）、
+    SVG（svglib/reportlab 或 cairosvg）、PSD（psd-tools）、RAW（rawpy）
+    为可选后端，`imaging.supported_image_exts()` 只放出**当前可解码**的扩展名，
+    避免列表出现打不开的条目；
+  - 媒体：音频/视频（`kind=audio|video`）不进入书库索引，列表以 `type=media`
+    下发 `media_kind`/`mime`/`stream_url`；`GET /api/v1/media?path=` 按块流式
+    + Range（206/416）+ ETag/304，客户端内嵌播放器（VideoView，不引入 Media3）。
+- **客户端**：格式判断不再硬编码——`FileEntry.has_contents` 由服务端下发
+  （旧服务器缺省 false 时退回本地清单）；`type=media` 直接进媒体播放页；
+  其余按 `mode`（flow/fixed/strip）沿用既有泛化渲染，新增格式零客户端改动。
+- **配置**：`library.sniff_unknown`、`library.ext_overrides`；
+  `.e2e` 之外的可选安装：`pip install -e ".[text,images,iso]"`。
+- **已知边界**：DRM 保护的电子书不支持；包内条目不参与内容嗅探（浏览器把未知
+  条目列为 file，避免为嗅探解压大条目）；HEIC 等后端缺失时对应扩展名不列出。
+
+---
+
 ## 8. 性能设计
 
 ### 8.1 目标指标
@@ -1503,3 +1553,50 @@ cd ..\android && gradlew.bat :app:assembleDebug           :: 构建通过
   `android/.../ArchiveDtosTest.kt`。
 
 验证：`py_compile` + `create_app` 导入通过（按项目约定未跑测试套件）。
+
+### v0.8（2026-10-07，格式大扩展 M5；设计见 7.7）
+
+需求：**支持更多类型的文件，越多越好**。此前格式分发是 6 组硬编码扩展名表，
+扩展一处要同步 registry/config/客户端 7~9 个位置。本次：
+
+- 服务端：
+  - `formats/specs.py`（30+ 格式 / 200 扩展名）为单一事实源，registry 重写为
+    表驱动分发；`GET /server/formats` 新增能力清单（含 openable/reason）；
+  - `formats/detect.py` 内容嗅探兜底 + 容器魔数兜底 + `library.ext_overrides`
+    扩展名覆盖；列表对未知条目按页嗅探（文本/图片/文档容器自动可读）；
+  - 新适配器：HTML、Markdown、RTF、源码、DOCX/ODT/PPTX/XLSX（内置 zip+XML）、
+    旧版 Office（LibreOffice）、多页 TIFF、DjVu、字体、ISO（pycdlib）、
+    CAB/LHA（bsdtar）；Calibre 族群扩到 CHM/LIT/PDB/PRC/RB/SNB/TCR/LRF/AZW4/
+    TXTZ/HTMLZ；tar 复合扩展名与 `.fbz`、`.cbz3` 修复；
+  - 图像：TGA/PCX/ICO/DDS/PNM 入基础清单；HEIC/JXL/SVG/PSD/RAW 走可选插件，
+    `imaging.supported_image_exts()` 动态过滤；
+  - 媒体：`/api/v1/media` Range 流式 + 列表 `type=media`；
+  - `code` 类保留缩进（`CodeAdapter`）；`.tif/.tiff` 从单图改为多页适配器。
+- 客户端：`FileEntry` 新增 `has_contents`/`media_kind`/`stream_url`/`mime`；
+  压缩包入口改用服务端 `has_contents`（旧服务器回退本地清单）；新增媒体播放页
+  （VideoView）与 `media` 路由；列表新增媒体分类与图标。
+- 配置：`library.sniff_unknown`、`library.ext_overrides`；
+  pyproject 新增可选 extras `text`/`images`/`iso`；版本 0.8.0。
+- 测试适配：`test_api.test_files_list_single_images_by_default` 的"非电子书"
+  夹具从 `readme.md` 换成二进制 `archive.dat`（Markdown 与未知文本现在可读，
+  原断言编码的是旧格式集合）。
+- **对抗性 review 修复（同日）**：①嗅探图片绕开 `show_image_files=false` 且
+  `total` 与实际条目不一致 → 第一阶段完成嗅探分类（detect 带缓存），
+  未知二进制不再计数；②`.fb2.zip`/`.tar.gz` 等复合扩展名被 `ext_of` 门禁误杀
+  → 所有 include_ext/override 比较改用 `ext_key_of`；③容器/文件夹内 TIFF 页
+  丢失 → 新增 `imaging.page_image_exts()` 页白名单（单图清单不变）；
+  ④嵌套书 `resolve` 仍按 `is_archive_name` 门禁 → 改用注册表
+  `is_browsable_format`，与 `/contents` 同源；⑤RTF 兜底解析 O(n²) 且后处理
+  正则吞字面反斜杠 → `match(src, pos)` + 删除后处理；⑥Office 条目解压加
+  per-entry/声明尺寸双限流 + XML 解析禁外部实体；`detect._detect_gz` 只读
+  首个成员头、`mimetype` 只读 64 字节；⑦`converted/lo` 与 `converted/djvu`
+  纳入 LRU sweep 与内容变化失效；⑧LibreOffice 每次转换独立 profile、去掉
+  全局串行锁；⑨HTML→块转换器统一到 `formats/htmlblocks.py`（EPUB 委托同一
+  实现）、章节切分共用 `split_chapters_by_headings`；⑩清理死代码（旧常量/
+  不可达映射/未用函数），图片基础清单以 specs 为唯一事实源。回归用例见
+  `tests/test_format_registry.py`、`tests/test_m5_formats.py`。
+
+验证：服务端 `compileall` + `create_app` 导入、16 例新格式适配器冒烟
+（md/html/rtf/code/csv/tiff/docx/odt/pptx/xlsx/fbz/tgz/ttf/无扩展名/错扩展名 zip）、
+书库分类与嗅探全链路、HTTP 契约（meta/layout/pages/contents/media Range）、
+Android `:app:compileDebugKotlin` 全部通过（按项目约定未跑测试套件）。

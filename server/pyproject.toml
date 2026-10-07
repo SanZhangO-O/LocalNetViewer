@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localnetviewer-server"
-version = "0.7.0"
+version = "0.8.0"
 description = "LocalNetViewer 局域网电子书阅读服务器（FastAPI + Pillow）"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +32,24 @@ dependencies = [
 sync = ["psutil>=5.9"]
 # 书库目录变化监听（P4 可选）
 watch = ["watchfiles>=0.21"]
+# 文本增强（可选；缺失时用内置轻量转换器，功能不受影响）
+text = ["markdown-it-py>=3.0", "striprtf>=0.0.26"]
+# 图像格式增强（可选；缺失时对应扩展名不出现/置灰）：
+#   pillow-heif  → .heic/.heif
+#   pillow-jxl-plugin → .jxl
+#   svglib + reportlab → .svg
+#   psd-tools → .psd
+#   rawpy → .cr2/.nef/.arw/.dng/.orf/.raf/.rw2 等 RAW
+images = [
+    "pillow-heif>=0.16",
+    "pillow-jxl-plugin>=1.0",
+    "svglib>=1.5",
+    "reportlab>=4.0",
+    "psd-tools>=1.9",
+    "rawpy>=0.19",
+]
+# ISO 光盘镜像浏览（可选）
+iso = ["pycdlib>=1.14"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27", "fontTools>=4.47"]
 
 [tool.setuptools]

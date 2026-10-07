@@ -490,8 +490,10 @@ def test_open_folder_single_image(api, tmp_books: Path):
 def test_files_list_single_images_by_default(api, tmp_books: Path):
     """单张图片默认出现在目录列表里（show_image_files 默认开，点按即单页图集）。"""
     (tmp_books / "solo.png").write_bytes(png_bytes(120, 200))
-    # 非电子书仍按 show_all_files=false 隐藏：图片行可见不能波及普通文件
-    (tmp_books / "readme.md").write_text("hi", encoding="utf-8")
+    # 非电子书仍按 show_all_files=false 隐藏：图片行可见不能波及普通文件。
+    # 注意：M5 起 Markdown 是可读格式，且未知扩展名的文本会被 sniff_unknown
+    # 判成可读——这个夹具必须是真正的二进制内容才能代表"非电子书"。
+    (tmp_books / "archive.dat").write_bytes(bytes([0, 1, 2, 3, 255, 254, 0, 0] * 8))
 
     body = api.get(f"{API}/files", params={"path": "/lib"}).json()
     entries = {e["name"]: e for e in body["entries"]}
@@ -503,7 +505,7 @@ def test_files_list_single_images_by_default(api, tmp_books: Path):
     assert solo["openable"] is True and solo["reason"] is None
     assert solo["book_id"]
     # 非电子书文件仍按 show_all_files=false 隐藏（图片可见不波及普通文件）
-    assert "readme.md" not in entries
+    assert "archive.dat" not in entries
 
 
 def test_files_hide_single_images_when_disabled(api, tmp_books: Path, make_config):

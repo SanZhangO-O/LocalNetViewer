@@ -23,16 +23,20 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
-from ..config import IMAGE_EXT, AppConfig
+from ..config import AppConfig
+from ..formats import detect as detect_mod
 from ..formats import registry
 from ..formats.base import BookRef
 from ..formats.comics import should_skip_entry
+from ..util import imaging
 from ..util.natural import natural_key
 from ..util.paths import (
     PathError,
     join_vpath,
     ext_of,
+    ext_key_of,
     normalize_vpath,
     parent_vpath,
     resolve_in_root,
@@ -349,6 +353,7 @@ class LibraryService:
                 dir_mtime = 0.0
 
             image_count = 0
+            image_exts = imaging.supported_image_exts()
             for fn in sorted(filenames, key=natural_key):
                 if fn.startswith("."):
                     continue
@@ -360,15 +365,18 @@ class LibraryService:
                 except OSError:
                     continue
                 ext = ext_of(fn)
-                if ext in set(IMAGE_EXT) and not should_skip_entry(fn, patterns):
+                if ext in image_exts and not should_skip_entry(fn, patterns):
                     image_count += 1
                     continue
+                ext_key = ext_key_of(fn)
                 fmt = registry.format_of(fn)
-                if not fmt:
+                if not fmt or not registry.is_indexable_format(fmt):
+                    # 未知扩展名 / 媒体文件不进书库索引（列表按目录实时分类）
                     continue
                 if (
-                    ext not in self.config.library.include_ext
+                    ext_key not in self.config.library.include_ext
                     and not self.config.library.show_all_files
+                    and not registry.is_override_ext(ext_key)
                 ):
                     continue
                 vpath = join_vpath(vdir, fn)
@@ -567,9 +575,10 @@ class LibraryService:
 
         # ---- 第一阶段：枚举 + 分类（只看名字）+ 排序
         patterns = list(self.config.comic.skip_entries)
-        image_exts = set(IMAGE_EXT)
+        image_exts = imaging.supported_image_exts()
         show_images = bool(self.config.gallery.show_image_files)
         show_all = bool(self.config.library.show_all_files)
+        sniff_enabled = bool(self.config.library.sniff_unknown)
         include_ext = self.config.library.include_ext
 
         try:
@@ -578,7 +587,8 @@ class LibraryService:
             raise PathError(f"目录无法读取: {v} ({exc})") from exc
 
         dirs: List[Tuple[str, str]] = []  # (name, 真实路径)
-        # kind: "image"（单图）/ "book"（电子书）/ "file"（show_all_files 的其它文件）
+        # kind: "image"（单图）/ "media"（音视频）/ "sniff"（未知扩展名待嗅探）
+        #       / "book"（电子书）/ "file"（show_all_files 的其它文件）
         files: List[Tuple[str, str, str]] = []
         for entry in scandir_entries:
             name = entry.name
@@ -594,16 +604,46 @@ class LibraryService:
                 dirs.append((name, entry.path))
                 continue
             ext = ext_of(name)
-            if ext in image_exts and show_images:
-                if not should_skip_entry(name, patterns):
+            ext_key = ext_key_of(name)
+            if ext in image_exts:
+                # 图片扩展名（单图）：show_image_files 关闭时必须整体隐藏，
+                # 不能落到未知扩展名嗅探分支（否则会被重新列出，旧契约失效）
+                if show_images and not should_skip_entry(name, patterns):
                     files.append((name, entry.path, "image"))
                 continue
             fmt = registry.format_of(name)
+            if fmt is not None and registry.is_media_format(fmt):
+                if (
+                    ext_key not in include_ext
+                    and not show_all
+                    and not registry.is_override_ext(ext_key)
+                ):
+                    continue
+                files.append((name, entry.path, "media"))
+                continue
             if fmt is None:
+                # 未知扩展名：先做廉价分类（detect 自带缓存）再计入列表，
+                # 保证 total 与实际下发的条目一致；嗅探不出且非 show_all 不列出
+                if not (show_all or sniff_enabled or ext_key in include_ext):
+                    continue
+                detected = detect_mod.detect_file(entry.path)
+                if detected.kind == "image":
+                    if show_images and not should_skip_entry(name, patterns):
+                        files.append((name, entry.path, "image"))
+                    elif show_all:
+                        files.append((name, entry.path, "file"))
+                    continue
+                if detected.kind in ("text", "book"):
+                    files.append((name, entry.path, "sniff"))
+                    continue
                 if show_all:
                     files.append((name, entry.path, "file"))
                 continue
-            if ext not in include_ext and not show_all:
+            if (
+                ext_key not in include_ext
+                and not show_all
+                and not registry.is_override_ext(ext_key)
+            ):
                 continue
             files.append((name, entry.path, "book"))
 
@@ -683,6 +723,67 @@ class LibraryService:
                 )
                 continue
 
+            if kind == "media":
+                fmt = registry.format_of(name) or ""
+                spec = registry.spec_of(fmt)
+                entries.append(
+                    {
+                        "name": name,
+                        "type": "media",
+                        "path": child_vpath,
+                        "format": fmt,
+                        "size": int(st.st_size),
+                        "mtime": iso_time(st.st_mtime),
+                        "media_kind": spec.kind if spec is not None else "audio",
+                        "mime": imaging.mime_for_ext(ext_of(name)),
+                        "stream_url": f"/api/v1/media?path={quote(child_vpath, safe='')}",
+                        "openable": True,
+                        "reason": None,
+                    }
+                )
+                continue
+
+            if kind == "sniff":
+                detected = detect_mod.detect_file(Path(child_real))
+                if detected.kind not in ("text", "book"):
+                    # 内容在分类与下发之间发生变化（分类阶段已过滤图片/未知）：
+                    # 按普通文件处理，下次刷新自然纠正
+                    if show_all:
+                        entries.append(
+                            {
+                                "name": name,
+                                "type": "file",
+                                "path": child_vpath,
+                                "size": int(st.st_size),
+                                "mtime": iso_time(st.st_mtime),
+                                "openable": False,
+                                "reason": "非电子书格式",
+                            }
+                        )
+                    continue
+                fmt = detected.format or "text"
+                reason = registry.openable_reason(fmt)
+                book_id = self._book_id_for(
+                    child_vpath, Path(child_real), st.st_size, st.st_mtime, fmt
+                )
+                rev = content_revision(book_id, int(st.st_size), float(st.st_mtime))
+                entries.append(
+                    {
+                        "name": name,
+                        "type": "book",
+                        "path": child_vpath,
+                        "format": fmt,
+                        "book_id": book_id,
+                        "size": int(st.st_size),
+                        "mtime": iso_time(st.st_mtime),
+                        "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
+                        "openable": reason is None,
+                        "reason": reason,
+                        "has_contents": registry.is_browsable_format(fmt),
+                    }
+                )
+                continue
+
             if kind == "file":
                 entries.append(
                     {
@@ -716,6 +817,7 @@ class LibraryService:
                     "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
                     "openable": reason is None,
                     "reason": reason,
+                    "has_contents": registry.is_browsable_format(fmt),
                 }
             )
 

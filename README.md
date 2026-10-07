@@ -3,7 +3,7 @@
 局域网电子书阅读系统：**PC 上的 Python 服务器负责书库管理、格式解析、分页与页面渲染；
 Android 客户端通过 IP 连接服务器，浏览文件并"逐页"阅读电子书与漫画，书籍不整本下载。**
 
-完整设计见 [DESIGN.md](DESIGN.md)（v0.6）。
+完整设计见 [DESIGN.md](DESIGN.md)（v0.8）。
 
 ```
 LocalNetViewer/
@@ -31,11 +31,11 @@ python run.py --config config.yaml
 启动信息会列出所有可用地址（多网卡 / VPN 会标注类型），例如：
 
 ```
-LocalNetViewer Server v0.7.0
+LocalNetViewer Server v0.8.0
 书库: 我的书库 (D:/Books, 123 本)  [扫描完成]
 
 可用地址:
-  http://192.168.1.10:8765   (以太网（推荐））
+  http://192.168.1.10:8765   (以太网（推荐）)
 ```
 
 交互式接口文档：`http://<服务器IP>:8765/docs`。
@@ -85,19 +85,30 @@ gradlew.bat assembleDebug
 | M2 EPUB + 阅读设置 | EPUB 适配器（meta 快速返回 + 首次布局全量解析并缓存）、内嵌图片、封面、`/render/fonts`；目录抽屉、设置面板（字号/行距/边距/主题/字体） | 已实现 |
 | M3 漫画与固定版式 + 搜索 | PDF 直渲、漫画容器（CBZ/CBR/CB7/CBT/图片文件夹）、文件夹图集虚拟书、`fit=viewport\|original`、全文搜索；客户端漫画控制、图集入口、搜索结果跳页 | 已实现 |
 | M4 可选增强 | 服务器端 JSON 模式、条漫切片、服务器端进度同步已实现；客户端 JSON 渲染、mDNS、扫码、TTS 未实现 | 部分实现 |
+| M5 格式扩展 | 格式注册表（`formats/specs.py`）+ `/server/formats` 能力接口 + 未知扩展名内容嗅探 + `ext_overrides`；新增 HTML/Markdown/RTF/源码、DOCX/ODT/PPTX/XLSX（内置解析）、旧版 Office（LibreOffice）、多页 TIFF、DjVu、字体预览、ISO/CAB/LHA、HEIC/JXL/SVG/PSD/RAW（可选插件）、音频/视频流式播放 | 已实现 |
 
 ## 服务器支持的格式
 
-| 格式 | 说明 |
-|---|---|
-| TXT | 编码检测（BOM → charset-normalizer → GB18030）+ 章节切分，可配置书级编码覆盖 |
-| EPUB | ebooklib 解析，缺失/异常时自动退回 zipfile + lxml 手写 OPF/spine 解析；图片型（漫画，每页一图）自动按固定版式漫画打开，等比完整显示、尽量铺满屏幕 |
-| PDF | pypdfium2 直渲（固定版式） |
-| CBZ/CBR/CB7/CBT、图片文件夹 | 图片即页，自然排序；CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr` |
-| 压缩包内容浏览（zip/rar/7z/tar） | 压缩包可当虚拟目录浏览：包内的书（txt/epub/pdf/fb2/mobi）、图片、目录（作为图集）、嵌套压缩包都能打开；进度独立保存（v0.7，见 DESIGN.md 7.6） |
-| 单张图片文件（jpg/png/webp/gif/bmp/avif/tif 等） | 目录列表直接列出（`gallery.show_image_files`），点按即作为"单页图集"打开 |
-| FB2 | XML → 块模型 |
-| MOBI/AZW3 | 检测到 Calibre `ebook-convert` 时转换缓存为 EPUB（可选）；漫画型（图片为主）自动按固定版式漫画打开，适应屏幕 |
+> M5 起格式清单由 `server/app/formats/specs.py` 单一事实源驱动（30+ 格式、
+> 200 个扩展名）；`GET /api/v1/server/formats` 可查询当前服务器实际可用性与
+> 置灰原因。可选后端缺失时对应条目在列表置灰，不影响其它格式。
+
+| 类别 | 格式 | 说明 |
+|---|---|---|
+| 文本 | TXT、源码/结构化文本（py/js/ts/c/cpp/go/rs/json/yaml/toml/sql/css/xml…）、字幕（srt/vtt/ass）、NFO | 编码检测（BOM → charset-normalizer → GB18030）+ 章节切分；代码保留缩进；书级编码覆盖 |
+| 网页/排版 | HTML、Markdown、RTF | Markdown 优先 markdown-it-py（可选装 `.[text]`），内置轻量转换器兜底 |
+| 电子书 | EPUB、FB2、FBZ/.fb2.zip、MOBI/AZW3 | EPUB 图片型自动按固定版式漫画打开；MOBI 需 Calibre |
+| Calibre 族群 | CHM、LIT、PDB、PRC、PML、RB、SNB、TCR、LRF、AZW4、TXTZ、HTMLZ | 经 `ebook-convert` 转 EPUB 后复用解析链（需 Calibre） |
+| Office | DOCX、ODT、PPTX、XLSX（内置 zip+XML 解析）；DOC/WPS、XLS、PPT/PPS（需 LibreOffice） | 旧版格式缺失 LibreOffice 时列表置灰 |
+| 固定版式 | PDF（pypdfium2 直渲）、DjVu（需 DjVuLibre）、多页 TIFF | 逐页阅读；TIFF 一帧一页 |
+| 漫画/压缩包 | CBZ/CBR/CB7/CBT、ZIP/RAR/7Z/TAR（含 .tgz/.tar.gz/.bz2/.xz）、CAB/LHA（bsdtar）、ISO（pycdlib） | 图片即页；压缩包可当虚拟目录浏览，包内书/图片/目录可嵌套打开 |
+| 图片 | JPG/PNG/GIF/WebP/AVIF/BMP、TGA/PCX/ICO/DDS/PNM；HEIC/JXL/SVG/PSD/RAW（可选装 `.[images]`） | 单图 = 单页图集；异形格式缺后端时不出现 |
+| 字体 | TTF/OTF/TTC | 渲染字样预览页 |
+| 媒体 | 音频 MP3/M4A/M4B/AAC/FLAC/OGG/OPUS/WAV/WMA、视频 MP4/M4V/MKV/WEBM/MOV/AVI/3GP | 服务端 Range 流式（206），客户端内嵌播放器，不整段下载 |
+| 嗅探兜底 | 任意扩展名 | 无扩展名/错扩展名读文件头判定：文本、图片、文档容器自动可读；`library.sniff_unknown=false` 可关闭；`library.ext_overrides` 可手动指定解析器 |
+
+可选增强后端一次装齐：`pip install -e ".[text,images,iso]"`（Calibre / LibreOffice /
+DjVuLibre / unrar / bsdtar 为系统级依赖，启动横幅会列出缺失项与安装提示）。
 
 ## 测试与验证
 

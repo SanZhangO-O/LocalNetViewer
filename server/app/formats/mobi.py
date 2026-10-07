@@ -68,7 +68,9 @@ def sweep_converted_cache(
         entries = []
         total = 0
         try:
-            files = [p for p in Path(directory).glob("*.epub") if p.is_file()]
+            # 递归覆盖全部转换产物：MOBI→EPUB、LibreOffice（converted/lo/）
+            # 与 DjVu 逐页缓存（converted/djvu/）共用同一配额
+            files = [p for p in Path(directory).rglob("*") if p.is_file()]
         except OSError:
             return 0
         for path in files:
@@ -160,8 +162,9 @@ class MobiAdapter(FlowAdapter):
                 return  # 等锁期间别人已经转好了
             exe = calibre_available()
             if not exe:
+                label = (self.ref.format or "mobi").upper()
                 raise UnsupportedFormatError(
-                    "MOBI/AZW3 需要 Calibre 的 ebook-convert 转换，请安装 Calibre 后重试",
+                    f"{label} 需要 Calibre 的 ebook-convert 转换，请安装 Calibre 后重试",
                     reason="需安装 Calibre",
                 )
             timeout = max(

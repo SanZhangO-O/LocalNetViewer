@@ -31,10 +31,9 @@ from fnmatch import fnmatch
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from ..config import IMAGE_EXT
 from ..util import imaging
 from ..util.natural import natural_key
-from ..util.paths import ext_of, stem_of
+from ..util.paths import ext_key_of, ext_of, stem_of
 from .base import (
     AdapterEnv,
     AdapterMeta,
@@ -46,23 +45,31 @@ from .base import (
     UnsupportedFormatError,
 )
 
-_ZIP_EXTS = {".cbz", ".zip"}
+_ZIP_EXTS = {".cbz", ".zip", ".cbz3", ".fbz"}
 _RAR_EXTS = {".cbr", ".rar"}
 _SEVEN_EXTS = {".cb7", ".7z"}
-_TAR_EXTS = {".cbt", ".tar"}
+_TAR_EXTS = {".cbt", ".tar", ".tgz", ".tar.gz", ".tbz2", ".tar.bz2", ".txz", ".tar.xz"}
+# 外部 libarchive（bsdtar）容器：CAB / LZH / LHA / ACE（ACE 实际不被 libarchive 支持，会明确失败）
+_EXTERNAL_EXTS = {".cab", ".lzh", ".lha", ".ace"}
+_ISO_EXTS = {".iso"}
 # 可浏览压缩包（设计 7.6）：contents API 只对这些容器开放
-ARCHIVE_EXTS = _ZIP_EXTS | _RAR_EXTS | _SEVEN_EXTS | _TAR_EXTS
+ARCHIVE_EXTS = _ZIP_EXTS | _RAR_EXTS | _SEVEN_EXTS | _TAR_EXTS | _EXTERNAL_EXTS | _ISO_EXTS
 
 logger = logging.getLogger("localnetviewer.formats.comics")
 
 
 def is_archive_name(name: str) -> bool:
-    return ext_of(name) in ARCHIVE_EXTS
+    return ext_key_of(name) in ARCHIVE_EXTS
 
 
 # ------------------------------------------------------------------ 工具
 def is_image_name(name: str) -> bool:
-    return ext_of(name) in set(IMAGE_EXT)
+    """图片**页**条目判定：单图可解码扩展名 + TIFF（容器/文件夹内的页，M5）。
+
+    独立 ``.tif/.tiff`` 文件在书库列表按多页格式（``tiff``)打开，不经过这里；
+    这里的白名单只服务"页"（压缩包条目、文件夹图集）。
+    """
+    return ext_key_of(name) in imaging.page_image_exts()
 
 
 def decode_zip_name(info: zipfile.ZipInfo) -> str:
@@ -695,7 +702,12 @@ class FolderComicContainer(ComicContainer):
 
     def _scan(self) -> List[str]:
         if self._single is not None:
-            if not should_skip_entry(self._single, self.patterns) and is_image_name(self._single):
+            if should_skip_entry(self._single, self.patterns):
+                return []
+            if is_image_name(self._single):
+                return [self._single]
+            # 错扩展名/无扩展名的单图（嗅探注册的图集）：按魔数兜底
+            if imaging.looks_like_image_file(self.root / self._single):
                 return [self._single]
             return []
         # 共享缓存：resolve() 的图片计数与这里取页共用同一份枚举结果，避免同一
@@ -729,14 +741,11 @@ class FolderComicContainer(ComicContainer):
 
 
 def open_container(env: AdapterEnv, path: Path, *, recursive: bool = False) -> ComicContainer:
-    """按扩展名选择容器；目录 / 单张图片 → 图集容器。"""
+    """按扩展名选择容器；目录 / 单张图片（含嗅探）→ 图集容器。"""
     p = Path(path)
     if p.is_dir():
         return FolderComicContainer(env, p, recursive=recursive)
-    if is_image_name(p.name):
-        # 单张图片 = 单页图集（设计 7.5）
-        return FolderComicContainer(env, p, recursive=False)
-    ext = ext_of(p.name)
+    ext = ext_key_of(p.name)
     if ext in _ZIP_EXTS:
         return ZipComicContainer(env, p)
     if ext in _RAR_EXTS:
@@ -745,7 +754,39 @@ def open_container(env: AdapterEnv, path: Path, *, recursive: bool = False) -> C
         return SevenZipComicContainer(env, p)
     if ext in _TAR_EXTS:
         return TarComicContainer(env, p)
+    if ext in _EXTERNAL_EXTS:
+        from .external import BsdtarComicContainer  # noqa: PLC0415 - 延迟导入避免环
+
+        return BsdtarComicContainer(env, p)
+    if ext in _ISO_EXTS:
+        from .isocomic import IsoComicContainer  # noqa: PLC0415 - 延迟导入避免环
+
+        return IsoComicContainer(env, p)
+    magic = _open_by_magic(env, p)
+    if magic is not None:
+        # 错扩展名 / 无扩展名的压缩包：按魔数兜底（嗅探注册的 zip 等）
+        return magic
+    if is_image_name(p.name) or imaging.looks_like_image_file(p):
+        # 单张图片 = 单页图集（设计 7.5）；错扩展名/无扩展名由魔数兜底
+        return FolderComicContainer(env, p, recursive=False)
     raise UnsupportedFormatError(f"不支持的漫画容器: {ext or p.name}", reason="未知容器类型")
+
+
+def _open_by_magic(env: AdapterEnv, path: Path) -> Optional[ComicContainer]:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    if head[:4] == b"PK\x03\x04":
+        return ZipComicContainer(env, path)
+    if head[:4] == b"Rar!":
+        return RarComicContainer(env, path)
+    if head[:6] == b"7z\xbc\xaf\x27\x1c":
+        return SevenZipComicContainer(env, path)
+    if head[:2] == b"\x1f\x8b" or (len(head) > 262 and head[257:262] == b"ustar"):
+        return TarComicContainer(env, path)
+    return None
 
 
 # ------------------------------------------------------------------ 适配器
@@ -834,7 +875,7 @@ class ComicAdapter(FixedAdapter):
     def page_native_size(self, page: int) -> Tuple[int, int]:
         name = self._entry(page)
         data = self._container.read(name)
-        size = imaging.probe_size(data)
+        size = imaging.probe_size(data, ext_of(name))
         if size is None:
             raise ParseError(f"图片无法识别: {name}")
         return size
@@ -873,11 +914,13 @@ class ComicAdapter(FixedAdapter):
 
         target_w = max(1, int(round(viewport_w * max(0.5, min(2.0, render_scale)))))
         if fit == "original":
-            native = imaging.probe_size(data)
+            native = imaging.probe_size(data, ext_of(name))
             if native and native[0] > target_w:
                 target_w = native[0]
         try:
-            img = imaging.decode_for_display(data, target_w, self.max_source_pixels)
+            img = imaging.decode_for_display(
+                data, target_w, self.max_source_pixels, ext=ext_of(name)
+            )
         except imaging.ImageTooLargeError as exc:
             raise ParseError(f"图片超出像素上限: {name} ({exc})") from exc
         except imaging.ImageDecodeError as exc:
@@ -921,7 +964,9 @@ class ComicAdapter(FixedAdapter):
         for p in pages:
             data, _ = self.raw_bytes(p)
             target_w = max(1, int(round(viewport_w * render_scale)))
-            img = imaging.decode_for_display(data, target_w, self.max_source_pixels)
+            img = imaging.decode_for_display(
+                data, target_w, self.max_source_pixels, ext=ext_of(self._entry(p))
+            )
             if img.width > target_w:
                 img = imaging.fit_width(img, target_w)
             imgs.append(img)
@@ -979,7 +1024,7 @@ class ComicAdapter(FixedAdapter):
             data = self._container.read(name)
         except Exception:
             return None
-        return imaging.probe_size(data)
+        return imaging.probe_size(data, ext_of(name))
 
     def strip_slice_bytes(
         self,
@@ -998,7 +1043,9 @@ class ComicAdapter(FixedAdapter):
         mime = self._mime_cache.get(name) or imaging.sniff_mime(data, ext_of(name))
         self._mime_cache[name] = mime
         try:
-            img = imaging.decode_for_display(data, 0, self.max_source_pixels, prefer_jpeg_draft=False)
+            img = imaging.decode_for_display(
+                data, 0, self.max_source_pixels, prefer_jpeg_draft=False, ext=ext_of(name)
+            )
         except imaging.ImageTooLargeError as exc:
             raise ParseError(f"长图超出像素上限: {name} ({exc})") from exc
         except imaging.ImageDecodeError as exc:

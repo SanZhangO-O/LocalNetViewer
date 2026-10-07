@@ -31,55 +31,9 @@ from .base import (
     DocumentModel,
     FlowAdapter,
     ParseError,
-    Span,
-    STYLE_BOLD,
-    STYLE_BOLD_ITALIC,
-    STYLE_ITALIC,
-    STYLE_NONE,
 )
+from .htmlblocks import html_to_blocks as _shared_html_to_blocks, make_soup
 
-_HEADING_LEVELS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
-_TEXT_CONTAINERS = {
-    "p",
-    "div",
-    "li",
-    "blockquote",
-    "pre",
-    "td",
-    "th",
-    "figcaption",
-    "dd",
-    "dt",
-    "section",
-    "article",
-    "main",
-    "aside",
-    "header",
-    "footer",
-    "caption",
-    "address",
-}
-_BLOCK_LEVEL = set(_TEXT_CONTAINERS) | set(_HEADING_LEVELS) | {"tr", "table", "ul", "ol", "dl", "figure"}
-_SKIP_TAGS = {
-    "script",
-    "style",
-    "head",
-    "title",
-    "nav",
-    "noscript",
-    "template",
-    "iframe",
-    "object",
-    "video",
-    "audio",
-    "math",
-}
-_WS_RE = re.compile(r"[ \t\r\n\f\v]+")
-_CJK_SPACE_RE = re.compile(
-    r"(?<=[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef])"
-    r"[ \t]+"
-    r"(?=[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef])"
-)
 _COVER_NAME_RE = re.compile(r"(^|/)cover[^/]*\.(jpe?g|png|gif|webp|bmp)$", re.IGNORECASE)
 
 
@@ -451,69 +405,21 @@ class EpubAdapter(FlowAdapter):
 
     # ------------------------------------------------------------ HTML → 块
     def _html_to_blocks(self, html: bytes, item_name: str) -> List[Block]:
-        soup = _soup(html)
-        if soup is None:
-            return []
-        # 不能用 `soup.body or soup`：BeautifulSoup 的 Tag 真值同样来自"有没有子元素"，
-        # 空的 <body></body> 会被判为假值而退回整个文档（与 lxml 是同一类陷阱）
-        body = soup.body if soup.body is not None else soup
-        blocks: List[Block] = []
-        for tag in body.find_all(True):
-            name = str(getattr(tag, "name", "") or "").lower()
-            if name in _SKIP_TAGS or _in_skipped(tag, body):
-                continue
-            if name in _HEADING_LEVELS:
-                if _has_block_descendant(tag):
-                    _append_direct_text(blocks, tag)
-                    continue
-                spans = self._spans(tag)
-                text = _spans_text(spans)
-                if text.strip():
-                    blocks.append(
-                        Block(type="heading", spans=spans, level=_HEADING_LEVELS[name])
-                    )
-                continue
-            if name in _TEXT_CONTAINERS:
-                if _has_block_descendant(tag):
-                    # 容器自己也可能有直接文本（<li>介绍<p>…</p></li>），不能整块丢掉
-                    _append_direct_text(blocks, tag)
-                    continue
-                spans = self._spans(tag)
-                text = _spans_text(spans)
-                if text.strip():
-                    blocks.append(Block(type="paragraph", spans=spans))
-                continue
-            if name == "hr":
-                blocks.append(Block.separator())
-                continue
-            if name in ("img", "image"):
-                block = self._image_block(tag, item_name)
-                if block is not None:
-                    blocks.append(block)
-        return blocks
+        """委托公共转换器（formats/htmlblocks.py）；图片解析回落到容器条目。"""
 
-    def _image_block(self, tag, item_name: str) -> Optional[Block]:
-        src = (
-            tag.get("src")
-            or tag.get("data-src")
-            # SVG 包裹的插图：HTML 解析器给出 "xlink:href"，XML 解析器给出 Clark 记法
-            or tag.get("xlink:href")
-            or tag.get("{http://www.w3.org/1999/xlink}href")
-            or _attr_by_suffix(tag, "href")
-            or ""
-        )
-        src = str(src).strip()
-        if not src:
-            return None
-        if src.startswith("data:"):
-            # 内联 data: URI 无法通过 /asset 提供（asset 不接受空路径），
-            # 与其留一个永久损坏的图片块，不如丢弃（封面另有专门路径）
-            return None
-        resolved = self._resolve(item_name, src)
-        if not resolved:
-            return None
-        w, h = self._image_size(resolved)
-        return Block.image(resolved, w, h)
+        def _resolve(tag, src: str) -> Optional[Block]:
+            s = str(src).strip()
+            if not s or s.startswith("data:"):
+                # 内联 data: URI 无法通过 /asset 提供（asset 不接受空路径），
+                # 与其留一个永久损坏的图片块，不如丢弃（封面另有专门路径）
+                return None
+            resolved = self._resolve(item_name, s)
+            if not resolved:
+                return None
+            w, h = self._image_size(resolved)
+            return Block.image(resolved, w, h)
+
+        return _shared_html_to_blocks(html, _resolve)
 
     def _image_size(self, name: str) -> Tuple[int, int]:
         if name in self._image_size_cache:
@@ -528,23 +434,6 @@ class EpubAdapter(FlowAdapter):
             pass
         self._image_size_cache[name] = size
         return size
-
-    def _spans(self, tag) -> List[Span]:
-        spans: List[Span] = []
-        for node in tag.descendants:
-            node_name = getattr(node, "name", None)
-            if node_name is None:
-                text = _WS_RE.sub(" ", str(node))
-                if not text:
-                    continue
-                style = _style_of(node.parent, tag)
-                _append_span(spans, text, style)
-            elif node_name == "br":
-                _append_span(spans, " ", _style_of(node.parent, tag))
-            elif node_name == "img":
-                _append_span(spans, " ", STYLE_NONE)
-        _tidy_spans(spans)
-        return spans
 
     # ------------------------------------------------------------ 封面/资源
     def cover(self, width: int = 0) -> Optional[Tuple[bytes, str]]:
@@ -583,40 +472,6 @@ class EpubAdapter(FlowAdapter):
 
 
 # ------------------------------------------------------------------ 辅助
-def _append_direct_text(blocks: List[Block], tag) -> None:
-    """只取容器的**直接**文本子节点（不含块级子元素的文本，那些由子元素自己输出）。
-
-    顺序上会排在该容器的块级子元素之前，但保证一句话都不会丢。
-    """
-    parts: List[str] = []
-    for child in getattr(tag, "children", []):
-        if getattr(child, "name", None) is not None:
-            continue
-        text = str(child)
-        if text.strip():
-            parts.append(text)
-    if not parts:
-        return
-    joined = _WS_RE.sub(" ", " ".join(parts))
-    joined = _CJK_SPACE_RE.sub("", joined).strip()
-    if joined:
-        blocks.append(Block(type="paragraph", spans=[Span(joined)]))
-
-
-def _attr_by_suffix(tag, suffix: str) -> Optional[str]:
-    """按属性名后缀查找（兼容 ``href`` / ``xlink:href`` / Clark 记法三种写法）。"""
-    attrs = getattr(tag, "attrs", None)
-    if not attrs:
-        return None
-    for key, value in attrs.items():
-        key_str = str(key)
-        if key_str == suffix or key_str.endswith(":" + suffix):
-            if isinstance(value, (list, tuple)):
-                return str(value[0]) if value else None
-            return str(value) if value is not None else None
-    return None
-
-
 def _first_meta(book, key: str) -> Optional[str]:
     try:
         values = book.get_metadata("DC", key)
@@ -653,7 +508,7 @@ def _norm_href(href: str) -> str:
 
 
 def _toc_from_nav(html: bytes, nav_name: str) -> Dict[str, str]:
-    soup = _soup(html)
+    soup = make_soup(html)
     if soup is None:
         return {}
     out: Dict[str, str] = {}
@@ -702,77 +557,3 @@ def _guess_cover(image_names: Sequence[str]) -> Optional[str]:
         if "cover" in posixpath.basename(name).lower():
             return name
     return None
-
-
-def _soup(html: bytes):
-    try:
-        from bs4 import BeautifulSoup  # noqa: PLC0415
-    except Exception:
-        return None
-    for parser in ("lxml", "html.parser"):
-        try:
-            return BeautifulSoup(html, parser)
-        except Exception:
-            continue
-    return None
-
-
-def _in_skipped(tag, stop) -> bool:
-    cur = getattr(tag, "parent", None)
-    while cur is not None and cur is not stop:
-        if getattr(cur, "name", None) in _SKIP_TAGS:
-            return True
-        cur = getattr(cur, "parent", None)
-    return False
-
-
-def _has_block_descendant(tag) -> bool:
-    for child in tag.find_all(True):
-        if getattr(child, "name", None) in _BLOCK_LEVEL:
-            return True
-    return False
-
-
-def _style_of(node, stop) -> str:
-    bold = italic = False
-    cur = node
-    while cur is not None and cur is not stop:
-        name = getattr(cur, "name", None)
-        if name in ("b", "strong"):
-            bold = True
-        elif name in ("i", "em"):
-            italic = True
-        cur = getattr(cur, "parent", None)
-    if bold and italic:
-        return STYLE_BOLD_ITALIC
-    if bold:
-        return STYLE_BOLD
-    if italic:
-        return STYLE_ITALIC
-    return "none"
-
-
-def _append_span(spans: List[Span], text: str, style: str) -> None:
-    if not text:
-        return
-    if spans and spans[-1].style == style:
-        spans[-1].text += text
-    else:
-        spans.append(Span(text, style))
-
-
-def _tidy_spans(spans: List[Span]) -> None:
-    for span in spans:
-        span.text = _CJK_SPACE_RE.sub("", _WS_RE.sub(" ", span.text))
-    if spans:
-        spans[0].text = spans[0].text.lstrip(" ")
-        spans[-1].text = spans[-1].text.rstrip(" ")
-    # 合并后可能产生空 span
-    cleaned = [s for s in spans if s.text]
-    spans[:] = cleaned
-    for i in range(len(spans) - 1):
-        spans[i].text = spans[i].text.rstrip(" ")
-
-
-def _spans_text(spans: Sequence[Span]) -> str:
-    return "".join(s.text for s in spans)

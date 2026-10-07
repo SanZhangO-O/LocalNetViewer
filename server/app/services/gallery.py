@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from ..config import IMAGE_EXT
+from ..util import imaging
 from ..util.paths import PathError, ext_of, makedirs_quiet, normalize_vpath, stem_of
 from ..util.textutil import content_revision
 from ..formats.base import BookRef, UnsupportedFormatError
@@ -49,7 +49,8 @@ def gallery_book_id(vpath: str) -> str:
 
 
 def _is_image(name: str) -> bool:
-    return ext_of(name) in set(IMAGE_EXT)
+    """图集页判定：单图可解码扩展名 + TIFF（文件夹图集/计数用，M5）。"""
+    return ext_of(name) in imaging.page_image_exts()
 
 
 def list_images(
@@ -144,7 +145,7 @@ class GalleryService:
         patterns = list(self.config.comic.skip_entries)
 
         if real.is_file():
-            if not _is_image(real.name):
+            if not _is_image(real.name) and not imaging.looks_like_image_file(real):
                 raise UnsupportedFormatError(
                     "该文件不是图片，无法作为图集打开", reason="非图片文件"
                 )

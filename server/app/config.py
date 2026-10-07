@@ -15,22 +15,13 @@ from typing import Any, Dict, List, Literal, Optional
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .formats.specs import default_include_exts
+
 logger = logging.getLogger("localnetviewer.config")
 
-DEFAULT_INCLUDE_EXT = [
-    ".txt",
-    ".epub",
-    ".pdf",
-    ".cbz",
-    ".cbr",
-    ".cb7",
-    ".cbt",
-    ".fb2",
-    ".mobi",
-    ".azw3",
-]
-
-IMAGE_EXT = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".jfif", ".tif", ".tiff"]
+# 默认书库列表显示的扩展名：由 formats.specs 的 default_list 派生（M5）。
+# 通用压缩包（zip/rar/7z/tar/cab/iso…）默认不列出，避免每个压缩包都算一本书。
+DEFAULT_INCLUDE_EXT = default_include_exts()
 
 
 class ConfigError(RuntimeError):
@@ -88,6 +79,12 @@ class LibraryCfg(BaseModel):
     watch_debounce_s: float = Field(default=2.0, ge=0.1, le=60.0)
     # 书级编码覆盖：虚拟路径 / 文件名 / 纯文件名 → 编码名
     encoding_overrides: Dict[str, str] = Field(default_factory=dict)
+    # 未知扩展名内容嗅探（M5）：ext 不在 include_ext 时读文件头判断
+    # 文本/图片/文档容器，能读的就作为书列出（关掉可让列表只显示已知格式）
+    sniff_unknown: bool = True
+    # 扩展名 → 格式 id 覆盖（M5），如 {".mybook": "epub"}；
+    # 用于给私有/错扩展名的文件手动指定解析器
+    ext_overrides: Dict[str, str] = Field(default_factory=dict)
 
     @field_validator("include_ext")
     @classmethod
@@ -315,6 +312,15 @@ def load_config(path: Optional[str | Path] = None) -> AppConfig:
         cfg = AppConfig.model_validate(data)
     except Exception as exc:  # pydantic ValidationError
         raise ConfigError(f"配置校验失败: {cfg_path}\n{exc}") from exc
+    # M5：include_ext 一旦显式配置就是权威过滤，新格式默认不可见。旧配置
+    # （0.7 的 10 项清单）升级后会"新功能好像没生效"，这里明确提示一次。
+    library_raw = data.get("library") if isinstance(data, dict) else None
+    if isinstance(library_raw, dict) and library_raw.get("include_ext"):
+        logger.info(
+            "library.include_ext 已显式配置：只列出清单内的扩展名。"
+            "要启用 0.8 新增格式（Office/Markdown/源码/媒体等），"
+            "请删除该键（使用内置默认全集）或把需要的扩展名加进去。"
+        )
     cfg.base_dir = cfg_path.parent
     cfg.config_path = cfg_path
     return cfg

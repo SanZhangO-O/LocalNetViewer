@@ -130,11 +130,15 @@ class ArchiveService:
         if ref.virtual and chain:
             root_path = Path(str(extra.get("root_path") or ref.path))
             return open_chain_container(self.env, root_path, chain, chain_ids)
-        if ref.virtual or not is_archive_name(ref.name):
+        # 非虚拟或未知扩展名：直接尝试打开容器（open_container 内含魔数兜底，
+        # 嗅探出来的错扩展名 zip/rar/7z 也能浏览内容）
+        container = open_container(self.env, ref.path)
+        if not getattr(container, "browsable", False):
+            container.close()
             raise UnsupportedFormatError(
                 "该书不是可浏览的压缩包", reason="非压缩包格式"
             )
-        return open_container(self.env, ref.path)
+        return container
 
     # ------------------------------------------------------------ 解析
     def resolve(self, nested_id: str, allowed: Optional[AccessScope] = None) -> Optional[BookRef]:
@@ -156,7 +160,12 @@ class ArchiveService:
                 return None
         root_id = str(chain[-1].get("parent") or "")
         root_ref = self.library.book_by_id(root_id, allowed)
-        if root_ref is None or not is_archive_name(root_ref.name):
+        if root_ref is None:
+            return None
+        # 与 /contents 同一能力判定（formats 注册表）：嗅探/覆盖出来的容器
+        # 也能解析其嵌套书，不得另用 is_archive_name 扩展名清单做门禁
+        root_fmt = registry.format_for_ref(root_ref)
+        if not registry.is_browsable_format(root_fmt):
             return None
         entries = [str(c.get("entry") or "") for c in reversed(chain)]
         chain_ids = list(reversed(ids))
@@ -386,7 +395,9 @@ class ArchiveService:
             title=title or e.rsplit("/", 1)[-1],
         )
         revision = nested_revision(nested_id, ref.revision)
-        fixed = fmt in ("gallery", "pdf") or (kind == "book" and is_archive_name(e))
+        # 预览模式：由注册表能力决定（gallery/pdf/漫画/字体/DjVu… 都是固定版式），
+        # 包内的压缩包条目按漫画容器打开也是固定版式。
+        fixed = registry.is_fixed_format(fmt) or (kind == "book" and is_archive_name(e))
         return {
             "book_id": nested_id,
             "title": title or e.rsplit("/", 1)[-1],

@@ -64,6 +64,12 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     private val _openBook = MutableStateFlow<String?>(null)
     val openBook: StateFlow<String?> = _openBook.asStateFlow()
 
+    /** 要在内嵌播放器打开的媒体（M5：音频/视频条目）。 */
+    data class MediaTarget(val url: String, val title: String, val audioOnly: Boolean)
+
+    private val _openMedia = MutableStateFlow<MediaTarget?>(null)
+    val openMedia: StateFlow<MediaTarget?> = _openMedia.asStateFlow()
+
     private var loadJob: Job? = null
 
     /** 目录访问历史：进入新目录时压入离开处的（目录, 页码, 滚动位置），返回时弹出恢复。 */
@@ -279,6 +285,22 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
                     showMessage(entry.reason ?: "该图片无法作为图集打开")
                 }
             }
+            entry.isMedia -> {
+                if (!entry.openable) {
+                    showMessage(entry.reason ?: "该媒体无法播放")
+                } else {
+                    val url = repository.mediaUrl(entry)
+                    if (url.isNullOrEmpty()) {
+                        showMessage("无法获取媒体地址")
+                    } else {
+                        _openMedia.value = MediaTarget(
+                            url = url,
+                            title = entry.name,
+                            audioOnly = entry.isAudio,
+                        )
+                    }
+                }
+            }
             else -> showMessage(entry.reason ?: "无法打开该文件")
         }
     }
@@ -303,6 +325,10 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
     fun consumeOpenBook() {
         _openBook.value = null
+    }
+
+    fun consumeOpenMedia() {
+        _openMedia.value = null
     }
 
     /** 书封 URL（Composable 不直接触碰 repository，设计分层；带服务端 rev）。 */

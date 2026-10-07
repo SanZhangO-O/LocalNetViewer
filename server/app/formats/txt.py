@@ -58,6 +58,10 @@ class TxtAdapter(FlowAdapter):
     def title_guess(self) -> str:
         return stem_of(self.ref.name)
 
+    def _clean(self, raw: str) -> str:
+        """行清理钩子：TXT 去掉段首缩进；CodeAdapter 覆写为保留缩进。"""
+        return _clean_line(raw)
+
     # ------------------------------------------------------------ meta
     def _scan_chapters(self) -> List[Dict[str, object]]:
         """轻量扫描：只产出章标题与字数，不构建 Block。"""
@@ -84,7 +88,7 @@ class TxtAdapter(FlowAdapter):
             cur_chars = 0
 
         for raw in textutil.split_lines(text):
-            line = raw.strip()
+            line = self._clean(raw)
             if not line:
                 continue
             title = textutil.match_chapter_title(line)
@@ -108,7 +112,7 @@ class TxtAdapter(FlowAdapter):
                 sections: List[Dict[str, object]] = []
                 cur_chars = 0
                 for raw in textutil.split_lines(text):
-                    line = raw.strip()
+                    line = self._clean(raw)
                     if not line:
                         continue
                     cur_chars += len(line)
@@ -185,7 +189,7 @@ class TxtAdapter(FlowAdapter):
             blocks = []
 
         for raw in textutil.split_lines(text):
-            line = _clean_line(raw)
+            line = self._clean(raw)
             if not line:
                 continue
             title = textutil.match_chapter_title(line)
@@ -230,6 +234,21 @@ def _clean_line(raw: str) -> str:
     """
     line = raw.replace("\t", "    ").rstrip()
     return line.lstrip("\u3000 \t")
+
+
+class CodeAdapter(TxtAdapter):
+    """源码 / 结构化文本：保留行首缩进（M5）。
+
+    TXT 的段首去缩进会毁掉代码可读性；这里只去掉行尾空白与制表符展开，
+    其余原样保留。format 没有规格时回退 ``code``。
+    """
+
+    def __init__(self, env, ref) -> None:
+        super().__init__(env, ref)
+        self.format = (ref.format or "code").lower()
+
+    def _clean(self, raw: str) -> str:
+        return raw.replace("\t", "    ").rstrip()
 
 
 def _split_chapter_into_sections(chapter: Chapter) -> List[Chapter]:

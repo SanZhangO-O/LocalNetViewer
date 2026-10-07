@@ -1,17 +1,23 @@
-"""扩展名 → 适配器注册表（设计 4.3 / 7.1）。
+"""扩展名 → 适配器注册表（M5：由 ``formats.specs`` 单一事实源驱动）。
 
 同时负责：
 - 可打开格式判定（供书库列表设置 ``openable`` / ``reason``）；
-- 解压后端探测（CBR 需要 unrar/bsdtar，CB7 需要 py7zr，MOBI 需要 Calibre）；
+- 解压/转换后端探测（RAR 需 unrar/bsdtar、7z 需 py7zr、Calibre/LibreOffice/DjVu、
+  可选图像插件等）；
+- 未知扩展名的内容嗅探兜底；
 - 单本书文件大小上限的统一校验。
 """
 
 from __future__ import annotations
 
+import dataclasses
 import threading
-from typing import Dict, List, Optional, Type
+from typing import Dict, List, Mapping, Optional, Type
 
-from ..util.paths import ext_of
+from ..util import imaging
+from ..util.paths import ext_key_of
+from . import detect as detect_mod
+from . import specs as specs_mod
 from .base import (
     AdapterEnv,
     BookAdapter,
@@ -21,59 +27,122 @@ from .base import (
     UnsupportedFormatError,
 )
 from .comics import ComicAdapter, rar_backend_tool
-from .epub import EpubAdapter
+from .djvu import DjvuAdapter, djvu_tools
+from .external import bsdtar_tool
 from .fb2 import Fb2Adapter
+from .fbz import open_fbz_adapter
+from .fontbook import FontSampleAdapter
+from .htmlbook import HtmlAdapter
 from .imagebook import open_epub_adapter
-from .mobi import MobiAdapter, calibre_available, open_mobi_adapter
+from .markdownbook import MarkdownAdapter
+from .mobi import calibre_available, open_mobi_adapter
+from .multipage import MultiPageImageAdapter
+from .officebook import (
+    DocxAdapter,
+    OdtAdapter,
+    PptxAdapter,
+    XlsxAdapter,
+    open_legacy_adapter,
+    soffice_path,
+)
 from .pdf import PdfAdapter
-from .txt import TxtAdapter
+from .rtfbook import RtfAdapter
+from .txt import CodeAdapter, TxtAdapter
 
-TXT_EXTS = {".txt", ".text", ".log"}
-EPUB_EXTS = {".epub"}
-PDF_EXTS = {".pdf"}
-FB2_EXTS = {".fb2"}
-MOBI_EXTS = {".mobi", ".azw3", ".azw"}
-COMIC_EXTS = {".cbz", ".zip", ".cbr", ".rar", ".cb7", ".7z", ".cbt", ".tar", ".cbz3"}
 GALLERY_FORMAT = "gallery"
 
 # 后端探测缓存（进程内一次性）
 _BACKEND_CACHE: Optional[Dict[str, Dict[str, object]]] = None
 _BACKEND_LOCK = threading.Lock()
 
-_FORMAT_BY_EXT: Dict[str, str] = {}
-for _ext in TXT_EXTS:
-    _FORMAT_BY_EXT[_ext] = "txt"
-for _ext in EPUB_EXTS:
-    _FORMAT_BY_EXT[_ext] = "epub"
-for _ext in PDF_EXTS:
-    _FORMAT_BY_EXT[_ext] = "pdf"
-for _ext in FB2_EXTS:
-    _FORMAT_BY_EXT[_ext] = "fb2"
-for _ext in MOBI_EXTS:
-    _FORMAT_BY_EXT[_ext] = "mobi"
-for _ext in COMIC_EXTS:
-    _FORMAT_BY_EXT[_ext] = _ext.lstrip(".")
+# 扩展名覆盖（library.ext_overrides）：扩展名 → 格式 id
+_OVERRIDES: Dict[str, str] = {}
+_OVERRIDES_LOCK = threading.Lock()
+
+_EXT_INDEX: Dict[str, specs_mod.FormatSpec] = {}
+for _spec in specs_mod.FORMAT_SPECS:
+    for _ext in _spec.exts:
+        _EXT_INDEX[_ext] = _spec
+
+
+def configure_overrides(mapping: Optional[Mapping[str, object]]) -> None:
+    """应用 ``library.ext_overrides``（扩展名 → 格式 id），幂等。"""
+    normalized: Dict[str, str] = {}
+    for key, value in dict(mapping or {}).items():
+        ext = str(key or "").strip().lower()
+        if ext and not ext.startswith("."):
+            ext = "." + ext
+        fmt = str(value or "").strip().lower()
+        if ext and fmt:
+            normalized[ext] = fmt
+    global _OVERRIDES
+    with _OVERRIDES_LOCK:
+        _OVERRIDES = normalized
+
+
+def _override_for(key: str) -> Optional[str]:
+    with _OVERRIDES_LOCK:
+        return _OVERRIDES.get(key)
 
 
 def format_of(name_or_path: str) -> Optional[str]:
     """扩展名 → 格式标识（不可打开的扩展名返回 None）。"""
-    return _FORMAT_BY_EXT.get(ext_of(name_or_path))
+    key = ext_key_of(name_or_path)
+    if not key:
+        return None
+    override = _override_for(key)
+    if override:
+        return override
+    spec = _EXT_INDEX.get(key)
+    return spec.id if spec is not None else None
 
 
-def is_openable_ext(ext: str) -> bool:
-    return (ext or "").lower() in _FORMAT_BY_EXT
+def spec_of(fmt: str) -> Optional[specs_mod.FormatSpec]:
+    return specs_mod.SPEC_BY_ID.get(str(fmt or "").lower())
 
 
-def supported_exts() -> List[str]:
-    return sorted(_FORMAT_BY_EXT.keys())
+def is_override_ext(ext: str) -> bool:
+    """该扩展名是否被 ``library.ext_overrides`` 显式配置（不受 include_ext 限制）。"""
+    e = (ext or "").lower()
+    return bool(e) and bool(_override_for(e))
 
 
 def format_for_ref(ref: BookRef) -> str:
     if ref.virtual and (ref.format == GALLERY_FORMAT or ref.path.is_dir()):
         return GALLERY_FORMAT
-    return _FORMAT_BY_EXT.get(ext_of(ref.name), "") or ref.format or ""
+    return format_of(ref.name) or (ref.format or "")
 
 
+def is_media_format(fmt: str) -> bool:
+    spec = spec_of(fmt)
+    return bool(spec and spec.kind in ("audio", "video"))
+
+
+def is_indexable_format(fmt: str) -> bool:
+    """是否作为"书"进入书库索引（媒体与不可打开格式不进）。"""
+    spec = spec_of(fmt)
+    if spec is None:
+        # 覆盖/嗅探出来的格式（text 等）按可读处理
+        return bool(fmt)
+    return bool(spec.mode)
+
+
+def is_browsable_format(fmt: str) -> bool:
+    """是否支持压缩包内容浏览（/books/{id}/contents）。"""
+    spec = spec_of(fmt)
+    if spec is None:
+        return False
+    return spec.adapter == "comic" and spec.kind in ("comic", "archive")
+
+
+def is_fixed_format(fmt: str) -> bool:
+    spec = spec_of(fmt)
+    if spec is not None:
+        return spec.mode in ("fixed", "strip")
+    return fmt == GALLERY_FORMAT
+
+
+# ---------------------------------------------------------------- 后端探测
 def backend_status() -> Dict[str, Dict[str, object]]:
     """解压/转换后端探测结果（启动打印 + 列表置灰）。"""
     global _BACKEND_CACHE
@@ -110,6 +179,16 @@ def _probe_backends() -> Dict[str, Dict[str, object]]:
     except Exception:
         pass
     calibre = calibre_available()
+    soffice = soffice_path() or ""
+    ddjvu, djvused = djvu_tools()
+    djvu_ok = bool(ddjvu and djvused)
+    if djvu_ok:
+        djvu_hint = str(ddjvu)
+    elif ddjvu:
+        djvu_hint = "缺少 djvused（DjVuLibre）"
+    else:
+        djvu_hint = "需安装 DjVuLibre（ddjvu + djvused）"
+    bsdtar = bsdtar_tool()
     return {
         "zip": {"available": True, "hint": "内置 zipfile"},
         "rar": {"available": rar_ok, "hint": rar_hint},
@@ -117,7 +196,16 @@ def _probe_backends() -> Dict[str, Dict[str, object]]:
         "tar": {"available": True, "hint": "内置 tarfile"},
         "pdf": {"available": _module_available("pypdfium2"), "hint": "pypdfium2"},
         "epub": {"available": _module_available("bs4"), "hint": "BeautifulSoup4"},
-        "calibre": {"available": bool(calibre), "hint": calibre or "需安装 Calibre（MOBI/AZW3）"},
+        "calibre": {"available": bool(calibre), "hint": calibre or "需安装 Calibre（MOBI/AZW3/CHM/LIT 等）"},
+        "libreoffice": {"available": bool(soffice), "hint": soffice or "需安装 LibreOffice（旧版 .doc/.xls/.ppt）"},
+        "djvu": {"available": djvu_ok, "hint": djvu_hint},
+        "bsdtar": {"available": bool(bsdtar), "hint": bsdtar or "需 bsdtar（libarchive；Windows 10+ 自带 tar.exe）"},
+        "iso": {"available": _module_available("pycdlib"), "hint": "pycdlib（pip install pycdlib）"},
+        "heif": {"available": imaging.image_backend_ready("heif"), "hint": "pillow-heif"},
+        "jxl": {"available": imaging.image_backend_ready("jxl"), "hint": "pillow-jxl-plugin"},
+        "svg": {"available": imaging.image_backend_ready("svg"), "hint": "svglib + reportlab"},
+        "psd": {"available": imaging.image_backend_ready("psd"), "hint": "psd-tools"},
+        "raw": {"available": imaging.image_backend_ready("raw"), "hint": "rawpy"},
     }
 
 
@@ -130,48 +218,121 @@ def _module_available(name: str) -> bool:
 
 
 def openable_reason(fmt: str) -> Optional[str]:
-    """该格式当前是否可用；不可用时返回原因（列表置灰用）。
-
-    探测结果进程内缓存：``backend_status()`` 会跑 ``rarfile.tool_setup()``
-    （可能启动子进程）与 ``shutil.which``，而目录列表的**每一个条目**都会问一次
-    （``create_adapter`` + 列表的 openable 字段），不缓存等于每列一次目录就做几百次探测。
-    """
-    status = backend_status()
-    if fmt in ("cbr", "rar") and not status["rar"]["available"]:
-        return str(status["rar"]["hint"])
-    if fmt in ("cb7", "7z") and not status["7z"]["available"]:
-        return str(status["7z"]["hint"])
-    if fmt in ("mobi", "azw3", "azw") and not status["calibre"]["available"]:
-        return str(status["calibre"]["hint"])
-    if fmt == "pdf" and not status["pdf"]["available"]:
-        return str(status["pdf"]["hint"])
+    """该格式当前是否可用；不可用时返回原因（列表置灰用）。"""
+    spec = spec_of(fmt)
+    if spec is None or not spec.backend:
+        return None
+    status = backend_status().get(spec.backend)
+    if status and not status.get("available"):
+        return str(status.get("hint") or f"{spec.backend} 不可用")
     return None
 
 
-def adapter_class_for(ref: BookRef) -> Type[BookAdapter]:
-    fmt = format_for_ref(ref)
-    if fmt == GALLERY_FORMAT:
-        return ComicAdapter
-    ext = ext_of(ref.name)
-    if ext in TXT_EXTS:
-        return TxtAdapter
-    if ext in EPUB_EXTS:
-        return EpubAdapter
-    if ext in PDF_EXTS:
-        return PdfAdapter
-    if ext in FB2_EXTS:
-        return Fb2Adapter
-    if ext in MOBI_EXTS:
-        return MobiAdapter
-    if ext in COMIC_EXTS:
-        return ComicAdapter
-    raise UnsupportedFormatError(
-        f"不支持的格式: {ext or ref.name}", reason=f"不支持的文件类型 {ext or ''}".strip()
+# ---------------------------------------------------------------- 能力清单
+def format_infos() -> List[Dict[str, object]]:
+    """能力清单（``/server/formats``）：客户端可据此做图标/置灰/入口判定。"""
+    out: List[Dict[str, object]] = []
+    for spec in specs_mod.FORMAT_SPECS:
+        reason = openable_reason(spec.id)
+        out.append(
+            {
+                "id": spec.id,
+                "label": spec.label,
+                "kind": spec.kind,
+                "exts": list(spec.exts),
+                "mode": spec.mode,
+                "openable": reason is None,
+                "reason": reason,
+            }
+        )
+    out.append(
+        {
+            "id": GALLERY_FORMAT,
+            "label": "图片 / 图集",
+            "kind": "image",
+            "exts": sorted(imaging.supported_image_exts()),
+            "mode": "fixed",
+            "openable": True,
+            "reason": None,
+        }
     )
+    return out
+
+
+# ---------------------------------------------------------------- 适配器工厂
+def _adapter_class_for_spec(spec: specs_mod.FormatSpec) -> Optional[Type[BookAdapter]]:
+    return {
+        "txt": TxtAdapter,
+        "code": CodeAdapter,
+        "html": HtmlAdapter,
+        "markdown": MarkdownAdapter,
+        "rtf": RtfAdapter,
+        "docx": DocxAdapter,
+        "odt": OdtAdapter,
+        "pptx": PptxAdapter,
+        "xlsx": XlsxAdapter,
+        "fb2": Fb2Adapter,
+        "pdf": PdfAdapter,
+        "multipage": MultiPageImageAdapter,
+        "djvu": DjvuAdapter,
+        "font": FontSampleAdapter,
+    }.get(spec.adapter)
+
+
+def _build_adapter(
+    env: AdapterEnv, ref: BookRef, spec: Optional[specs_mod.FormatSpec], recursive: bool
+) -> BookAdapter:
+    if spec is None:
+        raise UnsupportedFormatError(
+            f"不支持的格式: {ref.format or ref.name}",
+            reason=f"不支持的文件类型 {ref.format or ref.name}".strip(),
+        )
+    if spec.adapter == "comic":
+        return ComicAdapter(env, ref, recursive=recursive)
+    if spec.adapter == "epub":
+        # EPUB：图片型（漫画）按固定版式漫画打开，文本型走流式（工厂内部分流）
+        return open_epub_adapter(env, ref)
+    if spec.adapter == "mobi":
+        # MOBI/AZW3 及 Calibre 族群：转换后按漫画/文本分流（工厂内部决定）
+        return open_mobi_adapter(env, ref)
+    if spec.adapter == "fbz":
+        return open_fbz_adapter(env, ref)
+    if spec.adapter in ("office_legacy_doc", "office_legacy_xls", "office_legacy_ppt"):
+        return open_legacy_adapter(env, ref, spec.adapter)
+    cls = _adapter_class_for_spec(spec)
+    if cls is None:
+        raise UnsupportedFormatError(
+            f"格式 {spec.id} 没有适配器", reason=f"格式 {spec.id} 尚未实现"
+        )
+    return cls(env, ref)
+
+
+def _with_format(ref: BookRef, fmt: str) -> BookRef:
+    return dataclasses.replace(ref, format=fmt)
+
+
+def _sniff_adapter(env: AdapterEnv, ref: BookRef, recursive: bool) -> Optional[BookAdapter]:
+    """扩展名未识别时的内容嗅探（文本 / 图片 / 常见文档容器）。"""
+    detected = detect_mod.detect_file(ref.path)
+    if detected.kind == "text":
+        return TxtAdapter(env, _with_format(ref, "text"))
+    if detected.kind == "image":
+        return ComicAdapter(env, _with_format(ref, GALLERY_FORMAT), recursive=recursive)
+    if detected.kind == "book":
+        spec = specs_mod.SPEC_BY_ID.get(detected.format)
+        if spec is None:
+            return None
+        reason = openable_reason(spec.id)
+        if reason:
+            raise UnsupportedFormatError(
+                f"{spec.id} 暂不可用：{reason}", reason=reason
+            )
+        return _build_adapter(env, _with_format(ref, spec.id), spec, recursive)
+    return None
 
 
 def create_adapter(env: AdapterEnv, ref: BookRef, *, recursive: bool = False) -> BookAdapter:
-    """创建适配器；统一做大小上限与后端可用性校验。"""
+    """创建适配器；统一做大小上限、后端可用性与嗅探兜底。"""
     # 压缩包内嵌套书（设计 7.6）：extra 携带解析好的链信息，由 archivebook
     # 解压/过滤后委托回常规适配器链。放在最前面：嵌套 ref 是虚拟的，
     # max_book_mb 与 format_for_ref 的目录判定都不适用于它。
@@ -185,21 +346,25 @@ def create_adapter(env: AdapterEnv, ref: BookRef, *, recursive: bool = False) ->
             f"文件超过单本上限 {max_mb}MB（{ref.size / 1048576:.1f}MB），已拒绝"
         )
     fmt = format_for_ref(ref)
-    reason = openable_reason(fmt)
-    if reason:
-        raise UnsupportedFormatError(f"{fmt} 暂不可用：{reason}", reason=reason)
-    cls = adapter_class_for(ref)
-    if cls is ComicAdapter:
+    spec = spec_of(fmt)
+    if spec is not None:
+        reason = openable_reason(fmt)
+        if reason:
+            raise UnsupportedFormatError(f"{fmt} 暂不可用：{reason}", reason=reason)
+        return _build_adapter(env, ref, spec, recursive)
+    if fmt == GALLERY_FORMAT:
         return ComicAdapter(env, ref, recursive=recursive)
-    if cls is EpubAdapter:
-        # EPUB：图片型（漫画，每页一图）按固定版式漫画打开（铺满屏幕），
-        # 文本型仍走流式排版 —— 分流由工厂内部检测决定
-        return open_epub_adapter(env, ref)
-    if cls is MobiAdapter:
-        # MOBI/AZW3：漫画型（图片为主）转 EPUB 后按固定版式漫画打开，
-        # 文本型仍走流式 EPUB —— 分流要看转换产物，由工厂内部决定
-        return open_mobi_adapter(env, ref)
-    return cls(env, ref)
+    if fmt == "text":
+        # 嗅探出来的纯文本伪格式（列表/索引里记为 "text"）
+        return TxtAdapter(env, ref)
+    if spec is None and not ref.virtual and not fmt:
+        sniffed = _sniff_adapter(env, ref, recursive)
+        if sniffed is not None:
+            return sniffed
+    raise UnsupportedFormatError(
+        f"不支持的格式: {fmt or ref.name}",
+        reason=f"不支持的文件类型 {fmt or ''}".strip(),
+    )
 
 
 def is_fixed_adapter(adapter: BookAdapter) -> bool:

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path, PurePosixPath
-from typing import List, Optional
+from typing import List, Optional, Sequence
 from urllib.parse import unquote
 
 
@@ -122,6 +122,28 @@ def ext_of(path_or_name: str) -> str:
     if idx <= 0:
         return ""
     return name[idx:].lower()
+
+
+# 复合扩展名（按长度降序匹配）：.tar.gz / .fb2.zip 这类要整体识别，
+# 否则 ext_of 只会给出末段（".gz" / ".zip"），格式判定会全错。
+COMPOUND_EXTS: Sequence[str] = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".fb2.zip",
+)
+
+
+def ext_key_of(path_or_name: str) -> str:
+    """格式判定用扩展名：优先复合扩展名（``x.tar.gz`` → ``.tar.gz``），否则同 ext_of。
+
+    不要替换 ``ext_of``：展示、stem 计算等仍应使用末段扩展名语义。
+    """
+    name = path_or_name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in COMPOUND_EXTS:
+        if len(name) > len(ext) and name.endswith(ext):
+            return ext
+    return ext_of(path_or_name)
 
 
 def stem_of(name: str) -> str:

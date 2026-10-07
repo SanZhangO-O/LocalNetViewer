@@ -13,9 +13,12 @@ from ..models.schemas import (
     FeaturesInfo,
     FontInfo,
     FontsResponse,
+    FormatInfo,
+    FormatsResponse,
     LibraryInfo,
     ServerInfoResponse,
 )
+from ..formats import registry
 from ..services.access import resolve_access
 from .deps import AuthDep, get_ctx
 from .errors import AppError
@@ -68,9 +71,22 @@ async def server_info(
             strip=True,
             progress_sync=True,
             archive_browse=bool(ctx.config.archive.browse),
+            media=True,
             strip_min_aspect=float(ctx.config.comic.strip_min_aspect),
         ),
         server_time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
+
+
+@router.get("/server/formats", response_model=FormatsResponse, dependencies=[AuthDep])
+async def server_formats(ctx=Depends(get_ctx)) -> FormatsResponse:
+    """格式能力清单（M5）：格式 id / 扩展名 / 预览模式 / 当前是否可用与原因。
+
+    客户端可用它做图标与"查看内容"入口判定；书库列表条目的 openable/reason
+    仍然以每个条目下发的值为准（与后端探测结果同源）。
+    """
+    return FormatsResponse(
+        formats=[FormatInfo(**info) for info in registry.format_infos()]
     )
 
 

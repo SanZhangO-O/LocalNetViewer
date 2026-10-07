@@ -39,6 +39,10 @@ async def list_files(
             gallery=GalleryInfo(**item["gallery"]) if item.get("gallery") else None,
             openable=bool(item.get("openable", True)),
             reason=item.get("reason"),
+            has_contents=bool(item.get("has_contents", False)),
+            media_kind=item.get("media_kind"),
+            stream_url=item.get("stream_url"),
+            mime=item.get("mime"),
         )
         for item in data.get("entries", [])
     ]

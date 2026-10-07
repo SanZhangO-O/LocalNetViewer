@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.Collections
 import androidx.compose.material.icons.filled.FirstPage
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -87,6 +88,7 @@ import com.zqr.localnetviewer.ui.common.formatSize
 fun BrowserScreen(
     onOpenBook: (String) -> Unit,
     onOpenArchive: (String) -> Unit = {},
+    onOpenMedia: (url: String, title: String, audioOnly: Boolean) -> Unit = { _, _, _ -> },
     onDisconnect: () -> Unit,
     overrideViewModel: BrowserViewModel? = null,
 ) {
@@ -98,6 +100,7 @@ fun BrowserScreen(
     )
     val state by vm.state.collectAsStateWithLifecycle()
     val openBook by vm.openBook.collectAsStateWithLifecycle()
+    val openMedia by vm.openMedia.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
     // 系统返回键 = 返回上一页（恢复离开时的页码与滚动位置）；无历史时回到上一级目录，
@@ -108,6 +111,12 @@ fun BrowserScreen(
         openBook?.let {
             vm.consumeOpenBook()
             onOpenBook(it)
+        }
+    }
+    LaunchedEffect(openMedia) {
+        openMedia?.let {
+            vm.consumeOpenMedia()
+            onOpenMedia(it.url, it.title, it.audioOnly)
         }
     }
     LaunchedEffect(state.message) {
@@ -397,6 +406,10 @@ private fun EntryRow(
                     append(if (count > 0) "文件夹 · $count 张图片" else "文件夹")
                 } else if (entry.isImageFile) {
                     append("图片")
+                } else if (entry.isMedia) {
+                    append(if (entry.isAudio) "音频" else "视频")
+                    val size = formatSize(entry.size)
+                    if (size.isNotEmpty()) append(" · ").append(size)
                 }
                 if (!entry.openable) {
                     append(" · ").append(entry.reason ?: "不可打开")
@@ -451,6 +464,7 @@ private fun EntryLeading(entry: FileEntryDto, coverUrl: String?) {
         }
         entry.isDir -> IconBox(Icons.Default.Folder)
         entry.isImageFile -> IconBox(Icons.Default.Image)
+        entry.isMedia -> IconBox(Icons.Default.PlayCircle)
         else -> IconBox(Icons.AutoMirrored.Filled.InsertDriveFile)
     }
 }

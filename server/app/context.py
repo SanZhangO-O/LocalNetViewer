@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
@@ -30,6 +31,7 @@ from .services.progress import ProgressStore
 from .services.search import SearchService
 from .services.watcher import LibraryWatcher
 from .util import imaging
+from .util.paths import is_safe_id
 from .api.errors import AppError
 
 logger = logging.getLogger("localnetviewer")
@@ -40,6 +42,9 @@ class AppContext:
         self.config = config
         ensure_dirs(config)
         imaging.set_pixel_limit(config.limits.max_source_pixels)
+        # M5：扩展名覆盖（library.ext_overrides）与可选图像解码插件（HEIC/JXL）
+        registry.configure_overrides(getattr(config.library, "ext_overrides", None))
+        imaging.register_optional_plugins()
 
         self.fonts = FontManager(config)
         self.parsed = ParsedCache(config)
@@ -94,11 +99,19 @@ class AppContext:
         try:
             stale = list(converted_dir.glob(f"{book_id}.*.epub*"))
             stale.append(converted_dir / f"{book_id}.epub")
+            # M5：LibreOffice 产物（lo/{book_id}.{rev}.{ext}）+ 临时目录
+            stale.extend((converted_dir / "lo").glob(f"{book_id}.*"))
             for path in stale:
                 try:
-                    path.unlink(missing_ok=True)
+                    if path.is_dir():
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        path.unlink(missing_ok=True)
                 except OSError:
                     pass
+            # M5：DjVu 逐页缓存（djvu/{book_id}/）
+            if is_safe_id(book_id):
+                shutil.rmtree(converted_dir / "djvu" / book_id, ignore_errors=True)
         except OSError:
             pass
         # 压缩包嵌套书（设计 7.6）：父压缩包内容变化 → 链上解压缓存全部作废

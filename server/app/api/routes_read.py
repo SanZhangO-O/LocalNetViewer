@@ -22,6 +22,7 @@ from ..models.schemas import (
 from ..render.jsonout import build_page_json
 from ..render.raster import fixed_page_bytes, render_flow_page, strip_page_bytes
 from ..services.access import AccessScope
+from ..util.httprange import parse_range_header
 from .deps import ScopeDep, get_ctx
 from .errors import AppError
 
@@ -158,33 +159,13 @@ def _slice_range(body: bytes, range_header: Optional[str]) -> Tuple[str, bytes, 
     - 语法无效（RFC 9110 要求**忽略**）→ ``none``，按 200 返回整页；
     - 语法有效但超出范围 → ``unsatisfiable``，按 416 返回。
     """
-    if not range_header or not range_header.lower().startswith("bytes="):
-        return "none", b"", ""
-    spec = range_header.split("=", 1)[1].split(",")[0].strip()
-    if "-" not in spec:
-        return "none", b"", ""
-    start_s, _, end_s = spec.partition("-")
     total = len(body)
-    try:
-        if start_s == "":
-            if end_s == "":
-                return "none", b"", ""
-            length = int(end_s)
-            start = max(0, total - length)
-            end = total - 1
-        else:
-            start = int(start_s)
-            end = int(end_s) if end_s else total - 1
-    except ValueError:
-        return "none", b"", ""
-    if start < 0 or end < 0:
-        return "none", b"", ""
-    if start >= total:
+    kind, start, end = parse_range_header(range_header, total)
+    if kind == "ok":
+        return "ok", body[start : end + 1], f"bytes {start}-{end}/{total}"
+    if kind == "unsatisfiable":
         return "unsatisfiable", b"", f"bytes */{total}"
-    end = min(end, total - 1)
-    if end < start:
-        return "unsatisfiable", b"", f"bytes */{total}"
-    return "ok", body[start : end + 1], f"bytes {start}-{end}/{total}"
+    return "none", b"", ""
 
 
 def _etag_matches(header_value: Optional[str], etag: str) -> bool:
