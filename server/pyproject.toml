@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "localnetviewer-server"
-version = "0.1.0"
+version = "0.7.0"
 description = "LocalNetViewer 局域网电子书阅读服务器（FastAPI + Pillow）"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" }
+license = { text = "GPL-3.0-or-later" }
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
@@ -29,15 +32,10 @@ dependencies = [
 sync = ["psutil>=5.9"]
 # 书库目录变化监听（P4 可选）
 watch = ["watchfiles>=0.21"]
-# 控制台二维码（P4 可选）
-qr = ["qrcode>=7.4"]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27", "fontTools>=4.47"]
 
 [tool.setuptools]
 packages = { find = { include = ["app*"] } }
-
-[tool.setuptools.package-data]
-app = ["assets/fonts/*", "assets/fonts/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

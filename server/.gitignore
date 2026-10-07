@@ -13,7 +13,10 @@ venv/
 # 因此从未进入版本控制，修复无处提交）。
 /cache/
 
-# 内置字体（体积大，自行放入 NotoSansSC-Regular.otf）
-app/assets/fonts/*.otf
-app/assets/fonts/*.ttf
-app/assets/fonts/*.ttc
+# 个人配置（真实书库路径 / 密码）：仓库里只提交 config.example.yaml 模板
+/config.yaml
+
+# 字体文件体积大且版权各异，自行放入 assets/fonts/（见该目录 README）
+/assets/fonts/*.otf
+/assets/fonts/*.ttf
+/assets/fonts/*.ttc

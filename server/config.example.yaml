@@ -1,9 +1,13 @@
-# LocalNetViewer 服务器配置（设计文档 4.2）
+# LocalNetViewer 服务器配置示例
+# 首次使用：复制本文件为 config.yaml 再修改（config.yaml 已被 .gitignore 忽略，
+# 不会被提交；留空缺省项服务器也能启动，只是没有书库）。
 # 所有相对路径均相对于本文件所在目录解析。
 
 server:
   name: LocalNetViewer
-  host: 0.0.0.0
+  # 安全默认只监听本机。要给手机/其它设备用，请显式改为 0.0.0.0（或具体网卡地址）；
+  # 对外监听且没有任何访问控制时，启动横幅会打印醒目警告。
+  host: 127.0.0.1
   port: 8765
   # 管理员令牌：留空则不启用；填写后客户端需携带 X-Auth-Token（可见全部书库）。
   # 书库级访问密码见 library.roots[].password（两者可同时使用）。
@@ -12,11 +16,11 @@ server:
 library:
   roots:
     - name: 我的书库
-      path: D:\Books
-      password: ""   # 访问密码：留空 = 公开书库；输入该密码才可见（只见该书库）
-    - name: Books
-      path: C:\Books
-      # password: ""        # 公开书库：不输入密码也能看到它
+      path: D:\Books        # ← 改成你的书库目录
+      password: ""          # 访问密码：留空 = 公开书库；填写后输入该密码才可见（只见该书库）
+    # - name: 漫画
+    #   path: E:\Comics
+    #   password: "some-password"
   include_ext: [".txt", ".epub", ".pdf", ".cbz", ".cbr", ".cb7", ".cbt", ".fb2", ".mobi", ".azw3"]
   show_all_files: false     # true 时列出所有文件，但非电子书不可打开
   sort: natural             # 目录优先 + 数字感知自然排序（当前仅支持 natural）
@@ -50,7 +54,7 @@ comic:
                                  # 避免上万张图时 /layout 逐张读图；0 = 不限制
 
 render:
-  fonts_dir: assets/fonts
+  fonts_dir: assets/fonts   # 相对配置文件所在目录，默认 server/assets/fonts（见该目录 README）
   default_font: NotoSansSC-Regular
   max_page_pixels: 4000000  # 单页最大像素数（防止内存爆炸）
   jpeg_for_photo_pages: true

@@ -276,6 +276,7 @@ server/
 ├─ pyproject.toml
 ├─ config.yaml
 ├─ run.py                     # python run.py --config config.yaml
+├─ assets/fonts/              # NotoSansSC-Regular.otf 等（render.fonts_dir 默认值）
 └─ app/
    ├─ main.py                 # FastAPI 装配、路由注册、生命周期
    ├─ config.py               # 配置加载与校验
@@ -307,7 +308,7 @@ server/
    │  └─ jsonout.py           # JSON 模式序列化
    ├─ models/
    │  └─ schemas.py           # Pydantic DTO
-   └─ assets/fonts/           # NotoSansSC-Regular.otf 等
+
 ```
 
 ### 4.4 统一文档模型（DocumentModel）
@@ -461,7 +462,7 @@ python run.py --config config.yaml
 启动时打印：
 
 ```
-LocalNetViewer Server v0.1
+LocalNetViewer Server v0.7.0
 书库: 我的书库 (D:/Books, 123 本)  [扫描完成]
 可用地址:
   http://192.168.1.10:8765   (以太网, 推荐)

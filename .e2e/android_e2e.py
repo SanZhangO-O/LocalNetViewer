@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -22,7 +23,16 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-SDK = Path(r"C:\Users\***REMOVED***\AppData\Local\Android\Sdk")
+
+def _default_sdk() -> Path:
+    env = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if env:
+        return Path(env)
+    # Windows 上 SDK Manager 的默认安装位置（随 Android Studio 安装）
+    return Path.home() / "AppData" / "Local" / "Android" / "Sdk"
+
+
+SDK = _default_sdk()
 ADB = SDK / "platform-tools" / "adb.exe"
 APK = Path(__file__).resolve().parent.parent / "android" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
 SHOTS = Path(__file__).resolve().parent / "shots"

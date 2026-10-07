@@ -63,9 +63,8 @@ def create_app(
         # ebook-convert），必须留出 IO 余量——只按 CPU 核数取 4 时，几个慢打开
         # 就能占满全部 worker，饿死所有人的翻页。下限 8 兼顾两者。
         # 超时执行器（util.concurrency）是独立实现，不受影响。
-        asyncio.get_running_loop().set_default_executor(
-            ThreadPoolExecutor(max_workers=max(8, os.cpu_count() or 4))
-        )
+        executor = ThreadPoolExecutor(max_workers=max(8, os.cpu_count() or 4))
+        asyncio.get_running_loop().set_default_executor(executor)
         # lazy 模式（library.scan_mode=lazy，默认）不做任何全量扫描：索引由 /files
         # 按目录增量补齐，因此不启动后台扫描任务。
         effective_scan = background_scan and cfg.library.scan_mode != "lazy"
@@ -106,6 +105,9 @@ def create_app(
             await asyncio.to_thread(ctx.library.save_index)
             # 进度落盘是合并写入的，关停时必须强制刷一次，否则最后几次翻页会丢
             await asyncio.to_thread(ctx.progress.flush)
+            # 显式关停默认线程池：不排队的新任务直接取消；已在跑的线程不等待
+            # （wait=True 会拖住关停），剩余句柄由 GC 兜底
+            executor.shutdown(wait=False, cancel_futures=True)
             logger.info("服务器已停止")
 
     app = FastAPI(

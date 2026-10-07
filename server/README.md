@@ -10,8 +10,8 @@ cd server
 python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
-:: 可选：网卡名称识别 / 书库目录监听 / 二维码
-pip install -e ".[sync,watch,qr]"
+:: 可选：网卡名称识别 / 书库目录监听
+pip install -e ".[sync,watch]"
 ```
 
 Linux / macOS:
@@ -24,11 +24,12 @@ pip install -e .
 
 ## 配置
 
-编辑 `config.yaml`（关键项）：
+首次使用：复制 `config.example.yaml` 为 `config.yaml` 再修改（`config.yaml`
+含你的真实书库路径与密码，已被 `.gitignore` 忽略，不会提交）。关键项：
 
 | 项 | 说明 |
 |---|---|
-| `server.host` / `server.port` | 监听地址与端口（默认 `0.0.0.0:8765`） |
+| `server.host` / `server.port` | 监听地址与端口（默认 `127.0.0.1:8765` 仅本机；要给手机用请显式改为 `0.0.0.0` 或具体网卡地址） |
 | `server.auth_token` | 留空不需要令牌；填写后客户端需带 `X-Auth-Token` |
 | `library.roots` | 书库根目录列表，`name` 即虚拟路径第一段 |
 | `library.include_ext` | 参与索引的扩展名 |
@@ -43,11 +44,12 @@ pip install -e .
 
 ## 字体（重要）
 
-服务器需要中文字体才能正确渲染中文。请把字体文件放入 `app/assets/fonts/`：
+服务器需要中文字体才能正确渲染中文。请把字体文件放入 `assets/fonts/`
+（相对 `config.yaml` 所在目录解析，默认即 `server/assets/fonts/`，详见该目录 README）：
 
 ```
-app/assets/fonts/NotoSansSC-Regular.otf
-app/assets/fonts/NotoSansSC-Bold.otf      # 可选
+assets/fonts/NotoSansSC-Regular.otf
+assets/fonts/NotoSansSC-Bold.otf      # 可选
 ```
 
 未提供时服务器会退回系统字体（Windows 的微软雅黑 / Linux 的 Noto CJK / macOS 的
@@ -62,7 +64,7 @@ python run.py --config config.yaml
 启动信息示例：
 
 ```
-LocalNetViewer Server v0.1
+LocalNetViewer Server v0.7.0
 书库: 我的书库 (D:/Books, 123 本)  [扫描完成]
 字体: NotoSansSC-Regular（3 个可用）
 令牌: 未启用
@@ -104,8 +106,9 @@ Base URL `http://<host>:8765/api/v1`，交互式文档见 `http://<host>:8765/do
 ```
 server/
 ├─ pyproject.toml
-├─ config.yaml
+├─ config.example.yaml     # 配置模板（复制为 config.yaml 使用）
 ├─ run.py                  # 启动入口
+├─ assets/fonts/           # 字体放置处（render.fonts_dir 默认值）
 └─ app/
    ├─ main.py              # FastAPI 装配、路由注册、生命周期
    ├─ context.py           # 依赖容器（服务/缓存/字体装配）
@@ -118,8 +121,7 @@ server/
    ├─ render/              # raster（Pillow 栅格化）/ jsonout（JSON 模式）
    ├─ cache/               # 解析 / 布局 / 页面 三级缓存
    ├─ models/schemas.py    # HTTP 契约（Pydantic DTO）
-   ├─ util/                # 路径安全 / 自然排序 / 文本 / 图像 / 并发 / XML
-   └─ assets/fonts/        # 内置字体放置处
+   └─ util/                # 路径安全 / 自然排序 / 文本 / 图像 / 并发 / XML
 ```
 
 ## 运行期目录（`cache/`）
@@ -131,6 +133,7 @@ server/
 | `cache/layouts/{book_id}/` | 布局缓存（LayoutProfile + PageMap，重启后 layout_id 仍有效） |
 | `cache/galleries.json` | 文件夹图集虚拟书注册表 |
 | `cache/converted/` | MOBI/AZW3 经 Calibre 转换出的 EPUB |
+| `cache/extracted/` | 压缩包嵌套书的条目解压缓存（设计 7.6，按配额 LRU） |
 | `cache/progress.json` | 服务器端进度同步（可选功能） |
 
 页面图片只缓存在内存（LRU，字节 + 张数双上限），客户端 Coil 磁盘缓存兜底。
@@ -141,3 +144,14 @@ server/
 - 只读服务：除可选的进度同步外没有写入端点；路径穿越、zip-slip、图片炸弹均有防护。
 - 设计文档第 11 章列出的可选后端（CBR 需 `unrar`/`bsdtar`，CB7 需 `py7zr`，
   MOBI/AZW3 需 Calibre）在缺失时不影响其它格式，列表会把对应条目标记为不可打开。
+
+## 安全提示
+
+- 本项目面向**可信局域网**设计，客户端与服务器之间是明文 HTTP，同网络的设备
+  可以嗅探传输内容；请勿映射到公网。
+- 访问密码 / 令牌在客户端以明文存储在应用私有数据目录（已排除云备份与设备迁移），
+  请勿使用与其它服务相同的重要密码。
+
+## 许可
+
+本项目以 [GPL-3.0-or-later](../LICENSE) 许可发布（见仓库根目录 LICENSE）。

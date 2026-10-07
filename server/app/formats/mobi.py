@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ import threading
 from pathlib import Path
 from typing import Optional, Tuple
 
+from ..util.concurrency import KeyedLocks
 from ..util.paths import makedirs_quiet
 from .base import (
     AdapterEnv,
@@ -31,6 +33,8 @@ from .base import (
 from .epub import EpubAdapter
 from .imagebook import EpubComicAdapter, image_book_info, scan_image_book
 
+logger = logging.getLogger("localnetviewer.formats.mobi")
+
 CONVERT_TIMEOUT_FACTOR = 4.0
 
 # ``cache/converted`` 的总量上限：转换产物是"一次性"缓存，不设上限会被
@@ -38,9 +42,9 @@ CONVERT_TIMEOUT_FACTOR = 4.0
 CONVERTED_CACHE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 
 # 每本书一把锁：并发首次打开同一本 MOBI 时，第二个请求会等第一个转换完，
-# 而不是同时往同一个目标文件写（互相读到半成品 EPUB）
-_CONVERT_LOCKS: dict = {}
-_CONVERT_LOCKS_GUARD = threading.Lock()
+# 而不是同时往同一个目标文件写（互相读到半成品 EPUB）。
+# KeyedLocks 按引用计数回收不用的锁：dict 里每书一把锁永不回收会无限增长。
+_CONVERT_LOCKS = KeyedLocks()
 
 # 清理串行化：启动清理与转换后清理可能并发，避免同时删同一批文件
 _SWEEP_LOCK = threading.Lock()
@@ -91,15 +95,6 @@ def sweep_converted_cache(
             except OSError:
                 continue
         return removed
-
-
-def _lock_for(key: str) -> threading.Lock:
-    with _CONVERT_LOCKS_GUARD:
-        lock = _CONVERT_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _CONVERT_LOCKS[key] = lock
-        return lock
 
 
 def calibre_available() -> Optional[str]:
@@ -160,7 +155,7 @@ class MobiAdapter(FlowAdapter):
         ``os.replace``** —— 否则第二个请求可能在第一个请求写到一半时就把目标文件
         当成成品 EPUB 打开，解析出残缺内容。
         """
-        with _lock_for(str(target)):
+        with _CONVERT_LOCKS.acquire(str(target)):
             if _is_usable(target):
                 return  # 等锁期间别人已经转好了
             exe = calibre_available()
@@ -189,9 +184,14 @@ class MobiAdapter(FlowAdapter):
                 _unlink_quiet(tmp)
                 raise ParseError(f"Calibre 转换无法执行: {exc}") from exc
             if proc.returncode != 0 or not _is_usable(tmp):
-                detail = (proc.stderr or b"").decode("utf-8", errors="replace")[-500:]
+                # Calibre 的 stderr 可能带出本机路径等环境信息：完整内容只进
+                # 服务器日志，客户端只拿到退出码，避免向 LAN 内其它设备泄露
+                detail = (proc.stderr or b"").decode("utf-8", errors="replace")[-2000:]
+                logger.warning("Calibre 转换失败（exit=%s）: %s\n%s", proc.returncode, ref.vpath, detail)
                 _unlink_quiet(tmp)
-                raise ParseError(f"Calibre 转换失败（exit={proc.returncode}）: {detail}")
+                raise ParseError(
+                    f"Calibre 转换失败（exit={proc.returncode}），详情见服务器日志"
+                )
             try:
                 os.replace(tmp, target)
             except OSError as exc:

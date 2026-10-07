@@ -22,15 +22,16 @@ cd server
 python -m venv .venv
 .venv\Scripts\activate
 pip install -e .
-:: 把中文字体放到 server\app\assets\fonts\NotoSansSC-Regular.otf（见该目录 README）
-:: 编辑 config.yaml，把 library.roots 指向你的书库目录
+copy config.example.yaml config.yaml
+:: 把中文字体放到 server\assets\fonts\NotoSansSC-Regular.otf（见该目录 README）
+:: 编辑 config.yaml，把 library.roots 指向你的书库目录（对外提供服务时设 host: 0.0.0.0）
 python run.py --config config.yaml
 ```
 
 启动信息会列出所有可用地址（多网卡 / VPN 会标注类型），例如：
 
 ```
-LocalNetViewer Server v0.1
+LocalNetViewer Server v0.7.0
 书库: 我的书库 (D:/Books, 123 本)  [扫描完成]
 
 可用地址:
@@ -40,6 +41,10 @@ LocalNetViewer Server v0.1
 交互式接口文档：`http://<服务器IP>:8765/docs`。
 
 ### 2. Android 客户端
+
+前置要求：JDK 17+（首次构建会通过 foojay 解析器自动下载 Gradle 工具链所需的
+JDK 21）、首次构建需要联网（下载 Gradle 发行版与依赖）。已配置
+`local.properties` 的机器忽略 `sdk.dir` 指向不存在的路径时请删除该文件或修正。
 
 用 Android Studio 打开 `android/`，或命令行构建：
 
@@ -52,6 +57,10 @@ gradlew.bat assembleDebug
 按需填写访问密码：`library.roots[].password` 为书库级密码（输入某书库密码只看到该书库
 与公开书库），`server.auth_token` 为管理员令牌（看到全部书库）。历史地址按"地址 + 密码"
 分别记录，可用不同密码连接同一服务器的不同书库。
+
+> **安全须知**：本项目面向可信局域网。客户端与服务器之间是明文 HTTP（同网络设备
+> 可嗅探），访问密码在客户端以明文存储在应用私有目录（已排除云备份与设备迁移），
+> 请勿复用重要密码，也不要把服务映射到公网。
 
 ## 核心约束与设计取舍
 
@@ -121,7 +130,12 @@ cd server
 
 > **中文字体**：服务器会优先挑选系统里真正含中文字形的字体（Windows 的微软雅黑 / 等线、
 > macOS 的苹方等），因此开箱即可显示中文。若要固定观感，把 Noto Sans SC 放到
-> `server/app/assets/fonts/`（见该目录 README），它会被优先选中。
+> `server/assets/fonts/`（见该目录 README），它会被优先选中。
 
 端到端联调清单（真机手测）：打开书 → 连续翻页 → 改字号 → 横竖屏 → 断网重连 →
 服务器重启后继续阅读 → 文件夹作为图集打开 → 漫画方向/适应模式 → 搜索跳页。
+
+## 许可
+
+本项目以 [GPL-3.0-or-later](LICENSE) 许可发布：你可以自由使用、学习、修改和再分发，
+再分发时须同样以 GPL-3.0-or-later 许可并保留版权声明，无任何担保。

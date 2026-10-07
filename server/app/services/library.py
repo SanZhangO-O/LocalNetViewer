@@ -108,6 +108,9 @@ class LibraryService:
         self._generation: int = 0
         self._last_save: float = 0.0
         self._warnings: List[str] = []
+        # _warnings 由扫描线程整体替换、由请求线程读取：替换/拷贝必须成对加锁，
+        # 否则 list() 拷贝到一半被整体替换，读到的可能新旧混杂
+        self._warnings_lock = threading.Lock()
         # 内容变化监听者：由 AppContext 注入"清空派生缓存"的回调
         self._content_listeners: List[Callable[[str], None]] = []
 
@@ -132,7 +135,8 @@ class LibraryService:
         except FileNotFoundError:
             return
         except (OSError, json.JSONDecodeError, ValueError):
-            self._warnings.append(f"索引文件损坏，已忽略: {path}")
+            with self._warnings_lock:
+                self._warnings.append(f"索引文件损坏，已忽略: {path}")
             return
         if int(data.get("version", 0)) != INDEX_VERSION:
             return
@@ -210,7 +214,8 @@ class LibraryService:
 
     @property
     def warnings(self) -> List[str]:
-        return list(self._warnings)
+        with self._warnings_lock:
+            return list(self._warnings)
 
     def book_count(self) -> int:
         with self._lock:
@@ -273,7 +278,8 @@ class LibraryService:
                 self._by_id = {str(v["book_id"]): k for k, v in books.items()}
                 self._gallery_counts = counts
                 self._scanned_at = time.time()
-                self._warnings = warnings
+                with self._warnings_lock:
+                    self._warnings = warnings
                 # 只有索引内容真的变化才标 dirty：watcher 的事件驱动重扫可能每几秒
                 # 一次，no-op 扫描不能跟着做一次全量 json.dumps（在锁内，会卡请求
                 # 线程）+ 全文件重写。请求线程自行标的 dirty 保持不变。
@@ -965,13 +971,15 @@ class LibraryService:
     # ------------------------------------------------------------ 统计
     def index_stats(self) -> Dict[str, Any]:
         with self._lock:
-            return {
+            stats = {
                 "books": len(self._books),
                 "gallery_dirs": len(self._gallery_counts),
                 "scanned_at": self._scanned_at,
                 "scanning": self._scanning.is_set(),
-                "warnings": list(self._warnings),
             }
+        with self._warnings_lock:
+            stats["warnings"] = list(self._warnings)
+        return stats
 
 
 def _rollup_gallery_counts(counts: Dict[str, Dict[str, Any]]) -> None:

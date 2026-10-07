@@ -22,6 +22,7 @@ import hashlib
 import os
 import posixpath
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -38,6 +39,12 @@ from .comics import (
 
 # 解压文件名长度上限（留出路径余量）
 _NAME_MAX = 120
+
+# 运行期 sweep 节流：sweep_extract_cache 每次要遍历整棵 extracted 树算总量，
+# 嵌套书解压高峰期不能每次写入都全树扫描；60s 一次足够控盘
+_EXTRACT_SWEEP_INTERVAL_S = 60.0
+_EXTRACT_SWEEP_LOCK = threading.Lock()
+_LAST_EXTRACT_SWEEP = -_EXTRACT_SWEEP_INTERVAL_S
 
 _WINDOWS_RESERVED = {
     "con",
@@ -103,6 +110,7 @@ def extract_entry_to_cache(
         os.replace(tmp, target)
     except OSError as exc:
         raise ParseError(f"压缩包条目解压失败 {entry}: {exc}") from exc
+    _sweep_extract_cache_throttled(env.config)
     return target
 
 
@@ -268,6 +276,25 @@ def create_archive_adapter(env: AdapterEnv, ref: BookRef) -> BookAdapter:
     from . import registry as registry_mod  # noqa: PLC0415 - 延迟导入避免循环
 
     return registry_mod.create_adapter(env, synth)
+
+
+def _sweep_extract_cache_throttled(config) -> None:
+    """解压写入后的运行期配额检查（节流版 sweep）。
+
+    启动 sweep 只跑一次；长运行的服务会持续往 cache/extracted 写新嵌套书，
+    不补运行期检查就会无限增长。节流到 ``_EXTRACT_SWEEP_INTERVAL_S`` 一次，
+    失败静默（与启动 sweep 同语义：淘汰失败只是多占磁盘，不影响服务）。
+    """
+    global _LAST_EXTRACT_SWEEP
+    now = time.monotonic()
+    with _EXTRACT_SWEEP_LOCK:
+        if now - _LAST_EXTRACT_SWEEP < _EXTRACT_SWEEP_INTERVAL_S:
+            return
+        _LAST_EXTRACT_SWEEP = now
+    try:
+        sweep_extract_cache(config)
+    except Exception:  # noqa: BLE001 - 配额清理失败不影响解压主流程
+        pass
 
 
 def sweep_extract_cache(config) -> int:

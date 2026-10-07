@@ -7,12 +7,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger("localnetviewer.config")
 
 DEFAULT_INCLUDE_EXT = [
     ".txt",
@@ -322,6 +325,7 @@ def ensure_dirs(cfg: AppConfig) -> None:
     for d in (cfg.cache_dir, cfg.parsed_cache_dir, cfg.layouts_cache_dir, cfg.fonts_dir):
         try:
             d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            # 只读介质 / 权限问题不应阻止服务器启动，缓存层会自行降级
-            pass
+        except OSError as exc:
+            # 只读介质 / 权限问题不应阻止服务器启动，缓存层会自行降级，
+            # 但必须留一条日志，否则用户只会看到"缓存不生效"而无线索
+            logger.warning("目录无法创建（缓存/字体可能不可用）: %s (%s)", d, exc)

@@ -5,3 +5,8 @@
 .e2e/shots/
 .e2e/*.log
 .e2e/server-config.yaml
+
+# 操作系统垃圾文件
+Thumbs.db
+.DS_Store
+desktop.ini
