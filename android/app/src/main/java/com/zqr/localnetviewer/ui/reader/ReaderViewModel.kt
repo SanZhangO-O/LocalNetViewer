@@ -31,8 +31,10 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 阅读器状态机（设计 6.4 / 6.5）。
@@ -71,6 +73,10 @@ class ReaderViewModel(
         val chapters: List<ChapterInfoDto> = emptyList(),
         val settings: AppSettings = AppSettings.DEFAULT,
         val fonts: List<FontInfoDto> = emptyList(),
+        /** 服务器声明支持 JSON 页（`render_support.json`，旧服务器为 false）。 */
+        val renderSupportJson: Boolean = false,
+        /** 文字直发模式：页号 → 页面 JSON 状态（服务器渲染模式下恒为空）。 */
+        val textPages: Map<Int, TextPageState> = emptyMap(),
         val loading: Boolean = true,
         val preparing: Boolean = false,
         val error: String? = null,
@@ -92,6 +98,17 @@ class ReaderViewModel(
         val reverseLayout: Boolean
             get() = isFixed && settings.readingDirection == ReadingDirection.RTL.id
         val canRender: Boolean get() = layoutId != null && totalPages > 0
+
+        /** 服务器与当前书籍是否支持文字直发（flow 且服务器支持 JSON 页）。 */
+        val textSupported: Boolean get() = mode == "flow" && renderSupportJson
+
+        /**
+         * 文字直发是否真正生效：用户选了"文字直发"且书/服务器支持。
+         *
+         * "尽量"语义：不满足条件时自动回退为服务器渲染的 PNG 页，阅读不中断。
+         */
+        val textRenderActive: Boolean
+            get() = textSupported && settings.pageRenderMode == AppSettings.RENDER_TEXT
 
         /**
          * 双页跨页时一次翻两页。
@@ -133,6 +150,9 @@ class ReaderViewModel(
     private var anchorPage: Int = 0
     private var metaLoaded = false
     private var initialLayoutStarted = false
+
+    /** 自动重建守卫：文字直发的预取在 IO 域也会触发 [recoverLayout]，必须保证可见性。 */
+    @Volatile
     private var recovering = false
 
     private var relayoutJob: Job? = null
@@ -144,6 +164,12 @@ class ReaderViewModel(
     private val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val prefetchSlots = Semaphore(PREFETCH_CONCURRENCY)
     private var prefetchJob: Job? = null
+
+    /**
+     * 文字直发在途请求集合（页号）：去重与"取消后重取"都依据它，
+     * 不能看 UI 状态里的 [TextPageState.Loading]（取消会留下残影）。
+     */
+    private val textInFlight: MutableSet<Int> = ConcurrentHashMap.newKeySet()
 
     /** 当前搜索结果对应的 layout_id：重排后旧页码失效，需要用锚点重新定位。 */
     private var searchLayoutId: String? = null
@@ -181,6 +207,7 @@ class ReaderViewModel(
                     mode = meta.mode,
                     revision = meta.revision,
                     chapters = meta.chapters,
+                    renderSupportJson = meta.renderSupport.json,
                     loading = true,
                     error = null,
                     errorCode = null,
@@ -310,6 +337,8 @@ class ReaderViewModel(
                     mode = layout.mode,
                     chapters = chapters,
                     currentPage = target.coerceIn(1, total),
+                    // 新 layout 下旧页 JSON 的页码/内容都不再对应，整体作废
+                    textPages = emptyMap(),
                     preparing = false,
                     loading = false,
                     error = null,
@@ -374,6 +403,8 @@ class ReaderViewModel(
     fun onPageSettled(page: Int, immediate: Boolean = false) {
         if (page < 1) return
         _state.update { if (it.currentPage == page) it else it.copy(currentPage = page) }
+        // 文字直发：当前页立即取 JSON（不等 300ms 防抖；预取已命中则这里直接跳过）
+        if (_state.value.textRenderActive) requestTextPage(page)
         settleJob?.cancel()
         settleJob = viewModelScope.launch {
             if (!immediate) delay(SETTLE_DEBOUNCE_MS)
@@ -424,24 +455,31 @@ class ReaderViewModel(
         }
     }
 
-    /** 服务器重启 / 缓存淘汰后的自动恢复（设计 6.4：用户无感）。 */
+    /**
+     * 服务器重启 / 缓存淘汰后的自动恢复（设计 6.4：用户无感）。
+     *
+     * 文字直发的失败路径可能在 IO 域（预取）触发恢复，而 [relayoutJob] / [recovering]
+     * 与 scheduleRelayout 共享：统一切到主线程，保证守卫与任务句柄的单线程读改写。
+     */
     private fun recoverLayout(message: String) {
-        if (recovering) return
-        recovering = true
-        val snapshot = _state.value
-        val ratio = ratioFor(snapshot.currentPage, snapshot.totalPages)
-        _state.update { it.copy(message = message) }
-        // 与 scheduleRelayout 共用同一个 relayoutJob：用户改设置/旋转触发的重排
-        // 会取消正在进行的恢复，避免两份不同参数的 /layout 响应互相覆盖
-        relayoutJob?.cancel()
-        relayoutJob = viewModelScope.launch {
-            try {
-                rebuildLayout(
-                    anchorOverride = sessionAnchor() ?: restoreAnchor,
-                    ratioFallback = ratio,
-                )
-            } finally {
-                recovering = false
+        viewModelScope.launch {
+            if (recovering) return@launch
+            recovering = true
+            // 与 scheduleRelayout 共用同一个 relayoutJob：用户改设置/旋转触发的重排
+            // 会取消正在进行的恢复，避免两份不同参数的 /layout 响应互相覆盖
+            relayoutJob?.cancel()
+            relayoutJob = viewModelScope.launch {
+                val snapshot = _state.value
+                val ratio = ratioFor(snapshot.currentPage, snapshot.totalPages)
+                _state.update { it.copy(message = message) }
+                try {
+                    rebuildLayout(
+                        anchorOverride = sessionAnchor() ?: restoreAnchor,
+                        ratioFallback = ratio,
+                    )
+                } finally {
+                    recovering = false
+                }
             }
         }
     }
@@ -488,6 +526,24 @@ class ReaderViewModel(
     private fun prefetchAround(page: Int) {
         val snapshot = _state.value
         if (snapshot.layoutId == null || snapshot.totalPages <= 0) return
+        // 文字直发：预取 JSON（体积小），不再为同一页拉 PNG 图片；
+        // 与 PNG 预取共用同一个 job + 信号量：翻页取消未开始的预取、限并发 2
+        if (snapshot.textRenderActive) {
+            val targets = ArrayList<Int>(4)
+            for (delta in intArrayOf(1, -1, 2, -2)) {
+                val target = page + delta
+                if (target < 1 || target > snapshot.totalPages) continue
+                targets.add(target)
+            }
+            prefetchJob?.cancel()
+            if (targets.isEmpty()) return
+            prefetchJob = prefetchScope.launch {
+                for (target in targets) {
+                    prefetchSlots.withPermit { prefetchTextPage(target) }
+                }
+            }
+            return
+        }
         val app = getApplication<App>()
         val loader = app.imageLoader
         // 与屏上 AsyncImage 相同的目标尺寸（视口像素）：Coil 内存缓存键包含 size，
@@ -521,6 +577,170 @@ class ReaderViewModel(
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------ 文字直发
+    /**
+     * 取一页 JSON（设计 3.2）：当前页 / 失败重试走这里（ViewModel 域）。
+     *
+     * 预取走 [prefetchTextPage]（独立 scope + 信号量，翻页可取消）。
+     */
+    private fun requestTextPage(page: Int, force: Boolean = false) {
+        if (!startTextPageFetch(page, force)) return
+        viewModelScope.launch { fetchTextPage(page) }
+    }
+
+    /** 后台预取一页 JSON：失败静默（翻到该页时会重新请求）。 */
+    private suspend fun prefetchTextPage(page: Int) {
+        if (!startTextPageFetch(page)) return
+        fetchTextPage(page)
+    }
+
+    /**
+     * 登记"该页开始加载"。
+     *
+     * 去重依据是 [textInFlight]（真实在途请求）而不是 UI 里的 [TextPageState.Loading]：
+     * 预取任务被翻页取消时状态可能残留 Loading，若拿它当"在途"就会永久拒绝重取
+     * （页面无限转圈且没有重试入口）。页码越界、layout 未就绪、[force] 场景外已有
+     * 内容时一律不取。
+     */
+    private fun startTextPageFetch(page: Int, force: Boolean = false): Boolean {
+        val snapshot = _state.value
+        if (!snapshot.textRenderActive) return false
+        if (page < 1 || (snapshot.totalPages > 0 && page > snapshot.totalPages)) return false
+        if (snapshot.layoutId == null) return false
+        if (!force && snapshot.textPages[page] is TextPageState.Ready) return false
+        if (!textInFlight.add(page)) return false
+        _state.update { state ->
+            state.copy(
+                textPages = pruneTextPages(
+                    state.textPages + (page to TextPageState.Loading),
+                    state.currentPage,
+                )
+            )
+        }
+        return true
+    }
+
+    /**
+     * 拉取并落状态。
+     *
+     * - 响应回来时 layout 已重建 / 已切回服务器渲染则丢弃；若该页仍是当前页，
+     *   立即按新 layout 重新取（否则重排后回到当前页会只剩一个永远转圈的占位）；
+     * - 预取被取消时清掉 Loading 残影并做同样的重取；
+     * - layout 失效 / 页码越界与 PNG 模式同路径：触发自动重建，用户无感。
+     */
+    private suspend fun fetchTextPage(page: Int) {
+        val layoutId = _state.value.layoutId ?: run {
+            textInFlight.remove(page)
+            return
+        }
+        try {
+            val pageJson = readerRepository.flowPage(bookId, page, layoutId)
+            textInFlight.remove(page)
+            val now = _state.value
+            if (now.layoutId != layoutId || !now.textRenderActive) {
+                reRequestTextPageIfCurrent(page, now)
+                return
+            }
+            _state.update { state ->
+                state.copy(
+                    textPages = pruneTextPages(
+                        state.textPages + (page to TextPageState.Ready(pageJson)),
+                        state.currentPage,
+                    )
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            textInFlight.remove(page)
+            _state.update { state ->
+                if (state.textPages[page] is TextPageState.Loading) {
+                    state.copy(textPages = state.textPages - page)
+                } else {
+                    state
+                }
+            }
+            reRequestTextPageIfCurrent(page, _state.value)
+            throw cancelled
+        } catch (error: ApiException) {
+            textInFlight.remove(page)
+            val now = _state.value
+            if (now.layoutId != layoutId || !now.textRenderActive) {
+                reRequestTextPageIfCurrent(page, now)
+                return
+            }
+            when {
+                error.isLayoutLost || error.isPageOutOfRange ||
+                    error.code == ApiException.CODE_NOT_FOUND -> {
+                    // 不直接删条目：自动重建失败（断网）时删除会退化成"永远转圈、没有重试入口"。
+                    // 留给 Failed 占位；重建成功会整体清空 textPages 并自动重取。
+                    _state.update { state ->
+                        state.copy(
+                            textPages = pruneTextPages(
+                                state.textPages + (
+                                    page to TextPageState.Failed("排版已失效，正在自动重建")
+                                ),
+                                state.currentPage,
+                            )
+                        )
+                    }
+                    recoverLayout("布局缓存已失效，正在自动重建")
+                }
+                else -> _state.update { state ->
+                    state.copy(
+                        textPages = pruneTextPages(
+                            state.textPages + (page to TextPageState.Failed(error.message)),
+                            state.currentPage,
+                        )
+                    )
+                }
+            }
+        } catch (error: Exception) {
+            // 预取在 IO 域运行：非 ApiException 不能把协程炸掉；过期 layout 的失败同样丢弃
+            textInFlight.remove(page)
+            val now = _state.value
+            if (now.layoutId != layoutId || !now.textRenderActive) {
+                reRequestTextPageIfCurrent(page, now)
+                return
+            }
+            _state.update { state ->
+                state.copy(
+                    textPages = pruneTextPages(
+                        state.textPages + (page to TextPageState.Failed(error.message ?: "取页失败")),
+                        state.currentPage,
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * 作废的响应（旧 layout / 已切模式）丢弃后，若该页还是当前页则用新 layout 重取。
+     *
+     * 在途请求不能阻塞重排后的重取：重排会清空 [UiState.textPages]，而重排完成时
+     * `onPageSettled` 的请求会被在途去重挡下，必须由这里补一次。
+     */
+    private fun reRequestTextPageIfCurrent(page: Int, snapshot: UiState) {
+        if (snapshot.textRenderActive && snapshot.currentPage == page) {
+            requestTextPage(page)
+        }
+    }
+
+    /** 文字直发模式下的整页重试（页面失败占位上调用）。 */
+    fun retryTextPage(page: Int) {
+        requestTextPage(page, force = true)
+    }
+
+    /** 页缓存上限：只保留离当前页最近的 N 页，避免长时间阅读把整本 JSON 攒在内存里。 */
+    private fun pruneTextPages(
+        pages: Map<Int, TextPageState>,
+        currentPage: Int,
+    ): Map<Int, TextPageState> {
+        if (pages.size <= TEXT_CACHE_PAGES) return pages
+        return pages.entries
+            .sortedBy { abs(it.key - currentPage) }
+            .take(TEXT_CACHE_PAGES)
+            .associate { it.key to it.value }
     }
 
     // ------------------------------------------------------------ URL
@@ -567,6 +787,16 @@ class ReaderViewModel(
         }
         // 落盘失败不影响本次阅读（内存中的设置已生效）
         viewModelScope.launch { runCatchingIo { settingsStore.update { new } } }
+        // 页面模式切换：旧模式的页数据（JSON / PNG URL）都不再适用
+        if (old.pageRenderMode != new.pageRenderMode) {
+            // 预取只服务于旧模式：继续跑只会把结果写进已清空的缓存
+            prefetchJob?.cancel()
+            _state.update { it.copy(textPages = emptyMap()) }
+            // 切到文字直发需要立刻取当前页；切回服务器渲染由 URL 变化自然重载
+            if (_state.value.textRenderActive) {
+                onPageSettled(_state.value.currentPage, immediate = true)
+            }
+        }
         val geometryChanged = old.geometrySignature() != new.geometrySignature()
         if (geometryChanged) {
             scheduleRelayout(300)
@@ -793,5 +1023,8 @@ class ReaderViewModel(
 
         /** 预取并发上限（设计 6.4 要求 2–3）。 */
         const val PREFETCH_CONCURRENCY = 2
+
+        /** 文字直发页缓存上限（页号离当前页最近优先保留）。 */
+        const val TEXT_CACHE_PAGES = 12
     }
 }

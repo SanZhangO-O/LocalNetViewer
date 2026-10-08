@@ -8,6 +8,7 @@ import com.zqr.localnetviewer.data.net.dto.FontsResponseDto
 import com.zqr.localnetviewer.data.net.dto.LayoutProfileDto
 import com.zqr.localnetviewer.data.net.dto.LayoutResponseDto
 import com.zqr.localnetviewer.data.net.dto.LocateResponseDto
+import com.zqr.localnetviewer.data.net.dto.PageJsonDto
 import com.zqr.localnetviewer.data.net.dto.PageMetaDto
 import com.zqr.localnetviewer.data.net.dto.ProgressDto
 import com.zqr.localnetviewer.data.net.dto.ProgressPutDto
@@ -28,6 +29,10 @@ class ReaderRepository(private val client: ApiClient) {
         apiCall(client) {
             client.api().pageMeta(bookId, page, layoutId, revision.takeIf { it.isNotEmpty() })
         }
+
+    /** JSON 模式页面（文字直发）：仅 flow 文本书调用（设计 3.2 / 5.3）。 */
+    suspend fun flowPage(bookId: String, page: Int, layoutId: String): PageJsonDto =
+        apiCall(client) { client.api().flowPage(bookId, page, layoutId) }
 
     suspend fun locate(bookId: String, layoutId: String, anchor: AnchorDto): LocateResponseDto =
         apiCall(client) {

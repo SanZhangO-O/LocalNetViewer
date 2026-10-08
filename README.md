@@ -84,7 +84,7 @@ gradlew.bat assembleDebug
 | M1 TXT 阅读闭环 | TXT 适配器、DocumentModel、分页引擎、PNG 渲染、`/layout`、`/pages`、页元数据、`/locate`；客户端 Pager、进度记忆、预取 | 已实现 |
 | M2 EPUB + 阅读设置 | EPUB 适配器（meta 快速返回 + 首次布局全量解析并缓存）、内嵌图片、封面、`/render/fonts`；目录抽屉、设置面板（字号/行距/边距/主题/字体） | 已实现 |
 | M3 漫画与固定版式 + 搜索 | PDF 直渲、漫画容器（CBZ/CBR/CB7/CBT/图片文件夹）、文件夹图集虚拟书、`fit=viewport\|original`、全文搜索；客户端漫画控制、图集入口、搜索结果跳页 | 已实现 |
-| M4 可选增强 | 服务器端 JSON 模式、条漫切片、服务器端进度同步已实现；客户端 JSON 渲染、mDNS、扫码、TTS 未实现 | 部分实现 |
+| M4 可选增强 | 服务器端 JSON 模式、条漫切片、服务器端进度同步、客户端 JSON 渲染（设置面板"页面模式"：服务器图片 / 文字直发）已实现；mDNS、扫码、TTS 未实现 | 部分实现 |
 | M5 格式扩展 | 格式注册表（`formats/specs.py`）+ `/server/formats` 能力接口 + 未知扩展名内容嗅探 + `ext_overrides`；新增 HTML/Markdown/RTF/源码、DOCX/ODT/PPTX/XLSX（内置解析）、旧版 Office（LibreOffice）、多页 TIFF、DjVu、字体预览、ISO/CAB/LHA、HEIC/JXL/SVG/PSD/RAW（可选插件）、音频/视频流式播放 | 已实现 |
 
 ## 服务器支持的格式

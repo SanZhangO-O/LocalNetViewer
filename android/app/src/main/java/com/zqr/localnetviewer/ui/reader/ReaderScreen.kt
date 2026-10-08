@@ -190,6 +190,7 @@ fun ReaderScreen(
                 onNext = vm::nextPage,
                 onToggleOverlay = vm::toggleOverlay,
                 onError = vm::onPageImageFailed,
+                onTextRetry = vm::retryTextPage,
             )
         }
 
@@ -260,12 +261,14 @@ private fun PagedReader(
     onNext: () -> Unit,
     onToggleOverlay: () -> Unit,
     onError: (String) -> Unit,
+    onTextRetry: (Int) -> Unit,
 ) {
     val pageCount = state.spreadCount.coerceAtLeast(1)
     val pagerState = rememberPagerState(
         initialPage = state.indexOfPage(state.currentPage).coerceAtLeast(0),
         pageCount = { pageCount },
     )
+    val theme = ReaderTheme.of(state.settings.theme)
 
     // 程序化跳页（目录 / 搜索 / 进度恢复）；用户滑动不受影响。
     // 墨水屏预设（默认）一律 scrollToPage 直接落位：动画跳页在墨水屏上会连续
@@ -300,11 +303,22 @@ private fun PagedReader(
         userScrollEnabled = !zoomed,
     ) { index ->
         val isCurrent = index == pagerState.settledPage
+        val pageIndex = state.pageOfIndex(index)
+        // 文字直发只对 flow 生效；不满足条件（固定版式 / 旧服务器 / 用户没选）时走 PNG
+        val textMode = state.textRenderActive
         PageImage(
             // 跨页模式下每一屏都以"首页"页码请求，服务器会一并渲染 page+1
-            url = pageUrl(state.pageOfIndex(index)),
+            url = if (textMode) null else pageUrl(pageIndex),
+            textPage = if (textMode) {
+                state.textPages[pageIndex] ?: TextPageState.Loading
+            } else {
+                null
+            },
+            textTheme = theme,
+            textFonts = state.fonts,
+            onTextRetry = { onTextRetry(pageIndex) },
             // 页身份：映射到新页（翻页 / 跨页步长变化）时复位页内缩放
-            pageKey = state.pageOfIndex(index),
+            pageKey = pageIndex,
             contentScale = contentScaleFor(state.settings, state.isFixed),
             innerScroll = innerScrollFor(state.settings, state.isFixed),
             zoomEnabled = true,

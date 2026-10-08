@@ -39,7 +39,10 @@ import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
+import com.zqr.localnetviewer.data.net.dto.FontInfoDto
 import com.zqr.localnetviewer.ui.reader.InnerScrollAxis
+import com.zqr.localnetviewer.ui.reader.ReaderTheme
+import com.zqr.localnetviewer.ui.reader.TextPageState
 
 private const val MAX_ZOOM = 4f
 private const val ZOOM_EPSILON = 1.01f
@@ -71,6 +74,12 @@ fun PageImage(
     /** 当前槽位对应的页身份：变化（翻页 / 跨页步长变化）时复位页内缩放 */
     pageKey: Any? = null,
     isCurrent: Boolean = true,
+    /** 文字直发：非空时忽略 [url]，内容由客户端按 JSON 绘制（设计 3.2）。 */
+    textPage: TextPageState? = null,
+    textTheme: ReaderTheme = ReaderTheme.WHITE,
+    textFonts: List<FontInfoDto> = emptyList(),
+    /** 文字直发页加载失败时的重试（重新请求该页 JSON）。 */
+    onTextRetry: () -> Unit = {},
 ) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
@@ -89,6 +98,17 @@ fun PageImage(
     var attempt by remember(url) { mutableIntStateOf(0) }
     var failed by remember(url) { mutableStateOf(false) }
     var loading by remember(url) { mutableStateOf(false) }
+
+    // 文字直发的加载/失败由 ViewModel 的页状态驱动（PNG 模式由 Coil 回调驱动）
+    val isText = textPage != null
+    val textFailure = textPage as? TextPageState.Failed
+    val effectiveLoading = if (isText) textPage is TextPageState.Loading else loading
+    val effectiveFailed = if (isText) textFailure != null else failed
+    val failureMessage = if (isText) {
+        textFailure?.message?.takeIf { it.isNotBlank() } ?: "页面加载失败"
+    } else {
+        "页面加载失败"
+    }
 
     LaunchedEffect(zoomed) { onZoomChanged(zoomed) }
 
@@ -228,6 +248,9 @@ fun PageImage(
                         attempt = attempt,
                         contentScale = contentScale,
                         modifier = Modifier.fillMaxWidth(),
+                        textPage = textPage,
+                        textTheme = textTheme,
+                        textFonts = textFonts,
                         onLoading = { loading = true },
                         onSuccess = { loading = false; failed = false },
                         onError = {
@@ -248,6 +271,9 @@ fun PageImage(
                         attempt = attempt,
                         contentScale = contentScale,
                         modifier = Modifier.fillMaxHeight(),
+                        textPage = textPage,
+                        textTheme = textTheme,
+                        textFonts = textFonts,
                         onLoading = { loading = true },
                         onSuccess = { loading = false; failed = false },
                         onError = {
@@ -270,6 +296,9 @@ fun PageImage(
                             translationX = offset.x,
                             translationY = offset.y,
                         ),
+                    textPage = textPage,
+                    textTheme = textTheme,
+                    textFonts = textFonts,
                     onLoading = { loading = true },
                     onSuccess = { loading = false; failed = false },
                     onError = {
@@ -281,7 +310,7 @@ fun PageImage(
             }
 
             // 占位：加载中给进度指示，避免"翻页白屏闪一下"看起来像卡住
-            if (loading && !failed) {
+            if (effectiveLoading && !effectiveFailed) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -293,7 +322,7 @@ fun PageImage(
             }
 
             // 失败占位 + 重试（设计 6.4：加载失败提供重试，而不是只弹一条 Snackbar）
-            if (failed) {
+            if (effectiveFailed) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -302,12 +331,16 @@ fun PageImage(
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
-                            text = "页面加载失败",
+                            text = failureMessage,
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         TextButton(onClick = {
-                            failed = false
-                            attempt += 1
+                            if (isText) {
+                                onTextRetry()
+                            } else {
+                                failed = false
+                                attempt += 1
+                            }
                         }) {
                             Text("重试")
                         }
@@ -324,10 +357,25 @@ private fun PageContent(
     attempt: Int,
     contentScale: ContentScale,
     modifier: Modifier,
+    textPage: TextPageState?,
+    textTheme: ReaderTheme,
+    textFonts: List<FontInfoDto>,
     onLoading: () -> Unit,
     onSuccess: () -> Unit,
     onError: () -> Unit,
 ) {
+    // 文字直发：内容来自页面 JSON，加载/失败占位由外层状态驱动，这里不碰 Coil
+    if (textPage != null) {
+        if (textPage is TextPageState.Ready) {
+            TextPageContent(
+                page = textPage.page,
+                theme = textTheme,
+                fonts = textFonts,
+                modifier = modifier,
+            )
+        }
+        return
+    }
     val context = LocalPlatformContext.current
     val request = remember(model, attempt) {
         when {

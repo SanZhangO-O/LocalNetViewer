@@ -15,6 +15,7 @@ import coil3.request.crossfade
 import com.zqr.localnetviewer.data.net.ApiClient
 import com.zqr.localnetviewer.data.prefs.ProgressStore
 import com.zqr.localnetviewer.data.prefs.SettingsStore
+import com.zqr.localnetviewer.data.repo.FontStore
 import com.zqr.localnetviewer.data.repo.LibraryRepository
 import com.zqr.localnetviewer.data.repo.ReaderRepository
 import com.zqr.localnetviewer.data.runCatchingIo
@@ -72,6 +73,11 @@ class App : Application(), SingletonImageLoader.Factory {
 
     val readerRepository: ReaderRepository by lazy {
         ReaderRepository(apiClient)
+    }
+
+    /** 文字直发模式：服务器字体下载与缓存（设计 3.2）。 */
+    val fontStore: FontStore by lazy {
+        FontStore(this, apiClient)
     }
 
     /**

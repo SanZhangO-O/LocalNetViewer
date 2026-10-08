@@ -175,6 +175,44 @@ fun SettingsSheet(
                 }
             }
 
+            if (!state.isFixed) {
+                Text("页面模式", style = MaterialTheme.typography.titleSmall)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = settings.pageRenderMode == AppSettings.RENDER_SERVER,
+                        onClick = {
+                            onSettingsChange(settings.copy(pageRenderMode = AppSettings.RENDER_SERVER))
+                        },
+                        label = { Text("服务器图片") },
+                    )
+                    FilterChip(
+                        selected = settings.pageRenderMode == AppSettings.RENDER_TEXT,
+                        onClick = {
+                            onSettingsChange(settings.copy(pageRenderMode = AppSettings.RENDER_TEXT))
+                        },
+                        label = { Text("文字直发") },
+                    )
+                }
+                Text(
+                    text = when {
+                        settings.pageRenderMode != AppSettings.RENDER_TEXT ->
+                            "服务器排版并渲染成图片下发：观感最稳、流量较大。"
+                        !state.textSupported ->
+                            "当前服务器不支持文字直发（旧版服务器），将自动使用服务器图片。"
+                        else ->
+                            "服务器只下发排版数据，文字由手机绘制：更清晰、省流量；" +
+                                "首次使用会自动下载服务器字体。漫画 / PDF 不受影响。"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             if (state.isFixed) {
                 Text("漫画 / 固定版式", style = MaterialTheme.typography.titleSmall)
 

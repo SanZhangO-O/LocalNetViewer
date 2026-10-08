@@ -47,6 +47,13 @@ data class AppSettings(
     val readingDirection: String = "ltr",
     /** screen（铺满屏幕，等比完整显示，默认）| width（适应宽度）| height（适应高度） */
     val fitMode: String = "screen",
+    /**
+     * 页面模式：server（服务器渲染成图片，默认）| text（文字直发，客户端绘制）。
+     *
+     * 仅对 flow 文本书生效：漫画 / PDF / 条漫始终由服务器渲染（服务器不支持 JSON 页）。
+     * text 模式下客户端逐行绘制服务器下发的排版数据（字体、分页仍由服务器决定）。
+     */
+    val pageRenderMode: String = RENDER_SERVER,
     /** 固定版式取原图（fit=original，保真但流量大） */
     val originalQuality: Boolean = false,
     /** 条漫切片连续滚动 */
@@ -90,6 +97,12 @@ data class AppSettings(
         const val PRESET_EINK = "eink"
         const val PRESET_LCD = "lcd"
         const val PRESET_CUSTOM = "custom"
+
+        /** 服务器渲染页面图片（默认）。 */
+        const val RENDER_SERVER = "server"
+
+        /** 文字直发：服务器只发排版 JSON，客户端用原生文本绘制。 */
+        const val RENDER_TEXT = "text"
     }
 }
 

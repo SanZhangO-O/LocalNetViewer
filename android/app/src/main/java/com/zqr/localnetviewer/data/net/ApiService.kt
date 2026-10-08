@@ -13,6 +13,7 @@ import com.zqr.localnetviewer.data.net.dto.OpenArchiveResponseDto
 import com.zqr.localnetviewer.data.net.dto.OpenFolderRequestDto
 import com.zqr.localnetviewer.data.net.dto.OpenFolderResponseDto
 import com.zqr.localnetviewer.data.net.dto.PageMetaDto
+import com.zqr.localnetviewer.data.net.dto.PageJsonDto
 import com.zqr.localnetviewer.data.net.dto.ProgressDto
 import com.zqr.localnetviewer.data.net.dto.ProgressPutDto
 import com.zqr.localnetviewer.data.net.dto.SearchResponseDto
@@ -53,6 +54,19 @@ interface ApiService {
         @Query("layout_id") layoutId: String,
         @Query("rev") rev: String? = null,
     ): PageMetaDto
+
+    /**
+     * JSON 模式页面（文字直发）：服务器按行下发已排好的内容。
+     *
+     * 仅 flow 文本书支持；固定版式（PDF/漫画）服务器会返回 400，客户端不应请求。
+     */
+    @GET("api/v1/books/{bookId}/pages/{page}")
+    suspend fun flowPage(
+        @Path("bookId") bookId: String,
+        @Path("page") page: Int,
+        @Query("layout_id") layoutId: String,
+        @Query("format") format: String = "json",
+    ): PageJsonDto
 
     @GET("api/v1/books/{bookId}/locate")
     suspend fun locate(

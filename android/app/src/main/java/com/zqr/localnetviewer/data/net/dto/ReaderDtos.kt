@@ -112,6 +112,61 @@ data class SearchResultDto(
     val snippet: String = "",
 )
 
+/**
+ * JSON 模式页面 `GET /api/v1/books/{id}/pages/{n}?layout_id=...&format=json`。
+ *
+ * 关键约定：**分页边界由服务器决定**。`blocks` 里的 `lines` 已折好行（含段首缩进），
+ * 客户端逐行绘制、不做重排；图片块必须按服务器给的 `display_w/display_h` 布局。
+ */
+@Serializable
+data class PageJsonDto(
+    val page: Int = 1,
+    @SerialName("total_pages") val totalPages: Int = 0,
+    val anchor: AnchorDto = AnchorDto(),
+    @SerialName("chapter_index") val chapterIndex: Int = 0,
+    @SerialName("chapter_title") val chapterTitle: String = "",
+    val mode: String = "flow",
+    val blocks: List<PageBlockDto> = emptyList(),
+    val font: PageFontDto? = null,
+    val margin: MarginDto? = null,
+    val viewport: ViewportDto? = null,
+    val paragraph: PageParagraphDto? = null,
+)
+
+/** 页面块：paragraph / heading / image / separator。 */
+@Serializable
+data class PageBlockDto(
+    val type: String = "paragraph",
+    /** 标题级别（heading 才有）。 */
+    val level: Int = 0,
+    /** 已折好的行（含段首全角空格缩进）；客户端逐行绘制、不再折行。 */
+    val lines: List<String> = emptyList(),
+    @SerialName("font_size") val fontSize: Int = 0,
+    /** 相对内容区（不含 margin）顶部的纵坐标与块高，单位 = 排版视口物理像素。 */
+    val y: Float = 0f,
+    val height: Float = 0f,
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    /** image 块：书内资源相对 URL（服务器已带 rev）。 */
+    val asset: String? = null,
+    @SerialName("display_w") val displayW: Float = 0f,
+    @SerialName("display_h") val displayH: Float = 0f,
+)
+
+@Serializable
+data class PageFontDto(
+    val family: String = "auto",
+    @SerialName("size_px") val sizePx: Int = 0,
+    @SerialName("line_height") val lineHeight: Float = 1.6f,
+    @SerialName("letter_spacing_px") val letterSpacingPx: Float = 0f,
+)
+
+@Serializable
+data class PageParagraphDto(
+    @SerialName("spacing_px") val spacingPx: Float = 0f,
+    @SerialName("first_line_indent_chars") val firstLineIndentChars: Int = 0,
+)
+
 /** 字体列表 `GET /api/v1/render/fonts`。 */
 @Serializable
 data class FontsResponseDto(
