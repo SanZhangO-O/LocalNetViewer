@@ -184,12 +184,9 @@ class ArchiveBrowserViewModel(
     }
 }
 
-/** /files 列表里压缩包格式的书籍条目（"查看内容"入口判定，设计 7.6）。
+/** /files 列表里可浏览内容的书籍条目（"查看内容"入口判定，设计 7.6）。
  *
- * M5 起以服务端下发的 has_contents 为准（新人压缩包类型无需改客户端）；
- * 旧服务器没有该字段时退回本地清单。
+ * 以服务端下发的 has_contents 为准（新人压缩包类型无需改客户端）。
  */
-val ARCHIVE_BOOK_FORMATS = setOf("zip", "cbz", "rar", "cbr", "7z", "cb7", "tar", "cbt", "cbz3")
-
 fun com.zqr.localnetviewer.data.net.dto.FileEntryDto.isArchiveBook(): Boolean =
-    isBook && (hasContents || format?.lowercase() in ARCHIVE_BOOK_FORMATS)
+    isBook && hasContents

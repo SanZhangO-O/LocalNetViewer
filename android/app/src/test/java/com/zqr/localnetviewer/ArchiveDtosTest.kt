@@ -11,7 +11,7 @@ import org.junit.Test
 
 /**
  * 压缩包内容浏览（设计 7.6）DTO 契约：服务器 JSON 字段（snake_case）必须与
- * 客户端 @SerialName 一一对应；旧服务器缺字段时用默认值兜底。
+ * 客户端 @SerialName 一一对应。
  */
 class ArchiveDtosTest {
 
@@ -42,7 +42,7 @@ class ArchiveDtosTest {
         val body = json.decodeFromString(ArchiveContentsResponseDto.serializer(), payload)
         assertEquals("abc123", body.bookId)
         assertEquals("rev1", body.revision)
-        assertEquals("", body.entry)
+        assertEquals("vol01", body.entry)
         assertEquals("", body.parent)
         assertEquals(12, body.archive.entryCount)
         assertEquals(10, body.archive.imageCount)
@@ -59,29 +59,16 @@ class ArchiveDtosTest {
     }
 
     @Test
-    fun `旧服务器缺字段时默认值兜底`() {
-        val body = json.decodeFromString(
-            ArchiveContentsResponseDto.serializer(),
-            """{"book_id": "x", "entries": []}""",
-        )
-        assertEquals("", body.entry)
-        assertNull(body.parent)
-        assertEquals(0, body.archive.entryCount)
-        assertEquals(2, body.archive.maxDepth)
-        assertTrue(body.entries.isEmpty())
-    }
-
-    @Test
-    fun `meta 的 archive 块旧服务器缺省为 null`() {
+    fun `meta 的 archive 块缺省为 null`() {
         val withArchive = json.decodeFromString(
             BookMetaDto.serializer(),
-            """{"book_id":"a","title":"t","format":"zip",
+            """{"book_id":"a","title":"t","format":"zip","revision":"rev1",
                 "archive":{"entry_count":3,"image_count":1,"depth":1,"max_depth":2}}""",
         )
         assertEquals(1, withArchive.archive?.depth)
         val withoutArchive = json.decodeFromString(
             BookMetaDto.serializer(),
-            """{"book_id":"a","title":"t","format":"txt"}""",
+            """{"book_id":"a","title":"t","format":"txt","revision":"rev1"}""",
         )
         assertNull(withoutArchive.archive)
     }

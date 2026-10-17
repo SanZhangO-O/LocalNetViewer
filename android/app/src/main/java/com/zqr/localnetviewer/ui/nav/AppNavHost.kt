@@ -88,7 +88,6 @@ fun AppNavHost() {
                     // 断开连接：清空概要与整个返回栈，回到连接页
                     // （不清空的话，重连失败时连接页/浏览页残留旧服务器的摘要）
                     app.updateServerSummary("")
-                    app.updateArchiveBrowse(false)
                     navController.navigate(Routes.CONNECT) {
                         popUpTo(navController.graph.startDestinationId) { inclusive = true }
                         launchSingleTop = true

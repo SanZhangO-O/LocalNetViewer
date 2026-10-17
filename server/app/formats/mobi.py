@@ -31,7 +31,7 @@ from .base import (
     UnsupportedFormatError,
 )
 from .epub import EpubAdapter
-from .imagebook import EpubComicAdapter, image_book_info, scan_image_book
+from .imagebook import EpubComicAdapter, image_book_info
 
 logger = logging.getLogger("localnetviewer.formats.mobi")
 
@@ -226,10 +226,7 @@ class MobiAdapter(FlowAdapter):
 
 # ------------------------------------------------------------------ 漫画型 MOBI
 
-# 检测与固定版式适配已抽到 formats/imagebook.py（EPUB 与 MOBI 共用）。
-# 这两个别名保留给回归测试与旧调用点。
-_scan_manga = scan_image_book
-_manga_info = image_book_info
+# 检测与固定版式适配在 formats/imagebook.py（EPUB 与 MOBI 共用）。
 
 
 class MobiComicAdapter(EpubComicAdapter):
@@ -250,7 +247,7 @@ def open_mobi_adapter(env: AdapterEnv, ref: BookRef) -> BookAdapter:
     哪个适配器实例。
     """
     flow = MobiAdapter(env, ref)  # 构造即完成转换（缓存命中则直接复用）
-    info = _manga_info(flow._inner)
+    info = image_book_info(flow._inner)
     if not info["manga"]:
         return flow
     eref = flow._inner.ref

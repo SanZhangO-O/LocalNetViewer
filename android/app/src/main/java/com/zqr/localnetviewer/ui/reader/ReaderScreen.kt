@@ -304,7 +304,7 @@ private fun PagedReader(
     ) { index ->
         val isCurrent = index == pagerState.settledPage
         val pageIndex = state.pageOfIndex(index)
-        // 文字直发只对 flow 生效；不满足条件（固定版式 / 旧服务器 / 用户没选）时走 PNG
+        // 文字直发只对 flow 生效；不满足条件（固定版式 / 用户没选）时走 PNG
         val textMode = state.textRenderActive
         PageImage(
             // 跨页模式下每一屏都以"首页"页码请求，服务器会一并渲染 page+1

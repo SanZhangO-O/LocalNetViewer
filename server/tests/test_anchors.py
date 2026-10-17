@@ -252,26 +252,6 @@ def test_pagemap_round_trip_through_dict(doc, fonts):
         assert page_of_anchor(restored, rec.anchor)[0] == rec.page
 
 
-def test_pagemap_recovers_missing_end_anchor(fonts):
-    """旧格式 / 被裁剪的 PageMap 缺少 end_anchor 时不能把整本书判为越界。"""
-    from app.layout.engine import PageMap
-
-    pm = PageMap(
-        book_id="b",
-        layout_id="L",
-        total_pages=2,
-        pages=[
-            __import__("app.layout.engine", fromlist=["PageRecord"]).PageRecord(1, (0, 0, 0)),
-            __import__("app.layout.engine", fromlist=["PageRecord"]).PageRecord(2, (0, 5, 0)),
-        ],
-    )
-    data = pm.to_dict()
-    data.pop("end_anchor")
-    restored = PageMap.from_dict(data)
-    assert restored.end_anchor > (0, 5, 0)
-    assert page_of_anchor(restored, (0, 5, 0)) == (2, False)
-
-
 # --------------------------------------------------------- 固定版式锚点
 def test_fixed_pagemap_anchor_is_page_index():
     from app.layout.engine import build_fixed_pagemap

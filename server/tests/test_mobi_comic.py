@@ -20,6 +20,7 @@ from PIL import Image
 from app.formats import mobi as mobi_mod
 from app.formats.base import BookRef, FixedAdapter
 from app.formats.epub import EpubAdapter
+from app.formats.imagebook import scan_image_book
 from tests.conftest import jpeg_bytes
 
 BOOK_ID = "mobimanga0000001"
@@ -82,7 +83,7 @@ def _scan(env, path: Path) -> dict:
     ref = BookRef(book_id=BOOK_ID, vpath="/lib/m.epub", path=path, format="epub")
     adapter = EpubAdapter(env, ref)
     try:
-        return mobi_mod._scan_manga(adapter)
+        return scan_image_book(adapter)
     finally:
         adapter.close()
 

@@ -202,8 +202,6 @@ fun SettingsSheet(
                     text = when {
                         settings.pageRenderMode != AppSettings.RENDER_TEXT ->
                             "服务器排版并渲染成图片下发：观感最稳、流量较大。"
-                        !state.textSupported ->
-                            "当前服务器不支持文字直发（旧版服务器），将自动使用服务器图片。"
                         else ->
                             "服务器只下发排版数据，文字由手机绘制：更清晰、省流量；" +
                                 "首次使用会自动下载服务器字体。漫画 / PDF 不受影响。"

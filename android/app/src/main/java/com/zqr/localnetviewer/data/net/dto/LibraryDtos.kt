@@ -37,8 +37,8 @@ data class FileEntryDto(
     val gallery: GalleryInfoDto? = null,
     val openable: Boolean = true,
     val reason: String? = null,
-    /** 该书籍支持压缩包内容浏览（M5；旧服务器缺省 false）。 */
-    @SerialName("has_contents") val hasContents: Boolean = false,
+    /** 该书籍支持压缩包内容浏览（M5：服务端下发，客户端不硬编码格式清单）。 */
+    @SerialName("has_contents") val hasContents: Boolean,
     /** 媒体条目类型：audio | video（type=media 时存在）。 */
     @SerialName("media_kind") val mediaKind: String? = null,
     /** 媒体流地址（支持 Range，视频播放器用）。 */
@@ -67,8 +67,8 @@ data class BookMetaDto(
     @SerialName("render_support") val renderSupport: RenderSupportDto = RenderSupportDto(),
     val chapters: List<ChapterInfoDto> = emptyList(),
     val source: String? = null,
-    /** 内容修订号（旧服务器缺省为空串），见 /layout 同名字段。 */
-    val revision: String = "",
+    /** 内容修订号，见 /layout 同名字段。 */
+    val revision: String,
     /** 压缩包书籍才有：内容概览（设计 7.6）。 */
     val archive: ArchiveSummaryDto? = null,
 )

@@ -332,7 +332,7 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     }
 
     /** 书封 URL（Composable 不直接触碰 repository，设计分层；带服务端 rev）。 */
-    fun coverUrl(entry: FileEntryDto, width: Int = 240): String =
+    fun coverUrl(entry: FileEntryDto, width: Int = 240): String? =
         repository.coverUrl(entry, width)
 
     fun consumeMessage() {

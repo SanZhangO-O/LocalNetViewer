@@ -435,7 +435,6 @@ private fun EntryRow(
         }
 
         // 压缩包书籍：默认点按仍作为书打开，"内容"进压缩包浏览（设计 7.6）。
-        // 旧服务器没有 contents API：请求 404 时界面显示 Snackbar 错误，不崩溃。
         val archiveId = entry.bookId
         if (entry.isArchiveBook() && archiveId != null) {
             TextButton(

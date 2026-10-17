@@ -206,11 +206,6 @@ class PageMap:
         pages = [PageRecord.from_dict(p) for p in d.get("pages", [])]
         if isinstance(raw_end, (list, tuple)) and len(raw_end) >= 3:
             end_anchor = (int(raw_end[0]), int(raw_end[1]), int(raw_end[2]))
-        elif pages:
-            # 缺少 end_anchor（旧格式/被裁剪）：按"最后一页之后"推导，
-            # 否则 (0,0,0) 会让 page_of_anchor 认为任何锚点都已越界
-            last = pages[-1].anchor
-            end_anchor = (last[0], last[1] + 1, 0)
         else:
             end_anchor = (0, 0, 0)
         pm = PageMap(

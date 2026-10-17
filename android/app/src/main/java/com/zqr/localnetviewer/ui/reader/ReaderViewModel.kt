@@ -61,7 +61,7 @@ class ReaderViewModel(
         /** flow | fixed | strip */
         val mode: String = "flow",
         val layoutId: String? = null,
-        /** 服务器内容修订号（旧服务器可能缺省为空串）：页面 URL 携带它避免命中旧缓存 */
+        /** 服务器内容修订号：页面 URL 携带它避免命中旧缓存 */
         val revision: String = "",
         val totalPages: Int = 0,
         val currentPage: Int = 1,
@@ -73,7 +73,7 @@ class ReaderViewModel(
         val chapters: List<ChapterInfoDto> = emptyList(),
         val settings: AppSettings = AppSettings.DEFAULT,
         val fonts: List<FontInfoDto> = emptyList(),
-        /** 服务器声明支持 JSON 页（`render_support.json`，旧服务器为 false）。 */
+        /** 服务器声明支持 JSON 页（`render_support.json`，仅 flow 文本书为 true）。 */
         val renderSupportJson: Boolean = false,
         /** 文字直发模式：页号 → 页面 JSON 状态（服务器渲染模式下恒为空）。 */
         val textPages: Map<Int, TextPageState> = emptyMap(),
@@ -331,8 +331,7 @@ class ReaderViewModel(
             _state.update {
                 it.copy(
                     layoutId = layout.layoutId,
-                    // 旧服务器可能不带 revision：保留 meta 阶段拿到的值
-                    revision = layout.revision.ifEmpty { it.revision },
+                    revision = layout.revision,
                     totalPages = layout.totalPages,
                     mode = layout.mode,
                     chapters = chapters,

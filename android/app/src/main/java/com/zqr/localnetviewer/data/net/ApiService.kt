@@ -124,9 +124,6 @@ interface ApiService {
 /** URL 构造：页面图片/封面/书内资源都直接由 Coil 按 URL 拉取，不走 Retrofit。 */
 object ApiPaths {
 
-    fun cover(bookId: String, width: Int = 240): String =
-        "/api/v1/books/$bookId/cover?w=$width"
-
     /**
      * 页面图片 URL（设计 5.3）。
      *

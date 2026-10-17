@@ -790,8 +790,8 @@ android/app/src/main/java/com/zqr/localnetviewer/
   代价是沉浸态下上下各留一条主题背景 —— 与底栏早已采用的取舍一致。
 - 渲染模式切换（**设置面板"页面模式"：服务器图片 / 文字直发**）：仅 flow 文本书可选；
   "文字直发"时客户端按 JSON 模式逐行绘制（字体经 `/render/fonts/{id}/file` 下载对齐，
-  系统字体兜底时超宽行 ≤10% 横向压缩、仍超出截断），固定版式与不支持 JSON 的旧服务器
-  自动回退"服务器图片"，不影响阅读。
+  系统字体兜底时超宽行 ≤10% 横向压缩、仍超出截断），固定版式自动回退"服务器图片"，
+  不影响阅读。
 
 ### 6.4 阅读器实现要点
 
@@ -934,7 +934,7 @@ android/app/src/main/java/com/zqr/localnetviewer/
   - 条目类型：书籍扩展名 → 解压到缓存后走常规适配器链（txt/epub/pdf/fb2/mobi/漫画容器）；单张图片 → 单页图集；目录 → **前缀图集**（该目录下的图片条目即页，自然排序，支持条漫切片——覆盖"一个压缩包多话漫画"）；嵌套压缩包本身也可作为漫画书打开，或继续 `contents` 浏览；
   - 注册表持久化在 `cache/archives.json`（book_id 是哈希无法反推条目路径；上限 5000 条按 LRU 淘汰）；解析链顶时按 `scope` 校验顶层压缩包可见性——密码书库"不可见 = 不存在"语义自动继承。
 - **包中包**：链式下钻（最多 `archive.max_depth` 层，默认 2）。中间层压缩包条目解压到 `cache/extracted/<nested_id>/` 后继续打开；解压缓存按访问时间 LRU 淘汰（`archive.extract_cache_mb`，默认 512MB，启动 sweep），父压缩包内容变化时立即清除其链上缓存目录。
-- **客户端**：浏览页压缩包条目显示"内容"入口（默认点按仍作为书打开；条目打不开时"查看内容"升级为主操作）；压缩包浏览页（复用列表组件）内目录下钻、书籍/图片点按进阅读器、目录"作为图集打开"；旧服务器（无 contents API）隐藏入口或给出明确提示。
+- **客户端**：浏览页压缩包条目显示"内容"入口（默认点按仍作为书打开；条目打不开时"查看内容"升级为主操作）；压缩包浏览页（复用列表组件）内目录下钻、书籍/图片点按进阅读器、目录"作为图集打开"。
 - **边界**：加密 / 分卷压缩包维持现状报错；包内非书文件只列表不下载；`include_ext` 不含 zip 等扩展名时书库列表不显示对应压缩包（沿用 `/files` 的显示规则）。
 
 ---
@@ -979,8 +979,8 @@ android/app/src/main/java/com/zqr/localnetviewer/
   - 媒体：音频/视频（`kind=audio|video`）不进入书库索引，列表以 `type=media`
     下发 `media_kind`/`mime`/`stream_url`；`GET /api/v1/media?path=` 按块流式
     + Range（206/416）+ ETag/304，客户端内嵌播放器（VideoView，不引入 Media3）。
-- **客户端**：格式判断不再硬编码——`FileEntry.has_contents` 由服务端下发
-  （旧服务器缺省 false 时退回本地清单）；`type=media` 直接进媒体播放页；
+- **客户端**：格式判断不再硬编码——`FileEntry.has_contents` 由服务端下发；
+  `type=media` 直接进媒体播放页；
   其余按 `mode`（flow/fixed/strip）沿用既有泛化渲染，新增格式零客户端改动。
 - **配置**：`library.sniff_unknown`、`library.ext_overrides`；
   `.e2e` 之外的可选安装：`pip install -e ".[text,images,iso]"`。
@@ -1576,7 +1576,7 @@ cd ..\android && gradlew.bat :app:assembleDebug           :: 构建通过
   - 媒体：`/api/v1/media` Range 流式 + 列表 `type=media`；
   - `code` 类保留缩进（`CodeAdapter`）；`.tif/.tiff` 从单图改为多页适配器。
 - 客户端：`FileEntry` 新增 `has_contents`/`media_kind`/`stream_url`/`mime`；
-  压缩包入口改用服务端 `has_contents`（旧服务器回退本地清单）；新增媒体播放页
+  压缩包入口以服务端 `has_contents` 为准；新增媒体播放页
   （VideoView）与 `media` 路由；列表新增媒体分类与图标。
 - 配置：`library.sniff_unknown`、`library.ext_overrides`；
   pyproject 新增可选 extras `text`/`images`/`iso`；版本 0.8.0。
