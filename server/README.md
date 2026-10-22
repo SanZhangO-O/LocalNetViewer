@@ -95,6 +95,7 @@ Base URL `http://<host>:8765/api/v1`，交互式文档见 `http://<host>:8765/do
 | GET | `/books/{id}/pages/{n}/meta` | 页元数据（锚点、章节名） |
 | GET | `/books/{id}/locate` | 锚点 → 页码 |
 | GET | `/books/{id}/search?q=` | 全文搜索（TXT/EPUB） |
+| GET | `/library/search?q=&limit=` | 书库搜索：只匹配内存索引里的书名/路径（不读文件、不做全文） |
 | GET | `/books/{id}/asset?path=` | 书内资源（EPUB 图片） |
 | POST | `/books/open-folder` | 文件夹 → 虚拟图集书 |
 | GET | `/render/fonts` | 可用字体列表 |

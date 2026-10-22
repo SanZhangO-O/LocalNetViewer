@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -35,6 +36,7 @@ import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayCircle
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -50,6 +52,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -69,6 +72,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.layout.wrapContentHeight
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -126,6 +132,16 @@ fun BrowserScreen(
         }
     }
 
+    // 从阅读页返回：进度刚写过盘，书架卡片与列表进度条要跟着变
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) vm.refreshReadingProgress()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -163,6 +179,9 @@ fun BrowserScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = vm::openSearch) {
+                        Icon(Icons.Default.Search, contentDescription = "搜索书库")
+                    }
                     IconButton(onClick = vm::refresh) {
                         Icon(Icons.Default.Refresh, contentDescription = "刷新")
                     }
@@ -185,6 +204,19 @@ fun BrowserScreen(
                 onNavigate = { vm.load(it) },
             )
             HorizontalDivider()
+            // "继续阅读"摆在第一屏：根目录给全部最近阅读，子目录只给当前书架
+            // （从阅读页返回时 ON_RESUME 会刷新进度）
+            val shelf = remember(state.recent, state.path) {
+                recentInPath(state.recent, state.path)
+            }
+            if (shelf.isNotEmpty()) {
+                RecentReadingShelf(
+                    recent = shelf,
+                    coverUrl = { bookId -> vm.coverUrlForBook(bookId) },
+                    onOpen = vm::openRecent,
+                )
+                HorizontalDivider()
+            }
             if (state.scanning || (state.loading && state.entries.isNotEmpty())) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
@@ -249,6 +281,7 @@ fun BrowserScreen(
                                 EntryRow(
                                     entry = entry,
                                     coverUrl = if (entry.isBook) vm.coverUrl(entry, 240) else null,
+                                    progress = entry.bookId?.let { state.progressById[it] },
                                     onClick = {
                                         // 压缩包打不开（无图片页 / 缺后端）时，"查看内容"升级为主操作
                                         val archiveId = entry.bookId
@@ -283,6 +316,23 @@ fun BrowserScreen(
                 }
             }
         }
+    }
+
+    if (state.searchOpen) {
+        LibrarySearchSheet(
+            query = state.searchQuery,
+            searching = state.searching,
+            results = state.searchResults,
+            total = state.searchTotal,
+            truncated = state.searchTruncated,
+            scanning = state.searchScanning,
+            error = state.searchError,
+            onQueryChange = vm::onSearchQueryChange,
+            onSubmit = vm::submitSearch,
+            onOpenResult = vm::openSearchResult,
+            onOpenFolder = vm::openContainingFolder,
+            onDismiss = vm::closeSearch,
+        )
     }
 }
 
@@ -374,6 +424,8 @@ private fun GalleryEntryCard(
 private fun EntryRow(
     entry: FileEntryDto,
     coverUrl: String?,
+    /** 已读比例（0..1）；这本书没有本地进度时为 null。 */
+    progress: Float?,
     onClick: () -> Unit,
     onOpenAsGallery: () -> Unit,
     onOpenArchive: (String) -> Unit,
@@ -424,6 +476,16 @@ private fun EntryRow(
                     } else {
                         MaterialTheme.colorScheme.error
                     },
+                )
+            }
+            // 已读进度：细条不抢注意力，但能一眼看出"这本读过一半"
+            if (entry.isBook && progress != null) {
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp),
                 )
             }
         }

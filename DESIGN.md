@@ -517,11 +517,12 @@ LocalNetViewer Server v0.7.0
 | 9 | GET | `/books/{book_id}/search?q=` | 全文搜索（TXT/EPUB），结果含页码（无 layout_id 时 page 为 null） | P3 |
 | 10 | GET | `/books/{book_id}/asset?path=` | 书内资源（EPUB 图片；JSON 模式用） | P4 |
 | 11 | GET | `/render/fonts` | 可用字体列表（阅读设置页用） | P2 |
-| 12 | GET/PUT | `/progress/{book_id}?device_id=` | 服务器端进度同步（可选） | P4 |
+| 12 | GET/PUT | `/progress/{book_id}?device_id=` | 服务器端进度同步（可选）；v0.9 起客户端真的接上了（打开时与本地按 `updated_at` 取新，翻页防抖 PUT，只有拿得到锚点才同步） | P4 |
 | 13 | POST | `/books/open-folder` | 文件夹 → 虚拟图集书（返回 book_id）；之后走标准 `/books/{id}/*` 流程 | P3 |
 | 14 | GET | `/render/fonts/{font_id}/file` | 字体文件下载（JSON 模式客户端对齐排版用） | P4 |
 | 15 | GET | `/books/{book_id}/contents?entry=&limit=&offset=` | 压缩包内部目录列表（把压缩包当虚拟目录浏览，设计 7.6）；`/meta` 的 `archive` 块带条目/图片概览 | v0.7 |
 | 16 | POST | `/books/{book_id}/contents/open` | 包内条目 → 嵌套书（幂等，返回新 book_id）；之后走标准 `/books/{id}/*` 流程 | v0.7 |
+| 17 | GET | `/library/search?q=&limit=` | 书库搜索：只匹配内存索引里的书名/虚拟路径（空格分词 = 全部命中），不 stat、不读文件、不做全文；结果条目形状与 `/files` 一致，并受书库访问范围过滤 | v0.9 |
 
 ### 5.3 关键请求 / 响应示例
 
@@ -747,8 +748,15 @@ android/app/src/main/java/com/zqr/localnetviewer/
 
 **浏览页 BrowserScreen**
 
-- 顶部：面包屑（可回点任意层级）+ 返回。
-- 列表：文件夹（图标）与书籍（封面缩略图 + 标题 + 格式徽标 + 大小）。
+- 顶部：面包屑（可回点任意层级）+ 返回；右侧依次为"搜索书库 / 刷新 / 断开"。
+- 列表：文件夹（图标）与书籍（封面缩略图 + 标题 + 格式徽标 + 大小）；有本地进度的
+  书在描述下多一条 2dp 细进度条（一眼看出"这本读过一半"）。
+- **继续阅读（v0.9）**：书库根目录顶部显示最近阅读横排（封面 + 书名 + 已读百分比），
+  点一下直接进书；没有进度时不占高度。进度快照（title/format/vpath/total_pages）
+  随进度一起落盘，卡片不需要额外请求 `/meta`；从阅读页返回时 `ON_RESUME` 刷新。
+- **书库搜索（v0.9）**：顶栏搜索图标打开底部面板，输入即搜（250ms 防抖，服务端
+  `/library/search` 只查内存索引）。结果点一下直接开书，"所在目录"为次要操作；
+  结果被 limit 截断时提示"共 N 条，仅显示前 50 条"。
 - 点击文件夹进入；点击书籍进入阅读页。
 - **列表分页**：列表按页显示（每页 100 条，服务端 `limit/offset`）；多于 1 页时底部显示
   分页栏 —— 第一页 / 上一页 / 下一页 / 最后一页 + "第 x / y 页 · 共 n 项" + 页码跳转输入；
@@ -764,9 +772,13 @@ android/app/src/main/java/com/zqr/localnetviewer/
 **阅读页 ReaderScreen**
 
 - 主体：`HorizontalPager`（`pageCount = total_pages`），每页一张由 Coil 加载的页面图片；文本书默认 `ContentScale.Fit`，漫画/固定版式按适应模式展示（手势模型见 6.4）。
-- 点击屏幕中部：显示/隐藏工具栏（顶栏：返回、目录、设置；底栏：进度条 + `第 42 / 812 页 · 第三章`）。
+- 点击屏幕中部：显示/隐藏工具栏（顶栏：返回、**书签**、搜索、目录、设置；底栏：进度条 + `第 42 / 812 页 · 第三章`）。
 - 点击左右两侧：上一页 / 下一页；左右滑动翻页。
-- 目录抽屉：来自 meta 的章节表，点击跳 `start_page`。
+- 目录抽屉：两个 tab ——「目录」（来自 meta 的章节表，点击跳 `start_page`）与
+  「书签」（v0.9，页码升序；点击按锚点 `/locate` 跳转，右侧按钮删除；没有目录但有
+  书签时默认落在书签页）。
+- 书签（v0.9）：顶栏书签图标弹出"添加书签"对话框（备注可留空），保存 `{page, anchor,
+  chapter_title, note}`；锚点只在它确实属于当前页时记录，避免"新页码 + 旧锚点"。
 - 设置面板（底部 Sheet）：
   - 字号（`size_px`）、行距、左右/上下边距、段落间距；
   - 主题（white / paper / sepia / green / dark）；
@@ -829,10 +841,18 @@ android/app/src/main/java/com/zqr/localnetviewer/
 - 进度落盘按 1s 合并写入（连续翻页不必每页整文件重写），关停时强制 flush。
 
 - `ReaderUiState`：`layoutId, totalPages, currentPage, chapterTitle, settings, loading, error`，由 `ReaderViewModel`（StateFlow）驱动。
-- 进度写入时机：翻页停稳防抖 800ms + `onStop`；内容为 `{anchor, page, updated_at}`。
-- 打开书籍顺序：meta → 本地进度 → layout → locate → 渲染起始页并预取。
+- 进度写入时机：翻页停稳防抖 800ms + `onStop` + ViewModel 销毁兜底；内容为
+  `{anchor, page, ratio, updated_at, title, format, vpath, total_pages}`——后四个是
+  "继续阅读"书架的展示快照，省掉再请求一次 `/meta`。书架按 `vpath` 的书库根名过滤
+  （而不是服务器地址：DHCP 换 IP 后地址会变，按地址筛会让书架整个消失）。
+- 打开书籍顺序：meta → 本地进度（与服务器进度按 `updated_at` 取新）→ layout → locate → 渲染起始页并预取。
 - 锚点为"页首"，恢复时回到本页开头（常见阅读器行为）；页内精确位置（JSON 模式记录行偏移）列为后续优化。
-- 进度仅存本地（DataStore, `progress:{book_id}`）；服务器端同步为 P4 可选。
+- 进度本地权威（DataStore, `progress:{book_id}`）；服务器同步只在服务器记录更新时采用，
+  同一设备上本地永远优先，避免旧同步值把刚翻的页冲掉。只有拿得到锚点才 PUT（页码会随
+  字号/屏幕漂移，锚点不会）。
+- 书签（v0.9）：本地 DataStore（`bookmarks:{book_id}`），一条书签 =
+  `{id, page, anchor, chapter_title, note, created_at}`。定位优先 `/locate(anchor)`，
+  锚点缺失才退回页码；同一页同一锚点重复添加视为"改备注"。
 
 ### 6.6 网络与清单细节
 
@@ -1603,3 +1623,29 @@ cd ..\android && gradlew.bat :app:assembleDebug           :: 构建通过
 （md/html/rtf/code/csv/tiff/docx/odt/pptx/xlsx/fbz/tgz/ttf/无扩展名/错扩展名 zip）、
 书库分类与嗅探全链路、HTTP 契约（meta/layout/pages/contents/media Range）、
 Android `:app:compileDebugKotlin` 全部通过（按项目约定未跑测试套件）。
+
+### v0.9（2026-10-22，阅读回路补全）
+
+背景：格式广度（M5，30+ 格式）已经领先于"每天真的会用"的阅读回路——继续读、书签、
+跨设备续读、找书，四件事此前都缺。本轮不加格式，只补回路。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| 1 | **继续阅读**：`ReadingProgress` 增 `title/format/vpath/total_pages` 快照；根目录给全部最近阅读、子目录只给当前子树（vpath 前缀），并按当前服务器书库名过滤（换 IP 不丢、换服务器不串）；列表行 2dp 进度条；从阅读页返回 `ON_RESUME` 刷新 | `ProgressStore.recent`、`BrowserViewModel.refreshReadingProgress`、`RecentShelf.kt`、`BrowserScreen` |
+| 2 | **书签**：本地 DataStore（`bookmarks:{book_id}`），目录抽屉第二个 tab；添加对话框可写备注；跳转优先锚点 `/locate`，删除即时生效 | `BookmarkStore.kt`、`AddBookmarkDialog.kt`、`TocSheet.kt`、`ReaderViewModel` |
+| 3 | **跨设备进度**：客户端接上 `/progress/{id}`（此前服务端与 Kotlin repository 都有、UI 零调用）。打开时本地/服务器按 `updated_at` 取新（本地优先，避免旧同步值冲掉刚翻的页）；翻页防抖与销毁兜底 PUT，**只有拿得到锚点才同步** | `ReaderViewModel.loadProgress/syncProgressToServer`、`ConnectViewModel`（capabilities） |
+| 4 | **书库搜索**：`GET /library/search` 只查内存索引（空格分词、书名前缀优先、受访问范围过滤、`truncated` 标记）；客户端输入即搜，结果直接开书或跳到所在目录 | `library.search_books`、`routes_files.py`、`LibrarySearchSheet.kt` |
+| 5 | **手感**：`list_dir` 的书籍条目抽成 `_book_entry`（此前嗅探/扩展名两条路径各写一份 dict）；`onCleared` 去掉主线程 `runBlocking`（读侧 `pendingWrites` 已保证顺序）；文字直发状态机拆成 `TextPageCache`（在途去重/裁剪/失败占位，附 JVM 单测） | `services/library.py`、`ReaderViewModel`、`TextPageCache.kt` |
+
+取舍说明：
+
+- 进度同步**不做**"服务器优先"：同一台设备上本地永远比服务器新，服务器记录只在
+  `updated_at` 更晚（换设备/重装）时才被采用。
+- 书签不自动摘录正文：PNG 模式下客户端没有文本，为一条摘录再开一个服务端端点
+  不划算；备注由用户写，信息量更大。
+- 搜索只覆盖书名/路径，不覆盖全文：全文搜索按书进行（阅读页内），书库级全文
+  会把"找一本书"变成"扫一遍所有文件"。
+
+验证：`pytest`（新增 `tests/test_library_search.py`，9 例：排序/多关键词/截断/范围过滤/
+HTTP 契约）；Android `:app:testDebugUnitTest`（新增 `TextPageCacheTest` 6 例、
+`RecentInPathTest` 5 例）+ `:app:assembleDebug` 通过。

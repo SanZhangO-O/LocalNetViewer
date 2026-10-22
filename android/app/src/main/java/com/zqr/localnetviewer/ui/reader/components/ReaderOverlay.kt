@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -52,6 +53,7 @@ fun ReaderOverlay(
     onOpenToc: () -> Unit,
     onOpenSettings: () -> Unit,
     onOpenSearch: () -> Unit,
+    onAddBookmark: () -> Unit,
     onSeek: (Int) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -84,6 +86,9 @@ fun ReaderOverlay(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onAddBookmark) {
+                        Icon(Icons.Default.BookmarkAdd, contentDescription = "添加书签")
+                    }
                     IconButton(onClick = onOpenSearch) {
                         Icon(Icons.Default.Search, contentDescription = "搜索")
                     }

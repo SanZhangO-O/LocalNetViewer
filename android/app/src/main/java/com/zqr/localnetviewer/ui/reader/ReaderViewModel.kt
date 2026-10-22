@@ -12,6 +12,7 @@ import com.zqr.localnetviewer.data.net.dto.ChapterInfoDto
 import com.zqr.localnetviewer.data.net.dto.FontInfoDto
 import com.zqr.localnetviewer.data.net.dto.SearchResultDto
 import com.zqr.localnetviewer.data.prefs.AppSettings
+import com.zqr.localnetviewer.data.prefs.Bookmark
 import com.zqr.localnetviewer.data.prefs.ReadingProgress
 import com.zqr.localnetviewer.data.runCatchingIo
 import com.zqr.localnetviewer.ui.common.InsetsPx
@@ -20,21 +21,20 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 阅读器状态机（设计 6.4 / 6.5）。
@@ -52,12 +52,16 @@ class ReaderViewModel(
     private val readerRepository = app.readerRepository
     private val settingsStore = app.settingsStore
     private val progressStore = app.progressStore
+    private val bookmarkStore = app.bookmarkStore
+    private val appRef = app
 
     data class UiState(
         val bookId: String = "",
         val title: String = "",
         val author: String? = null,
         val format: String = "",
+        /** 书籍虚拟路径（服务端 meta.source）：进度快照与"继续阅读"展示用。 */
+        val vpath: String = "",
         /** flow | fixed | strip */
         val mode: String = "flow",
         val layoutId: String? = null,
@@ -92,6 +96,10 @@ class ReaderViewModel(
         val searchLimited: Boolean = false,
         /** 放大查看时以 scale=2.0 重新渲染当页（只影响渲染，不影响分页） */
         val renderScale: Float = 1f,
+        /** 本书书签（本地，按页码升序）。 */
+        val bookmarks: List<Bookmark> = emptyList(),
+        /** "添加书签"对话框（输入备注）。 */
+        val bookmarkDialogOpen: Boolean = false,
     ) {
         val isFixed: Boolean get() = mode != "flow"
         val strip: Boolean get() = mode == "strip"
@@ -166,10 +174,12 @@ class ReaderViewModel(
     private var prefetchJob: Job? = null
 
     /**
-     * 文字直发在途请求集合（页号）：去重与"取消后重取"都依据它，
-     * 不能看 UI 状态里的 [TextPageState.Loading]（取消会留下残影）。
+     * 文字直发页缓存：在途去重 / 上限裁剪 / 失败占位都由 [TextPageCache] 负责。
+     *
+     * 单独成类而不是散在 ViewModel 里，是因为"取消会留下 Loading 残影"这类
+     * 规则必须与网络路径解耦才讲得清（也才能被普通单元测试覆盖）。
      */
-    private val textInFlight: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    private val textPageCache = TextPageCache(TEXT_CACHE_PAGES)
 
     /** 当前搜索结果对应的 layout_id：重排后旧页码失效，需要用锚点重新定位。 */
     private var searchLayoutId: String? = null
@@ -194,8 +204,13 @@ class ReaderViewModel(
     // ------------------------------------------------------------ 打开
     private suspend fun openBook() {
         try {
-            val meta = libraryRepository.bookMeta(bookId)
-            val progress = progressStore.get(bookId)
+            // meta 与进度并行取：多一次网络往返不该出现在"打开一本书"的关键路径上
+            // （进度失败已被 loadProgress 吞掉，不会连累 meta）
+            val (meta, progress) = coroutineScope {
+                val metaJob = async { libraryRepository.bookMeta(bookId) }
+                val progressJob = async { loadProgress(bookId) }
+                metaJob.await() to progressJob.await()
+            }
             restoreAnchor = progress?.anchor
             restoreRatio = progress?.ratio
             restorePage = progress?.page
@@ -204,6 +219,7 @@ class ReaderViewModel(
                     title = meta.title,
                     author = meta.author,
                     format = meta.format,
+                    vpath = meta.source.orEmpty(),
                     mode = meta.mode,
                     revision = meta.revision,
                     chapters = meta.chapters,
@@ -214,6 +230,7 @@ class ReaderViewModel(
                 )
             }
             metaLoaded = true
+            refreshBookmarks()
             maybeInitialLayout()
         } catch (error: ApiException) {
             _state.update {
@@ -233,6 +250,156 @@ class ReaderViewModel(
     private suspend fun loadFonts() {
         runCatchingIo { readerRepository.fonts() }.onSuccess { response ->
             _state.update { it.copy(fonts = response.fonts) }
+        }
+    }
+
+    // ------------------------------------------------------------ 进度同步
+    /**
+     * 取"该从哪读"：本地进度与服务器进度按 `updated_at` 取新。
+     *
+     * 服务器进度只在这几种情况下才比本地新：换了设备、重装过 App、或者本地
+     * DataStore 被清过。取新而不是"服务器优先"，是为了让**本机**刚翻的页
+     * 不被上一次同步的旧值覆盖（同一台设备上本地永远是权威）。
+     *
+     * 服务器不可达 / 没有记录都只是"没有更快的消息"，不是错误：阅读照常从本地恢复。
+     */
+    private suspend fun loadProgress(bookId: String): ReadingProgress? {
+        val local = progressStore.get(bookId)
+        if (!appRef.progressSyncEnabled) return local
+        // 有界等待：进度是"锦上添花"，不能让一个卡住的 /progress 请求把
+        // "打开一本书"一起卡住（阅读器要先出页面）。超时就先用本地进度。
+        val remote = withTimeoutOrNull(PROGRESS_FETCH_TIMEOUT_MS) {
+            try {
+                readerRepository.getProgress(bookId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // 404（该书暂无进度）/ 网络失败：都按"服务器没有更快的消息"处理
+                null
+            }
+        } ?: return local
+        val remoteAt = parseIsoMillis(remote.updatedAt)
+        if (remoteAt <= (local?.updatedAt ?: 0L)) return local
+        return ReadingProgress(
+            // 全零锚点视为"没有锚点"：服务器允许只存页码/比例
+            anchor = remote.anchor.takeIf { it != AnchorDto() },
+            page = remote.page ?: local?.page ?: 1,
+            ratio = remote.ratio ?: local?.ratio ?: 0f,
+            updatedAt = remoteAt,
+            title = local?.title.orEmpty(),
+            format = local?.format.orEmpty(),
+            vpath = local?.vpath.orEmpty(),
+            totalPages = local?.totalPages ?: 0,
+        )
+    }
+
+    /** 服务器时间格式固定为 `yyyy-MM-ddTHH:mm:ssZ`（UTC）；解析失败按"最旧"处理。 */
+    private fun parseIsoMillis(text: String): Long {
+        if (text.isEmpty()) return 0L
+        return runCatching {
+            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", java.util.Locale.US)
+                .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }
+                .parse(text)?.time ?: 0L
+        }.getOrDefault(0L)
+    }
+
+    /**
+     * 把进度写到服务器（多设备续读）。
+     *
+     * 只在拿得到锚点时同步：页码会随字号/屏幕变化，只有锚点在别的设备上仍然
+     * 指向同一段文字。拿不到锚点（固定版式漫画等）就不发——存一个错的位置
+     * 比不存更糟。
+     */
+    private suspend fun syncProgressToServer(record: ReadingProgress) {
+        if (!appRef.progressSyncEnabled) return
+        val anchor = record.anchor ?: return
+        runCatchingIo {
+            readerRepository.putProgress(bookId, anchor, record.page, record.ratio)
+        }
+    }
+
+    // ------------------------------------------------------------ 书签
+    private fun refreshBookmarks() {
+        viewModelScope.launch {
+            runCatchingIo { bookmarkStore.list(bookId) }.onSuccess { list ->
+                _state.update { it.copy(bookmarks = list) }
+            }
+        }
+    }
+
+    fun openBookmarkDialog() {
+        _state.update { it.copy(bookmarkDialogOpen = true) }
+    }
+
+    fun closeBookmarkDialog() {
+        _state.update { it.copy(bookmarkDialogOpen = false) }
+    }
+
+    /**
+     * 收藏当前位置（可选备注）。
+     *
+     * 锚点优先、页码兜底：`sessionAnchor()` 只在锚点确实属于当前页时返回，
+     * 翻页后立刻收藏不会把"新页码 + 旧锚点"写进书签。
+     */
+    fun addBookmark(note: String) {
+        val snapshot = _state.value
+        if (snapshot.totalPages <= 0) {
+            notify("内容还没准备好，稍后再试")
+            return
+        }
+        val bookmark = Bookmark(
+            page = snapshot.currentPage,
+            anchor = sessionAnchor(),
+            chapterTitle = snapshot.chapterTitle,
+            note = note.trim(),
+        )
+        viewModelScope.launch {
+            val list = runCatchingIo { bookmarkStore.add(bookId, bookmark) }.getOrNull()
+            if (list == null) {
+                // 写盘失败：保留原列表与对话框，别让用户以为已经存上了
+                notify("书签保存失败，请重试")
+                return@launch
+            }
+            _state.update {
+                it.copy(bookmarks = list, bookmarkDialogOpen = false, message = "已添加书签")
+            }
+        }
+    }
+
+    fun deleteBookmark(bookmarkId: String) {
+        viewModelScope.launch {
+            val list = runCatchingIo { bookmarkStore.remove(bookId, bookmarkId) }.getOrNull()
+            if (list == null) {
+                notify("删除书签失败，请重试")
+            } else {
+                _state.update { it.copy(bookmarks = list) }
+            }
+        }
+    }
+
+    /**
+     * 跳到书签。
+     *
+     * 有锚点就走 `/locate`（当前 layout 下重新换算页码）——书签可能是改字号
+     * 之前存的，直接按旧页码跳会落到别处；没有锚点才退回页码（越界自动收敛）。
+     */
+    fun jumpToBookmark(bookmark: Bookmark) {
+        val snapshot = _state.value
+        val layoutId = snapshot.layoutId
+        if (layoutId == null) {
+            // 排版还没回来：此时页码也只是默认值 1，跳过去等于把读者扔回开头
+            notify("排版还没准备好，稍后再试")
+            return
+        }
+        val anchor = bookmark.anchor
+        if (anchor == null) {
+            jumpToPage(bookmark.page)
+            return
+        }
+        viewModelScope.launch {
+            runCatchingIo { readerRepository.locate(bookId, layoutId, anchor).page }
+                .onSuccess { jumpToPage(it) }
+                .onFailure { notify("定位失败：${it.message}") }
         }
     }
 
@@ -598,24 +765,20 @@ class ReaderViewModel(
     /**
      * 登记"该页开始加载"。
      *
-     * 去重依据是 [textInFlight]（真实在途请求）而不是 UI 里的 [TextPageState.Loading]：
-     * 预取任务被翻页取消时状态可能残留 Loading，若拿它当"在途"就会永久拒绝重取
-     * （页面无限转圈且没有重试入口）。页码越界、layout 未就绪、[force] 场景外已有
-     * 内容时一律不取。
+     * 去重依据是 [TextPageCache] 的在途集合（真实在途请求）而不是 UI 里的
+     * [TextPageState.Loading]：预取任务被翻页取消时状态可能残留 Loading，
+     * 若拿它当"在途"就会永久拒绝重取（页面无限转圈且没有重试入口）。
+     * 页码越界、layout 未就绪、[force] 场景外已有内容时一律不取。
      */
     private fun startTextPageFetch(page: Int, force: Boolean = false): Boolean {
         val snapshot = _state.value
         if (!snapshot.textRenderActive) return false
         if (page < 1 || (snapshot.totalPages > 0 && page > snapshot.totalPages)) return false
         if (snapshot.layoutId == null) return false
-        if (!force && snapshot.textPages[page] is TextPageState.Ready) return false
-        if (!textInFlight.add(page)) return false
+        if (!textPageCache.begin(page, snapshot.textPages, force)) return false
         _state.update { state ->
             state.copy(
-                textPages = pruneTextPages(
-                    state.textPages + (page to TextPageState.Loading),
-                    state.currentPage,
-                )
+                textPages = textPageCache.loading(state.textPages, page, state.currentPage)
             )
         }
         return true
@@ -631,12 +794,12 @@ class ReaderViewModel(
      */
     private suspend fun fetchTextPage(page: Int) {
         val layoutId = _state.value.layoutId ?: run {
-            textInFlight.remove(page)
+            textPageCache.finish(page)
             return
         }
         try {
             val pageJson = readerRepository.flowPage(bookId, page, layoutId)
-            textInFlight.remove(page)
+            textPageCache.finish(page)
             val now = _state.value
             if (now.layoutId != layoutId || !now.textRenderActive) {
                 reRequestTextPageIfCurrent(page, now)
@@ -644,25 +807,23 @@ class ReaderViewModel(
             }
             _state.update { state ->
                 state.copy(
-                    textPages = pruneTextPages(
-                        state.textPages + (page to TextPageState.Ready(pageJson)),
+                    textPages = textPageCache.ready(
+                        state.textPages,
+                        page,
+                        pageJson,
                         state.currentPage,
                     )
                 )
             }
         } catch (cancelled: CancellationException) {
-            textInFlight.remove(page)
+            textPageCache.finish(page)
             _state.update { state ->
-                if (state.textPages[page] is TextPageState.Loading) {
-                    state.copy(textPages = state.textPages - page)
-                } else {
-                    state
-                }
+                state.copy(textPages = textPageCache.dropLoading(state.textPages, page))
             }
             reRequestTextPageIfCurrent(page, _state.value)
             throw cancelled
         } catch (error: ApiException) {
-            textInFlight.remove(page)
+            textPageCache.finish(page)
             val now = _state.value
             if (now.layoutId != layoutId || !now.textRenderActive) {
                 reRequestTextPageIfCurrent(page, now)
@@ -675,10 +836,10 @@ class ReaderViewModel(
                     // 留给 Failed 占位；重建成功会整体清空 textPages 并自动重取。
                     _state.update { state ->
                         state.copy(
-                            textPages = pruneTextPages(
-                                state.textPages + (
-                                    page to TextPageState.Failed("排版已失效，正在自动重建")
-                                ),
+                            textPages = textPageCache.failed(
+                                state.textPages,
+                                page,
+                                "排版已失效，正在自动重建",
                                 state.currentPage,
                             )
                         )
@@ -687,8 +848,10 @@ class ReaderViewModel(
                 }
                 else -> _state.update { state ->
                     state.copy(
-                        textPages = pruneTextPages(
-                            state.textPages + (page to TextPageState.Failed(error.message)),
+                        textPages = textPageCache.failed(
+                            state.textPages,
+                            page,
+                            error.message,
                             state.currentPage,
                         )
                     )
@@ -696,7 +859,7 @@ class ReaderViewModel(
             }
         } catch (error: Exception) {
             // 预取在 IO 域运行：非 ApiException 不能把协程炸掉；过期 layout 的失败同样丢弃
-            textInFlight.remove(page)
+            textPageCache.finish(page)
             val now = _state.value
             if (now.layoutId != layoutId || !now.textRenderActive) {
                 reRequestTextPageIfCurrent(page, now)
@@ -704,8 +867,10 @@ class ReaderViewModel(
             }
             _state.update { state ->
                 state.copy(
-                    textPages = pruneTextPages(
-                        state.textPages + (page to TextPageState.Failed(error.message ?: "取页失败")),
+                    textPages = textPageCache.failed(
+                        state.textPages,
+                        page,
+                        error.message ?: "取页失败",
                         state.currentPage,
                     )
                 )
@@ -728,18 +893,6 @@ class ReaderViewModel(
     /** 文字直发模式下的整页重试（页面失败占位上调用）。 */
     fun retryTextPage(page: Int) {
         requestTextPage(page, force = true)
-    }
-
-    /** 页缓存上限：只保留离当前页最近的 N 页，避免长时间阅读把整本 JSON 攒在内存里。 */
-    private fun pruneTextPages(
-        pages: Map<Int, TextPageState>,
-        currentPage: Int,
-    ): Map<Int, TextPageState> {
-        if (pages.size <= TEXT_CACHE_PAGES) return pages
-        return pages.entries
-            .sortedBy { abs(it.key - currentPage) }
-            .take(TEXT_CACHE_PAGES)
-            .associate { it.key to it.value }
     }
 
     // ------------------------------------------------------------ URL
@@ -976,14 +1129,25 @@ class ReaderViewModel(
         }
         // 兜底落盘：viewModelScope 已不可用，交给进程级 scope；写入顺序由
         // ProgressStore 保证（pending Job + get/flow 先等待），因此"退出后立刻
-        // 重开"仍能读到最新位置。这里再有界等待 300ms：正常 DataStore 写入毫秒级
-        // 完成，保证进程被立刻杀掉前已落盘；磁盘异常时也不会卡死退出路径。
-        val job = progressStore.putAsync(
-            getApplication<App>().applicationScope,
-            bookId,
-            ReadingProgress(anchor = anchor, page = page, ratio = ratio),
+        // 重开"仍能读到最新位置。
+        // 这里**不再**用 runBlocking 等它落盘：读侧会 join pendingWrites，
+        // 而主线程上等磁盘换来的只是退出时的一次卡顿（DataStore 写入是毫秒级，
+        // 真慢的时候 300ms 也等不完）。
+        val record = ReadingProgress(
+            anchor = anchor,
+            page = page,
+            ratio = ratio,
+            title = _state.value.title,
+            format = _state.value.format,
+            vpath = _state.value.vpath,
+            totalPages = total,
         )
-        runBlocking { withTimeoutOrNull(300L) { job.join() } }
+        val scope = getApplication<App>().applicationScope
+        progressStore.putAsync(scope, bookId, record)
+        if (anchor != null) {
+            // 多设备续读：阅读页已销毁，失败也不能有任何用户可见影响
+            scope.launch { syncProgressToServer(record) }
+        }
     }
 
     /** 会话内锚点：只有它确实属于当前页时才可信（否则用比例恢复）。 */
@@ -1003,17 +1167,19 @@ class ReaderViewModel(
         // 只有锚点属于要保存的这一页时才记录；否则只存页码+比例，避免"错锚点"把位置带偏
         val anchor = if (anchorPage == page) snapshot.anchor else null
         val ratio = ratioFor(page, snapshot.totalPages) ?: 0f
+        val record = ReadingProgress(
+            anchor = anchor,
+            page = page,
+            ratio = ratio.coerceIn(0f, 1f),
+            // 快照字段：书架"继续阅读"卡片直接用它，不必再请求一次 meta
+            title = snapshot.title,
+            format = snapshot.format,
+            vpath = snapshot.vpath,
+            totalPages = snapshot.totalPages,
+        )
         // 进度是"尽力而为"的本地数据：写失败（磁盘满等）不能影响阅读，也不能抛出崩溃
-        runCatchingIo {
-            progressStore.put(
-                bookId,
-                ReadingProgress(
-                    anchor = anchor,
-                    page = page,
-                    ratio = ratio.coerceIn(0f, 1f),
-                ),
-            )
-        }
+        runCatchingIo { progressStore.put(bookId, record) }
+        syncProgressToServer(record)
     }
 
     private companion object {
@@ -1025,5 +1191,8 @@ class ReaderViewModel(
 
         /** 文字直发页缓存上限（页号离当前页最近优先保留）。 */
         const val TEXT_CACHE_PAGES = 12
+
+        /** 打开书时等待服务器进度的上限：超过就用本地进度，别卡住阅读器。 */
+        const val PROGRESS_FETCH_TIMEOUT_MS = 2000L
     }
 }

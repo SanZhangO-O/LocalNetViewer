@@ -23,6 +23,17 @@ data class GalleryInfoDto(
     @SerialName("can_open_as_book") val canOpenAsBook: Boolean = false,
 )
 
+/** 书库搜索 `GET /api/v1/library/search`（只匹配索引里的书名/路径）。 */
+@Serializable
+data class LibrarySearchResponseDto(
+    val query: String = "",
+    val entries: List<FileEntryDto> = emptyList(),
+    val total: Int = 0,
+    /** 结果被 limit 截断（total > entries.size）。 */
+    val truncated: Boolean = false,
+    val scanning: Boolean = false,
+)
+
 @Serializable
 data class FileEntryDto(
     val name: String,

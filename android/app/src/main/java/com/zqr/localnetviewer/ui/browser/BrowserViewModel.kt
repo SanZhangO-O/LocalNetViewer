@@ -6,11 +6,15 @@ import com.zqr.localnetviewer.App
 import com.zqr.localnetviewer.data.net.ApiException
 import com.zqr.localnetviewer.data.net.dto.FileEntryDto
 import com.zqr.localnetviewer.data.net.dto.GalleryInfoDto
+import com.zqr.localnetviewer.data.prefs.RecentBook
+import com.zqr.localnetviewer.data.runCatchingIo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
@@ -47,6 +51,23 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
          * 回顶/恢复滚动）与"从阅读页返回重建组合"（版本没变，保持原有位置）。
          */
         val dataVersion: Int = 0,
+        /** 最近阅读（继续阅读卡片），按落盘时间倒序。 */
+        val recent: List<RecentBook> = emptyList(),
+        /** 当前列表里各书的已读比例（book_id → 0..1），用于列表行的细进度条。 */
+        val progressById: Map<String, Float> = emptyMap(),
+        /** 当前服务器可见的书库名（只有根目录响应带；子目录沿用上一次）。 */
+        val libraryNames: List<String> = emptyList(),
+        /** 书库搜索面板。 */
+        val searchOpen: Boolean = false,
+        val searchQuery: String = "",
+        val searching: Boolean = false,
+        val searchResults: List<FileEntryDto> = emptyList(),
+        val searchTotal: Int = 0,
+        val searchTruncated: Boolean = false,
+        /** 搜索时书库仍在扫描：结果可能不全，界面要明说。 */
+        val searchScanning: Boolean = false,
+        /** 搜索失败原因（网络/服务端错误）：不能与"没有匹配"混为一谈。 */
+        val searchError: String? = null,
     ) {
         val totalPages: Int get() = totalPagesOf(total)
 
@@ -71,6 +92,7 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
     val openMedia: StateFlow<MediaTarget?> = _openMedia.asStateFlow()
 
     private var loadJob: Job? = null
+    private var searchJob: Job? = null
 
     /** 目录访问历史：进入新目录时压入离开处的（目录, 页码, 滚动位置），返回时弹出恢复。 */
     private class HistoryEntry(val path: String, val page: Int, val scrollIndex: Int, val scrollOffset: Int)
@@ -127,7 +149,151 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
     init {
         _state.update { it.copy(serverSummary = appRef.serverSummary) }
+        refreshReadingProgress()
         load("/")
+    }
+
+    // ------------------------------------------------------------ 继续阅读
+    /**
+     * 重新读一遍本地进度（书架卡片 + 列表进度条）。
+     *
+     * 由 init 与浏览页 ON_RESUME 调用：从阅读页返回时进度刚写过盘，
+     * 不刷新的话卡片会停在"上次进来时"的页码。
+     */
+    fun refreshReadingProgress() {
+        viewModelScope.launch {
+            runCatchingIo {
+                val all = appRef.progressStore.recent(RECENT_LOAD).first()
+                // 只展示"当前服务器上确实存在该书库"的书：同一台设备可能连过多个
+                // 服务器，而进度按 book_id 全局存，不筛会把 A 服务器的书摆到 B 的
+                // 书架上（点开必然 404）。用书库名而不是服务器地址：局域网里 DHCP
+                // 换 IP 是常事，按地址筛会让书架在换 IP 后整个消失。
+                val roots = _state.value.libraryNames.toSet()
+                val list = if (roots.isEmpty()) {
+                    all
+                } else {
+                    all.filter { book ->
+                        val root = book.progress.vpath.trimStart('/').substringBefore('/')
+                        // 旧记录没有 vpath：无从判断，按可见处理
+                        root.isEmpty() || root in roots
+                    }
+                }
+                _state.update {
+                    it.copy(
+                        recent = list.take(RECENT_ON_SHELF),
+                        progressById = list.mapNotNull { book ->
+                            book.fraction?.let { fraction -> book.bookId to fraction }
+                        }.toMap(),
+                    )
+                }
+            }
+        }
+    }
+
+    /** 打开"最近阅读"里的书（与点列表行同一条路径）。 */
+    fun openRecent(bookId: String) {
+        if (bookId.isEmpty()) {
+            showMessage("这本书的进度记录缺少 book_id")
+            return
+        }
+        _openBook.value = bookId
+    }
+
+    fun coverUrlForBook(bookId: String, width: Int = 240): String =
+        repository.coverUrlForBook(bookId, width)
+
+    // ------------------------------------------------------------ 书库搜索
+    fun openSearch() {
+        _state.update { it.copy(searchOpen = true) }
+    }
+
+    fun closeSearch() {
+        searchJob?.cancel()
+        // 保留查询与结果（再打开时接着看），只清掉上一次的错误
+        _state.update { it.copy(searchOpen = false, searching = false, searchError = null) }
+    }
+
+    /**
+     * 输入即搜（250ms 防抖）：书库搜索只查内存索引，单次几毫秒，
+     * 但大书库每个按键都发一次请求没有意义，防抖把连打合并成一次。
+     */
+    fun onSearchQueryChange(value: String) {
+        // 服务端 q 限长 120：超长粘贴在客户端截断，别让它变成一次 422
+        val query = value.take(SEARCH_MAX_QUERY)
+        _state.update { it.copy(searchQuery = query, searchError = null) }
+        searchJob?.cancel()
+        val keyword = query.trim()
+        if (keyword.isEmpty()) {
+            _state.update {
+                it.copy(
+                    searching = false,
+                    searchResults = emptyList(),
+                    searchTotal = 0,
+                    searchTruncated = false,
+                    searchScanning = false,
+                    searchError = null,
+                )
+            }
+            return
+        }
+        searchJob = viewModelScope.launch {
+            delay(SEARCH_DEBOUNCE_MS)
+            searchNow(keyword)
+        }
+    }
+
+    /** 键盘"搜索"键：跳过防抖立即查。 */
+    fun submitSearch() {
+        val keyword = _state.value.searchQuery.trim()
+        if (keyword.isEmpty()) return
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch { searchNow(keyword) }
+    }
+
+    private suspend fun searchNow(keyword: String) {
+        _state.update { it.copy(searching = true, searchError = null) }
+        try {
+            val response = repository.searchLibrary(keyword, SEARCH_LIMIT)
+            // 过期响应防护：防抖任务被取消后仍可能已返回，关键词变了就不能覆盖
+            if (_state.value.searchQuery.trim() != keyword) return
+            _state.update {
+                it.copy(
+                    searching = false,
+                    searchResults = response.entries,
+                    searchTotal = response.total,
+                    searchTruncated = response.truncated,
+                    searchScanning = response.scanning,
+                    searchError = null,
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: ApiException) {
+            if (_state.value.searchQuery.trim() != keyword) return
+            // 错误留在面板里显示：Snackbar 会被底部面板盖住，用户只看到"没有匹配"
+            _state.update { it.copy(searching = false, searchError = error.message) }
+        }
+    }
+
+    /** 点搜索结果：能打开就直接进书（这是搜索的主要目的）。 */
+    fun openSearchResult(entry: FileEntryDto) {
+        val bookId = entry.bookId
+        when {
+            entry.isBook && !bookId.isNullOrEmpty() && entry.openable -> {
+                closeSearch()
+                _openBook.value = bookId
+            }
+            !entry.openable -> showMessage(entry.reason ?: "该格式暂不可用")
+            else -> showMessage("这本书还没有索引，请稍后重试")
+        }
+    }
+
+    /** 跳到搜索结果所在目录（书打不开 / 想看看同目录还有什么时用）。 */
+    fun openContainingFolder(entry: FileEntryDto) {
+        val path = entry.path.trimEnd('/')
+        val parent = path.substringBeforeLast('/', "").ifEmpty { "/" }
+        closeSearch()
+        load(parent)
     }
 
     /**
@@ -210,8 +376,13 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
                         loading = false,
                         serverSummary = appRef.serverSummary,
                         dataVersion = it.dataVersion + 1,
+                        // 根目录响应才带书库清单；子目录响应没有就沿用上一次
+                        libraryNames = response.libraries?.map { lib -> lib.name }
+                            ?: it.libraryNames,
                     )
                 }
+                // 书库清单第一次到达：按它重新过滤"继续阅读"（初始化时可能还没拿到）
+                if (response.libraries != null) refreshReadingProgress()
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: ApiException) {
@@ -349,6 +520,17 @@ class BrowserViewModel(app: App) : AndroidViewModel(app) {
 
         /** 目录历史栈深度上限（防无限深度浏览撑爆内存）。 */
         const val MAX_HISTORY = 32
+
+        /** "继续阅读"最多显示几本；读多少条用来算列表进度条。 */
+        const val RECENT_ON_SHELF = 8
+        const val RECENT_LOAD = 50
+
+        /** 书库搜索：结果条数上限与输入防抖。 */
+        const val SEARCH_LIMIT = 50
+        const val SEARCH_DEBOUNCE_MS = 250L
+
+        /** 与服务端 `q` 的 max_length 一致（避免超长输入换来一次 422）。 */
+        const val SEARCH_MAX_QUERY = 120
 
         fun totalPagesOf(total: Int): Int = if (total <= 0) 1 else (total + PAGE_SIZE - 1) / PAGE_SIZE
     }

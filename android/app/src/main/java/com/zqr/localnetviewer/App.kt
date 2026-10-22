@@ -13,6 +13,7 @@ import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
 import com.zqr.localnetviewer.data.net.ApiClient
+import com.zqr.localnetviewer.data.prefs.BookmarkStore
 import com.zqr.localnetviewer.data.prefs.ProgressStore
 import com.zqr.localnetviewer.data.prefs.SettingsStore
 import com.zqr.localnetviewer.data.repo.FontStore
@@ -45,6 +46,9 @@ class App : Application(), SingletonImageLoader.Factory {
 
     /** 每本书的阅读进度（本地 DataStore）。 */
     val progressStore: ProgressStore by lazy { ProgressStore(this) }
+
+    /** 每本书的书签（本地 DataStore）。 */
+    val bookmarkStore: BookmarkStore by lazy { BookmarkStore(this) }
 
     /** HTTP 客户端：地址可切换，令牌与超时统一管理。 */
     val apiClient: ApiClient by lazy { ApiClient() }
@@ -101,6 +105,17 @@ class App : Application(), SingletonImageLoader.Factory {
     fun updateServerSummary(text: String) {
         serverSummary = text
     }
+
+    /**
+     * 服务器是否提供进度同步（`/server/info` 的 `features.progress_sync`）。
+     *
+     * 默认 true：本项目服务器一直有这个端点，而"进程被系统回收后直接还原到阅读页"
+     * 时不会经过连接页、拿不到 capabilities。连接页拿到 capabilities 后以服务器
+     * 声明为准（老服务器没有该端点时置 false，避免每次翻页都去撞 404）。
+     * 阅读页把 GET 的 404 当作"这本书还没有服务器进度"，不会因此关闭同步。
+     */
+    @Volatile
+    var progressSyncEnabled: Boolean = true
 
     /**
      * Coil 3 图片加载器：复用 OkHttp（与接口同一连接池）+ 磁盘缓存兜底页面图片。

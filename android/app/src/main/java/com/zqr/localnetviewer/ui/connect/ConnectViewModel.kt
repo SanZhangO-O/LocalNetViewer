@@ -142,6 +142,8 @@ class ConnectViewModel(app: App) : AndroidViewModel(app) {
                 // 服务器信息放到 App 上：连接成功后本页立刻被移出返回栈，
                 // 渲染在这里的"服务器信息卡片"用户根本看不到（设计 6.3）
                 appRef.updateServerSummary("${info.name} v${info.version} · $summary")
+                // 进度同步能力：老服务器没有 /progress 端点时别每页都去撞 404
+                appRef.progressSyncEnabled = info.features.progressSync
                 _state.update {
                     it.copy(
                         connecting = false,

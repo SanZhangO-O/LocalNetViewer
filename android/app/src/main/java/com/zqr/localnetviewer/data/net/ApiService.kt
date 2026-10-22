@@ -7,6 +7,7 @@ import com.zqr.localnetviewer.data.net.dto.FilesResponseDto
 import com.zqr.localnetviewer.data.net.dto.FontsResponseDto
 import com.zqr.localnetviewer.data.net.dto.LayoutProfileDto
 import com.zqr.localnetviewer.data.net.dto.LayoutResponseDto
+import com.zqr.localnetviewer.data.net.dto.LibrarySearchResponseDto
 import com.zqr.localnetviewer.data.net.dto.LocateResponseDto
 import com.zqr.localnetviewer.data.net.dto.OpenArchiveRequestDto
 import com.zqr.localnetviewer.data.net.dto.OpenArchiveResponseDto
@@ -37,6 +38,13 @@ interface ApiService {
         @Query("limit") limit: Int = 1000,
         @Query("offset") offset: Int = 0,
     ): FilesResponseDto
+
+    /** 书库搜索：书名 / 路径关键词（空格分词 = 全部命中）。 */
+    @GET("api/v1/library/search")
+    suspend fun searchLibrary(
+        @Query("q") query: String,
+        @Query("limit") limit: Int = 50,
+    ): LibrarySearchResponseDto
 
     @GET("api/v1/books/{bookId}/meta")
     suspend fun bookMeta(@Path("bookId") bookId: String): BookMetaDto

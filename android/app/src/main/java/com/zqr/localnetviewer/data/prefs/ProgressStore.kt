@@ -9,9 +9,11 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.zqr.localnetviewer.data.net.dto.AnchorDto
 import com.zqr.localnetviewer.data.runCatchingIo
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.launch
@@ -39,7 +41,33 @@ data class ReadingProgress(
     val page: Int = 1,
     val ratio: Float = 0f,
     val updatedAt: Long = 0L,
+    /**
+     * 书架展示用的快照字段（旧版本写入的记录没有它们，缺省为空）。
+     *
+     * 存进进度而不是另建一张"最近阅读"表：一本书只有一条记录，"读到哪"和
+     * "这是什么书"天然同生命周期，少一份需要同步的草稿。
+     */
+    val title: String = "",
+    val format: String = "",
+    val vpath: String = "",
+    /** 上次已知总页数（0 = 未知）：continue-reading 卡片用它显示"第 42 页"。 */
+    val totalPages: Int = 0,
 )
+
+/** 一条"最近阅读"：book_id 与它当前的进度快照。 */
+data class RecentBook(
+    val bookId: String,
+    val progress: ReadingProgress,
+) {
+    val displayTitle: String
+        get() = progress.title.ifEmpty {
+            progress.vpath.trimEnd('/').substringAfterLast('/').ifEmpty { bookId }
+        }
+
+    /** 0..1；未知（旧记录没有比例）时为 null。 */
+    val fraction: Float?
+        get() = progress.ratio.takeIf { it in 0.0001f..1f }
+}
 
 class ProgressStore(private val context: Context) {
 
@@ -66,6 +94,33 @@ class ProgressStore(private val context: Context) {
         }
 
     suspend fun get(bookId: String): ReadingProgress? = flow(bookId).first()
+
+    /**
+     * 最近阅读（按落盘时间倒序，最多 [limit] 本）。
+     *
+     * 直接遍历 DataStore 的键而不是再维护一份索引：键前缀本身就是 book_id，
+     * 记录数上限就是"读过的书数"，量级与书架相当，启动时读一遍足够便宜。
+     */
+    fun recent(limit: Int = 20): Flow<List<RecentBook>> =
+        store.data
+            .onStart { pendingWrites.values.toList().forEach { it.join() } }
+            .map { prefs ->
+                prefs.asMap().entries
+                    .mapNotNull { (key, value) ->
+                        val name = key.name
+                        if (!name.startsWith(KEY_PREFIX) || value !is String) return@mapNotNull null
+                        val progress = runCatching {
+                            prefsJson.decodeFromString<ReadingProgress>(value)
+                        }.getOrNull() ?: return@mapNotNull null
+                        if (progress.updatedAt <= 0L) return@mapNotNull null
+                        RecentBook(name.removePrefix(KEY_PREFIX), progress)
+                    }
+                    .sortedByDescending { it.progress.updatedAt }
+                    .take(limit)
+            }
+            // 解码 N 条 JSON 是纯 CPU 活：书架每次 ON_RESUME 都会读一遍，
+            // 不该占主线程（DataStore 自身的 IO 调度不覆盖 map 里的解码）
+            .flowOn(Dispatchers.IO)
 
     /**
      * 异步兜底写入：登记为该书 pending，之后的 [get]/[flow] 会先等待它落盘。
@@ -101,5 +156,9 @@ class ProgressStore(private val context: Context) {
         }
     }
 
-    private fun key(bookId: String) = stringPreferencesKey("progress_$bookId")
+    private fun key(bookId: String) = stringPreferencesKey("$KEY_PREFIX$bookId")
+
+    private companion object {
+        const val KEY_PREFIX = "progress_"
+    }
 }

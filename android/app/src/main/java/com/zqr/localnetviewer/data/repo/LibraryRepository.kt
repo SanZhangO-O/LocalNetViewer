@@ -7,6 +7,7 @@ import com.zqr.localnetviewer.data.net.dto.ArchiveEntryItemDto
 import com.zqr.localnetviewer.data.net.dto.BookMetaDto
 import com.zqr.localnetviewer.data.net.dto.FileEntryDto
 import com.zqr.localnetviewer.data.net.dto.FilesResponseDto
+import com.zqr.localnetviewer.data.net.dto.LibrarySearchResponseDto
 import com.zqr.localnetviewer.data.net.dto.OpenArchiveRequestDto
 import com.zqr.localnetviewer.data.net.dto.OpenArchiveResponseDto
 import com.zqr.localnetviewer.data.net.dto.OpenFolderRequestDto
@@ -20,6 +21,10 @@ class LibraryRepository(private val client: ApiClient) {
 
     suspend fun listFiles(path: String, limit: Int = 500, offset: Int = 0): FilesResponseDto =
         apiCall(client) { client.api().listFiles(path, limit, offset) }
+
+    /** 书库搜索（服务端只查内存索引，不读文件）。 */
+    suspend fun searchLibrary(query: String, limit: Int = 50): LibrarySearchResponseDto =
+        apiCall(client) { client.api().searchLibrary(query, limit) }
 
     suspend fun bookMeta(bookId: String): BookMetaDto =
         apiCall(client) { client.api().bookMeta(bookId) }
@@ -64,4 +69,13 @@ class LibraryRepository(private val client: ApiClient) {
         val withWidth = if ('?' in provided) "$provided&w=$width" else "$provided?w=$width"
         return client.absoluteUrl(withWidth)
     }
+
+    /**
+     * 只有 book_id 时构造封面 URL（"继续阅读"列表用：那里没有列表条目）。
+     *
+     * 不带 rev：最近阅读只缓存一屏缩略图，服务端封面本身有 24h 缓存头，
+     * 内容变化后最多一天收敛，换一次多一次请求不值。
+     */
+    fun coverUrlForBook(bookId: String, width: Int = 240): String =
+        client.absoluteUrl("/api/v1/books/$bookId/cover?w=$width")
 }

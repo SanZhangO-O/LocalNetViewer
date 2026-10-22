@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import os
 import threading
@@ -762,25 +763,13 @@ class LibraryService:
                         )
                     continue
                 fmt = detected.format or "text"
-                reason = registry.openable_reason(fmt)
                 book_id = self._book_id_for(
                     child_vpath, Path(child_real), st.st_size, st.st_mtime, fmt
                 )
-                rev = content_revision(book_id, int(st.st_size), float(st.st_mtime))
                 entries.append(
-                    {
-                        "name": name,
-                        "type": "book",
-                        "path": child_vpath,
-                        "format": fmt,
-                        "book_id": book_id,
-                        "size": int(st.st_size),
-                        "mtime": iso_time(st.st_mtime),
-                        "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
-                        "openable": reason is None,
-                        "reason": reason,
-                        "has_contents": registry.is_browsable_format(fmt),
-                    }
+                    self._book_entry(
+                        name, child_vpath, fmt, book_id, st.st_size, st.st_mtime
+                    )
                 )
                 continue
 
@@ -802,23 +791,10 @@ class LibraryService:
             book_id = self._book_id_for(
                 child_vpath, Path(child_real), st.st_size, st.st_mtime, fmt
             )
-            # 封面 URL 带内容修订号：内容变化后 URL 变化，客户端强缓存自然失效
-            rev = content_revision(book_id, int(st.st_size), float(st.st_mtime))
-            reason = registry.openable_reason(fmt)
             entries.append(
-                {
-                    "name": name,
-                    "type": "book",
-                    "path": child_vpath,
-                    "format": fmt,
-                    "book_id": book_id,
-                    "size": int(st.st_size),
-                    "mtime": iso_time(st.st_mtime),
-                    "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
-                    "openable": reason is None,
-                    "reason": reason,
-                    "has_contents": registry.is_browsable_format(fmt),
-                }
+                self._book_entry(
+                    name, child_vpath, fmt, book_id, st.st_size, st.st_mtime
+                )
             )
 
         gallery_info = self.dir_gallery_info(v, real)
@@ -867,6 +843,104 @@ class LibraryService:
             "limit": int(limit),
             "offset": int(offset),
             "scanning": self._scanning.is_set(),
+        }
+
+    # ------------------------------------------------------------ 书库搜索
+    def search_books(
+        self,
+        query: str,
+        limit: int = 50,
+        allowed: Optional[AccessScope] = None,
+    ) -> Dict[str, Any]:
+        """按书名/路径搜索整个书库（只查内存索引，不做全文）。
+
+        大书库的痛点是"知道书名，不想一层层点进去"：目录列表只解决浏览，
+        解决不了"那本书在哪"。这里直接对 ``_books`` 的虚拟路径做子串匹配
+        （空格分词 = 全部命中），不 stat、不读文件、不碰磁盘。
+
+        排序：书名以**首个关键词**开头 > 书名包含全部关键词 > 仅路径包含；
+        同档按路径自然序，这样同一个目录里的命中会挨在一起，结果看起来像
+        "书架的浓缩版"。首个关键词而不是整串：多关键词查询里整串几乎不可能
+        是书名的前缀（"三体 黑暗" 不该因此掉到最后一档）。
+        """
+        tokens = [t for t in str(query or "").strip().casefold().split() if t]
+        if not tokens:
+            return {"entries": [], "total": 0, "truncated": False}
+        first = tokens[0]
+        # 只取引用、不复制每条记录：大书库里 30 万本书复制一遍 dict 是几十 MB 的
+        # 瞬时分配，而搜索本身只需要 vpath（命中后要用的 info 也一并带出来）
+        with self._lock:
+            snapshot = list(self._books.items())
+
+        hits: List[Tuple[int, str, Dict[str, Any]]] = []
+        for vpath, info in snapshot:
+            root = vpath.lstrip("/").split("/", 1)[0]
+            if allowed is not None and not allowed.allows_root(root):
+                continue
+            haystack = vpath.casefold()
+            if not all(token in haystack for token in tokens):
+                continue
+            name = vpath.rsplit("/", 1)[-1].casefold()
+            if name.startswith(first):
+                rank = 0
+            elif all(token in name for token in tokens):
+                rank = 1
+            else:
+                rank = 2
+            hits.append((rank, vpath, info))
+
+        total = len(hits)
+        entries = []
+        # 只取前 limit 条：命中很多时（比如搜 "a"）全量 sort 的 key 计算是浪费，
+        # nsmallest 对 n 大、k 小的场景是 O(n log k)。
+        for _rank, vpath, info in heapq.nsmallest(
+            max(0, int(limit)), hits, key=lambda item: (item[0], natural_key(item[1]))
+        ):
+            fmt = str(info.get("format") or registry.format_of(vpath) or "")
+            book_id = str(info.get("book_id") or "")
+            if not book_id:
+                continue
+            entries.append(
+                self._book_entry(
+                    vpath.rsplit("/", 1)[-1],
+                    vpath,
+                    fmt,
+                    book_id,
+                    int(info.get("size", 0)),
+                    float(info.get("mtime", 0.0)),
+                )
+            )
+        return {"entries": entries, "total": total, "truncated": total > len(entries)}
+
+    def _book_entry(
+        self,
+        name: str,
+        vpath: str,
+        fmt: str,
+        book_id: str,
+        size: int,
+        mtime: float,
+    ) -> Dict[str, Any]:
+        """书籍条目的统一形状（列表与搜索共用）。
+
+        抽出来的理由不是行数，而是一致性：此前列表里"嗅探出的书"与"按扩展名认出
+        的书"各写了一遍同一份 dict，任何新增字段（如 has_contents）都得记得改两处。
+        """
+        reason = registry.openable_reason(fmt)
+        # 封面 URL 带内容修订号：内容变化后 URL 变化，客户端强缓存自然失效
+        rev = content_revision(book_id, int(size), float(mtime))
+        return {
+            "name": name,
+            "type": "book",
+            "path": vpath,
+            "format": fmt,
+            "book_id": book_id,
+            "size": int(size),
+            "mtime": iso_time(mtime),
+            "cover_url": f"/api/v1/books/{book_id}/cover?rev={rev}",
+            "openable": reason is None,
+            "reason": reason,
+            "has_contents": registry.is_browsable_format(fmt),
         }
 
     def _book_id_for(

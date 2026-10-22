@@ -62,6 +62,7 @@ import com.zqr.localnetviewer.ui.common.LoadingView
 import com.zqr.localnetviewer.ui.common.findActivity
 import com.zqr.localnetviewer.ui.common.rememberStableInsets
 import com.zqr.localnetviewer.ui.common.rememberWindowSizePx
+import com.zqr.localnetviewer.ui.reader.components.AddBookmarkDialog
 import com.zqr.localnetviewer.ui.reader.components.PageImage
 import com.zqr.localnetviewer.ui.reader.components.ReaderOverlay
 import com.zqr.localnetviewer.ui.reader.components.SearchSheet
@@ -96,6 +97,7 @@ fun ReaderScreen(
     // 沉浸态不拦返回：浏览内容时按返回应直接退出，工具栏用点击屏幕中央呼出。
     BackHandler(enabled = true) {
         when {
+            state.bookmarkDialogOpen -> vm.closeBookmarkDialog()
             state.tocOpen -> vm.closeToc()
             state.settingsOpen -> vm.closeSettings()
             state.searchOpen -> vm.closeSearch()
@@ -209,6 +211,7 @@ fun ReaderScreen(
             onOpenToc = vm::openToc,
             onOpenSettings = vm::openSettings,
             onOpenSearch = vm::openSearch,
+            onAddBookmark = vm::openBookmarkDialog,
             onSeek = vm::jumpToPage,
         )
 
@@ -225,8 +228,19 @@ fun ReaderScreen(
             chapters = state.chapters,
             currentChapterIndex = state.chapterIndex,
             currentChapterTitle = state.chapterTitle,
+            bookmarks = state.bookmarks,
             onSelect = vm::jumpToChapter,
+            onJumpBookmark = vm::jumpToBookmark,
+            onDeleteBookmark = vm::deleteBookmark,
             onDismiss = vm::closeToc,
+        )
+    }
+    if (state.bookmarkDialogOpen) {
+        AddBookmarkDialog(
+            pageLabel = state.pageLabel,
+            chapterTitle = state.chapterTitle,
+            onConfirm = vm::addBookmark,
+            onDismiss = vm::closeBookmarkDialog,
         )
     }
     if (state.settingsOpen) {

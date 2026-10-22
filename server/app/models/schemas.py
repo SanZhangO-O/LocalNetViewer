@@ -153,6 +153,17 @@ class FilesResponse(BaseModel):
     libraries: Optional[List[LibraryInfo]] = None
 
 
+class LibrarySearchResponse(BaseModel):
+    """书库搜索（`GET /library/search`）：只查内存索引，不做全文检索。"""
+
+    query: str = ""
+    entries: List[FileEntry] = Field(default_factory=list)
+    total: int = 0
+    # total 大于 entries 长度 = 结果被 limit 截断（客户端提示"仅显示前 N 条"）
+    truncated: bool = False
+    scanning: bool = False
+
+
 # ------------------------------------------------------------- 压缩包内容
 class ArchiveSummary(BaseModel):
     """压缩包内容概览（设计 7.6）。"""
