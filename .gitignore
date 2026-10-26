@@ -6,6 +6,10 @@
 .e2e/*.log
 .e2e/server-config.yaml
 
+# Python 缓存
+__pycache__/
+*.py[cod]
+
 # 操作系统垃圾文件
 Thumbs.db
 .DS_Store
