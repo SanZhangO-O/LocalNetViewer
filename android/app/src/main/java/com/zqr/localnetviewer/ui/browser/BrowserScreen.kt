@@ -204,18 +204,10 @@ fun BrowserScreen(
                 onNavigate = { vm.load(it) },
             )
             HorizontalDivider()
-            // "继续阅读"摆在第一屏：根目录给全部最近阅读，子目录只给当前书架
-            // （从阅读页返回时 ON_RESUME 会刷新进度）
+            // "继续阅读"与列表平级：渲染为 LazyColumn 首项，随内容一起滚动，
+            // 不再固定钉在列表上方占一整块高度（从阅读页返回时 ON_RESUME 会刷新进度）
             val shelf = remember(state.recent, state.path) {
                 recentInPath(state.recent, state.path)
-            }
-            if (shelf.isNotEmpty()) {
-                RecentReadingShelf(
-                    recent = shelf,
-                    coverUrl = { bookId -> vm.coverUrlForBook(bookId) },
-                    onOpen = vm::openRecent,
-                )
-                HorizontalDivider()
             }
             if (state.scanning || (state.loading && state.entries.isNotEmpty())) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -248,10 +240,11 @@ fun BrowserScreen(
                         val restore = vm.pendingScrollAction(state.dataVersion)
                         if (restore != null) {
                             // 内容可能在离开后变化：越界位置收敛到末项，避免 scrollToItem 异常
-                            val maxIndex = (
-                                state.entries.size +
-                                    if (state.canOpenCurrentAsGallery) 1 else 0
-                                ) - 1
+                            // （首项可能是"继续阅读"书架，也算进总项数）
+                            val leadingItems = if (shelf.isNotEmpty()) 1 else 0
+                            val maxIndex = leadingItems +
+                                (if (state.canOpenCurrentAsGallery) 1 else 0) +
+                                state.entries.size - 1
                             val index = restore.index.coerceIn(0, maxIndex.coerceAtLeast(0))
                             val offset = if (index == restore.index) restore.offset else 0
                             listState.scrollToItem(index, offset.coerceAtLeast(0))
@@ -264,6 +257,16 @@ fun BrowserScreen(
                             modifier = Modifier.weight(1f),
                             state = listState,
                         ) {
+                            if (shelf.isNotEmpty()) {
+                                item(key = "recent-shelf") {
+                                    RecentReadingShelf(
+                                        recent = shelf,
+                                        coverUrl = { bookId -> vm.coverUrlForBook(bookId) },
+                                        onOpen = vm::openRecent,
+                                    )
+                                    HorizontalDivider()
+                                }
+                            }
                             if (state.canOpenCurrentAsGallery) {
                                 item(key = "current-gallery") {
                                     GalleryEntryCard(
